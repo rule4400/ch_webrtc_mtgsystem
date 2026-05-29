@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>SFU Server Admin Dashboard</title>
+  <style>
+    :root {
+      --bg: #1e1e1e;
+      --bg-panel: #2d2d30;
+      --text: #d4d4d4;
+      --border: #3e3e42;
+      --accent: #007acc;
+      --danger: #f44336;
+      --success: #4caf50;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background-color: var(--bg);
+      color: var(--text);
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      box-sizing: border-box;
+    }
+    /* ヘッダー */
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 15px 20px;
+      background-color: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .status-area {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 1.1rem;
+      font-weight: bold;
+    }
+    .indicator {
+      width: 12px; height: 12px; border-radius: 50%;
+      background-color: var(--danger);
+    }
+    .indicator.running { background-color: var(--success); }
+    .controls button {
+      padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;
+      font-weight: bold; color: white; margin-left: 8px;
+    }
+    #startBtn { background-color: var(--success); }
+    #stopBtn { background-color: var(--danger); }
+    
+    /* タブナビゲーション */
+    .tabs {
+      display: flex; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+    }
+    .tab {
+      padding: 10px 20px; cursor: pointer; color: #888;
+      border-bottom: 2px solid transparent;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+    
+    /* コンテンツエリア */
+    .content {
+      flex: 1; overflow: hidden; position: relative; padding: 20px;
+    }
+    .panel {
+      display: none; height: 100%; flex-direction: column;
+    }
+    .panel.active { display: flex; }
+    
+    /* ダッシュボード */
+    .dashboard-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
+    }
+    .card {
+      background: var(--bg-panel); border: 1px solid var(--border);
+      border-radius: 6px; padding: 20px; text-align: center;
+    }
+    .card-title { font-size: 0.9rem; color: #888; margin-bottom: 10px; }
+    .card-value { font-size: 2rem; font-weight: bold; }
+    
+    /* クライアントテーブル */
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { color: #888; font-weight: normal; }
+    .btn-kick { background: transparent; border: 1px solid var(--danger); color: var(--danger); padding: 4px 10px; border-radius: 4px; cursor: pointer; }
+    .btn-kick:hover { background: var(--danger); color: white; }
+    
+    /* ログ */
+    .log-container {
+      flex: 1; background-color: #000; border-radius: 4px; padding: 10px;
+      font-family: "Courier New", monospace; overflow-y: auto; font-size: 0.9rem;
+    }
+    
+    /* 設定 */
+    .settings-row { margin-bottom: 15px; }
+    .settings-row label { display: block; margin-bottom: 5px; color: #888; }
+    .path-display { padding: 10px; background: #000; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 10px;}
+    .btn-secondary { background: #555; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="status-area">
+      <div id="statusDot" class="indicator"></div>
+      <span id="statusText">Stopped</span>
+    </div>
+    <div class="controls">
+      <button id="startBtn">Start Server</button>
+      <button id="stopBtn">Stop Server</button>
+    </div>
+  </div>
+  
+  <div class="tabs">
+    <div class="tab active" data-target="dashboard">Dashboard</div>
+    <div class="tab" data-target="clients">Clients</div>
+    <div class="tab" data-target="logs">Logs</div>
+    <div class="tab" data-target="settings">Settings</div>
+  </div>
+  
+  <div class="content">
+    <!-- ダッシュボード -->
+    <div id="dashboard" class="panel active">
+      <div class="dashboard-grid">
+        <div class="card">
+          <div class="card-title">Connected Peers</div>
+          <div class="card-value" id="valPeers">0</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Total Streams (Prod / Cons)</div>
+          <div class="card-value" id="valStreams">0 / 0</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Memory Usage</div>
+          <div class="card-value" id="valMem">0 MB</div>
+        </div>
+        <div class="card">
+          <div class="card-title">CPU Usage</div>
+          <div class="card-value" id="valCpu">0.0 %</div>
+        </div>
+      </div>
+      <div style="margin-top: 20px; text-align: right;">
+        <button id="restartAllBtn" style="background: var(--danger); color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">⚠ Force Restart All Clients</button>
+      </div>
+    </div>
+    
+    <!-- クライアント管理 -->
+    <div id="clients" class="panel">
+      <div style="overflow-y: auto; flex: 1; border: 1px solid var(--border); border-radius: 4px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Socket ID</th>
+              <th>Producers</th>
+              <th>Consumers</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="clientsTableBody">
+            <tr><td colspan="4" style="text-align: center; color: #888;">No clients connected</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    
+    <!-- ログ -->
+    <div id="logs" class="panel">
+      <div class="log-container" id="logOutput">
+        === SFU Server Logs ===
+      </div>
+    </div>
+    
+    <!-- 設定 -->
+    <div id="settings" class="panel">
+      <div class="settings-row">
+        <label>Server Directory Path</label>
+        <div class="path-display" id="pathDisplay">Not selected</div>
+        <button class="btn-secondary" id="selectBtn">Select Folder</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Tab logic
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById(tab.dataset.target).classList.add('active');
+      });
+    });
+
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const selectBtn = document.getElementById('selectBtn');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const logOutput = document.getElementById('logOutput');
+    const pathDisplay = document.getElementById('pathDisplay');
+
+    let currentServerPath = localStorage.getItem('sfuServerPath') || '';
+    pathDisplay.innerText = currentServerPath || 'サーバーのフォルダを選択してください';
+
+    selectBtn.addEventListener('click', async () => {
+      const folder = await window.api.selectFolder();
+      if (folder) {
+        currentServerPath = folder;
+        localStorage.setItem('sfuServerPath', folder);
+        pathDisplay.innerText = folder;
+      }
+    });
+
+    startBtn.addEventListener('click', () => {
+      window.api.startServer(currentServerPath);
+    });
+
+    stopBtn.addEventListener('click', () => {
+      window.api.stopServer();
+    });
+
+    window.api.onServerStatus((status) => {
+      statusText.innerText = status;
+      if (status === 'Running') {
+        statusDot.classList.add('running');
+      } else {
+        statusDot.classList.remove('running');
+        // Reset stats
+        document.getElementById('valPeers').innerText = '0';
+        document.getElementById('valStreams').innerText = '0 / 0';
+        document.getElementById('valMem').innerText = '0 MB';
+        document.getElementById('valCpu').innerText = '0.0 %';
+        document.getElementById('clientsTableBody').innerHTML = '<tr><td colspan="4" style="text-align: center; color: #888;">Server stopped</td></tr>';
+      }
+    });
+
+    window.api.onServerLog((log) => {
+      const p = document.createElement('div');
+      p.innerText = log.trim();
+      if(log.includes('ERROR') || log.includes('error')) p.style.color = 'var(--danger)';
+      if(log.includes('[Admin]')) p.style.color = 'var(--accent)';
+      
+      logOutput.appendChild(p);
+      logOutput.scrollTop = logOutput.scrollHeight;
+      if (logOutput.childNodes.length > 2000) logOutput.removeChild(logOutput.firstChild);
+    });
+
+    window.api.onServerStats((stats) => {
+      document.getElementById('valPeers').innerText = stats.peerCount;
+      document.getElementById('valStreams').innerText = `${stats.totalProducers} / ${stats.totalConsumers}`;
+      document.getElementById('valMem').innerText = `${Math.round(stats.memory / 1024 / 1024)} MB`;
+      document.getElementById('valCpu').innerText = `${stats.cpu} %`;
+
+      const tbody = document.getElementById('clientsTableBody');
+      if (stats.clients.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #888;">No clients connected</td></tr>';
+      } else {
+        tbody.innerHTML = '';
+        stats.clients.forEach(c => {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${c.id}</td>
+            <td>${c.producers}</td>
+            <td>${c.consumers}</td>
+            <td><button class="btn-kick" data-id="${c.id}">Kick</button></td>
+          `;
+          tbody.appendChild(tr);
+        });
+
+        // Add kick listeners
+        document.querySelectorAll('.btn-kick').forEach(btn => {
+          btn.addEventListener('click', (e) => {
+            const id = e.target.dataset.id;
+            if (confirm(`本当にクライアント ${id} を切断しますか？`)) {
+              window.api.kickClient(id);
+            }
+          });
+        });
+      }
+    });
+
+    document.getElementById('restartAllBtn').addEventListener('click', () => {
+      if (confirm('警告: 全てのクライアントを強制的に再起動させます。よろしいですか？')) {
+        window.api.restartAll();
+      }
+    });
+  </script>
+</body>
+</html>

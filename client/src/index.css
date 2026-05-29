@@ -1,0 +1,431 @@
+/* ── リセット & 変数 ─────────────────────────────────── */
+:root {
+  --bg:          #141414;
+  --panel:       #1e1e1e;
+  --border:      rgba(255,255,255,0.1);
+  --text:        #ffffff;
+  --text-muted:  #9aa0a6;
+  --green:       #4ade80;
+  --blue:        #8ab4f8;
+  --danger:      #ea4335;
+  --danger-dark: #c62828;
+  --header-h:    44px;
+  --ctrl-h:      70px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Inter', 'Roboto', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* ── メインレイアウト ──────────────────────────────── */
+.main-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── ヘッダー ─────────────────────────────────────── */
+.header-bar {
+  height: var(--header-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px 0 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.header-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+/* ── ビデオグリッド ────────────────────────────────── */
+.video-grid {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+  flex: 1;
+  overflow: hidden;
+  align-content: center;
+  justify-content: center;
+  grid-auto-rows: 1fr;
+}
+
+/* ── 個別セル ─────────────────────────────────────── */
+.video-cell {
+  position: relative;
+  background: #0a0a0a;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 16 / 9;
+  min-height: 0;
+}
+
+/* カメラOFF 暗転オーバーレイ */
+.cam-off-overlay {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  background: #111;
+}
+
+/* 拠点名ラベル（左下） */
+.cell-label {
+  position: absolute;
+  bottom: 8px;
+  left: 8px;
+  display: flex;
+  align-items: center;
+  background: rgba(0,0,0,0.6);
+  color: white;
+  font-size: 0.75rem;
+  padding: 3px 8px;
+  border-radius: 4px;
+  gap: 4px;
+  max-width: calc(100% - 16px);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 自拠点 緑丸 */
+.self-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.2; }
+}
+
+/* カメラエラーバー */
+.cam-error-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(234, 67, 53, 0.15);
+  border-bottom: 1px solid rgba(234, 67, 53, 0.4);
+  color: #ff8a80;
+  font-size: 0.8rem;
+  padding: 8px 16px;
+  flex-shrink: 0;
+}
+
+/* マイクOFFバッジ（右上） */
+.mute-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: var(--danger);
+  border-radius: 50%;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ── コントロールバー ──────────────────────────────── */
+.control-bar {
+  height: var(--ctrl-h);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.ctrl-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(255,255,255,0.1);
+  color: white;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, transform 0.1s;
+  font-size: 0.85rem;
+}
+.ctrl-btn:hover {
+  background: rgba(255,255,255,0.2);
+  transform: scale(1.05);
+}
+.ctrl-btn.danger {
+  background: var(--danger);
+}
+.ctrl-btn.danger:hover {
+  background: var(--danger-dark);
+}
+.leave-btn {
+  width: auto;
+  padding: 0 20px;
+  border-radius: 24px;
+}
+
+/* ── デバイスボタングループ ─────────────────────────── */
+.device-btn-group {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+/* デバイス選択用 小さい ▾ ボタン */
+.chevron-btn {
+  width: 18px;
+  height: 32px;
+  border-radius: 0 8px 8px 0;
+  border: none;
+  background: rgba(255,255,255,0.08);
+  color: rgba(255,255,255,0.6);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: -2px;
+  transition: background 0.15s;
+}
+.chevron-btn:hover { background: rgba(255,255,255,0.18); }
+.chevron-btn.danger { background: rgba(234,67,53,0.4); }
+.chevron-btn.danger:hover { background: rgba(234,67,53,0.6); }
+
+/* ドロップダウンメニュー */
+.device-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #2a2a2a;
+  border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 10px;
+  padding: 6px;
+  min-width: 220px;
+  max-width: 320px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.device-item {
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: rgba(255,255,255,0.8);
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.1s;
+}
+.device-item:hover  { background: rgba(255,255,255,0.1); }
+.device-item.active { background: rgba(138,180,248,0.2); color: var(--blue); }
+
+/* ── 設定画面 ─────────────────────────────────────── */
+.settings-layout {
+  display: flex;
+  height: 100vh;
+  align-items: center;
+  justify-content: center;
+  gap: 48px;
+  padding: 40px;
+  overflow-y: auto;
+}
+
+.settings-preview {
+  flex: 1;
+  max-width: 560px;
+}
+
+.preview-wrap {
+  position: relative;
+  background: #000;
+  border-radius: 12px;
+  overflow: hidden;
+  aspect-ratio: 16 / 9;
+  width: 100%;
+}
+
+.preview-wrap video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  display: block;
+}
+
+.preview-controls {
+  position: absolute;
+  bottom: 16px;
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: center;
+  gap: 12px;
+}
+
+.settings-form {
+  flex: 1;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-form h1 {
+  font-size: 1.6rem;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.settings-section {
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-section h2 {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.field input,
+.field select {
+  width: 100%;
+  padding: 10px 12px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: white;
+  font-size: 0.9rem;
+  outline: none;
+  appearance: none;
+}
+.field input:focus,
+.field select:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 1px var(--blue);
+}
+.field select option {
+  background: #2c2c2c;
+  color: white;
+}
+
+.server-row {
+  display: grid;
+  grid-template-columns: 1fr 100px;
+  gap: 8px;
+}
+
+.btn-join {
+  width: 100%;
+  padding: 14px;
+  background: var(--blue);
+  color: #141414;
+  border: none;
+  border-radius: 24px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.15s, transform 0.1s;
+  margin-top: 4px;
+}
+.btn-join:hover {
+  filter: brightness(0.9);
+  transform: translateY(-1px);
+}
+
+/* ── 汎用ボタン（設定画面プレビュー用）──────────────── */
+.circle-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(40,40,40,0.85);
+  color: white;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+  backdrop-filter: blur(4px);
+}
+.circle-btn:hover       { background: rgba(60,60,60,0.9); }
+.circle-btn.danger      { background: var(--danger); }
+.circle-btn.danger:hover { background: var(--danger-dark); }

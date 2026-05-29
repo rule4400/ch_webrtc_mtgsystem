@@ -1,0 +1,30 @@
+{
+  "name": "sfu-server-gui",
+  "version": "1.0.0",
+  "description": "GUI Wrapper for WebRTC SFU Server",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-builder build --mac --win"
+  },
+  "build": {
+    "appId": "com.webrtc.servergui",
+    "productName": "SFU Server GUI",
+    "mac": {
+      "target": ["dmg", "dir"],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "target": ["nsis", "portable"]
+    },
+    "directories": {
+      "output": "release"
+    }
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "^latest",
+    "electron-builder": "^latest"
+  }
+}
