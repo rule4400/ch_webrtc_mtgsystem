@@ -307,6 +307,8 @@ function getStatsSnapshot() {
     clients,
     workerPids: workers.map(w => w.pid),
     routerWorkerPid: routerWorker?.pid || null,
+    listenIp: config.listenIp,
+    listenPort: config.listenPort,
     announcedIp: config.announcedIp,
     rtcPortRange: config.rtcPortRange,
     iceServerCount: (config.iceServers || []).length,

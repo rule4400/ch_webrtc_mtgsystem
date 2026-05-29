@@ -456,6 +456,116 @@
       white-space: pre-wrap;
     }
 
+    .registry-wrap {
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      gap: 14px;
+      min-height: 0;
+    }
+
+    .registry-form {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      padding: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .registry-form .wide-field {
+      grid-column: span 2;
+    }
+
+    .registry-field {
+      min-width: 0;
+    }
+
+    .registry-field label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.7rem;
+      margin-bottom: 5px;
+    }
+
+    .registry-field input {
+      width: 100%;
+      min-height: 34px;
+      padding: 0 9px;
+      color: var(--text);
+      background: #11151a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      outline: none;
+      min-width: 0;
+    }
+
+    .registry-field input:focus {
+      border-color: rgba(90,176,255,0.55);
+      box-shadow: 0 0 0 1px rgba(90,176,255,0.22);
+    }
+
+    .registry-actions {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .registry-status {
+      color: var(--muted);
+      font-size: 0.76rem;
+      align-self: center;
+    }
+
+    .registry-grid {
+      min-height: 0;
+      overflow: auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+      align-content: start;
+      gap: 12px;
+    }
+
+    .registered-card {
+      min-width: 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .registered-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .registered-title {
+      min-width: 0;
+      font-weight: 760;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .registered-meta {
+      color: var(--muted);
+      font-size: 0.72rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .registered-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
     .settings-wrap {
       max-width: 860px;
       display: grid;
@@ -541,6 +651,7 @@
     <nav class="tabs" role="tablist" aria-label="Server dashboard sections">
       <button type="button" class="tab active" data-target="dashboard" role="tab" aria-selected="true" aria-controls="dashboard">Dashboard</button>
       <button type="button" class="tab" data-target="clients" role="tab" aria-selected="false" aria-controls="clients">Clients</button>
+      <button type="button" class="tab" data-target="registered" role="tab" aria-selected="false" aria-controls="registered">Registry</button>
       <button type="button" class="tab" data-target="logs" role="tab" aria-selected="false" aria-controls="logs">Logs</button>
       <button type="button" class="tab" data-target="settings" role="tab" aria-selected="false" aria-controls="settings">Settings</button>
     </nav>
@@ -562,6 +673,49 @@
 
       <section id="clients" class="panel" role="tabpanel" hidden>
         <div id="clientCardsFull" class="client-grid"></div>
+      </section>
+
+      <section id="registered" class="panel" role="tabpanel" hidden>
+        <div class="registry-wrap">
+          <div class="registry-form">
+            <div class="registry-field">
+              <label>管理名</label>
+              <input id="regName" placeholder="例: サテライト">
+            </div>
+            <div class="registry-field">
+              <label>クライアントIP / ホスト</label>
+              <input id="regHost" placeholder="例: 192.168.10.24">
+            </div>
+            <div class="registry-field">
+              <label>管理ポート</label>
+              <input id="regPort" value="39210">
+            </div>
+            <div class="registry-field">
+              <label>管理トークン</label>
+              <input id="regToken" type="password" placeholder="未設定なら空欄">
+            </div>
+            <div class="registry-field">
+              <label>クライアント拠点名</label>
+              <input id="regLocation" placeholder="例: サテライト">
+            </div>
+            <div class="registry-field">
+              <label>接続先SFU IP</label>
+              <input id="regServerIp" placeholder="ANNOUNCED_IP">
+            </div>
+            <div class="registry-field">
+              <label>接続先SFU Port</label>
+              <input id="regServerPort" value="3000">
+            </div>
+            <div class="registry-actions">
+              <button id="regAddBtn" class="btn primary">Register</button>
+              <button id="regReloadBtn" class="btn ghost">Reload</button>
+              <span id="regStatus" class="registry-status"></span>
+            </div>
+          </div>
+          <div id="registeredClients" class="registry-grid">
+            <div class="empty">遠隔操作するクライアントを登録できます</div>
+          </div>
+        </div>
       </section>
 
       <section id="logs" class="panel" role="tabpanel" hidden>
@@ -598,12 +752,24 @@
     const envDisplay = document.getElementById('envDisplay');
     const clientCards = document.getElementById('clientCards');
     const clientCardsFull = document.getElementById('clientCardsFull');
+    const registeredClientsEl = document.getElementById('registeredClients');
+    const regName = document.getElementById('regName');
+    const regHost = document.getElementById('regHost');
+    const regPort = document.getElementById('regPort');
+    const regToken = document.getElementById('regToken');
+    const regLocation = document.getElementById('regLocation');
+    const regServerIp = document.getElementById('regServerIp');
+    const regServerPort = document.getElementById('regServerPort');
+    const regAddBtn = document.getElementById('regAddBtn');
+    const regReloadBtn = document.getElementById('regReloadBtn');
+    const regStatus = document.getElementById('regStatus');
 
     let currentServerPath = localStorage.getItem('sfuServerPath') || '';
     let latestStats = null;
     let deferredCardStats = null;
     let lastCardsHtml = '';
     let deviceSelectHoldUntil = 0;
+    let registeredClients = [];
     pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
 
     const healthText = {
@@ -663,6 +829,95 @@
 
     function shortId(id) {
       return String(id || '').slice(0, 8);
+    }
+
+    function setRegistryStatus(message, tone = 'muted') {
+      regStatus.innerText = message || '';
+      regStatus.style.color =
+        tone === 'ok' ? 'var(--green)' :
+        tone === 'bad' ? 'var(--red)' :
+        tone === 'warn' ? 'var(--amber)' :
+        'var(--muted)';
+    }
+
+    function defaultRegistryServerIp() {
+      return latestStats?.announcedIp || '';
+    }
+
+    function defaultRegistryServerPort() {
+      return String(latestStats?.listenPort || '3000');
+    }
+
+    function refreshRegistryDefaults() {
+      if (!regServerIp.value && defaultRegistryServerIp()) regServerIp.value = defaultRegistryServerIp();
+      if (!regServerPort.value) regServerPort.value = defaultRegistryServerPort();
+    }
+
+    function registeredStatusChip(client) {
+      const status = client.lastStatus || 'unknown';
+      const cls =
+        status === 'online' || status === 'configured' ? 'ok' :
+        status === 'offline' ? 'bad' :
+        'warn';
+      return `<span class="chip ${cls}">${escapeHtml(status)}</span>`;
+    }
+
+    function renderRegisteredClients() {
+      if (!registeredClients.length) {
+        registeredClientsEl.innerHTML = '<div class="empty">遠隔操作するクライアントを登録できます</div>';
+        return;
+      }
+      registeredClientsEl.innerHTML = registeredClients.map(client => `
+        <article class="registered-card">
+          <div class="registered-head">
+            <div style="min-width:0">
+              <div class="registered-title">${escapeHtml(client.name || client.host)}</div>
+              <div class="registered-meta">${escapeHtml(client.host)}:${escapeHtml(client.port)} / ${escapeHtml(client.locationName || '-')}</div>
+            </div>
+            ${registeredStatusChip(client)}
+          </div>
+          <div class="chip-row">
+            <span class="chip blue">SFU ${escapeHtml(client.serverIp || '-')}:${escapeHtml(client.serverPort || '-')}</span>
+            <span class="chip ${client.hasToken ? 'ok' : 'warn'}">${client.hasToken ? 'token' : 'open'}</span>
+          </div>
+          ${client.lastError ? `<div class="registered-meta" style="color:var(--red)">${escapeHtml(client.lastError)}</div>` : ''}
+          <div class="registered-actions">
+            <button class="mini-btn blue" data-reg-action="probe" data-id="${escapeHtml(client.id)}">Probe</button>
+            <button class="mini-btn blue" data-reg-action="configure" data-id="${escapeHtml(client.id)}">Push Config</button>
+            <button class="mini-btn danger" data-reg-action="restart" data-id="${escapeHtml(client.id)}">Restart</button>
+            <button class="mini-btn" data-reg-action="remove" data-id="${escapeHtml(client.id)}">Remove</button>
+          </div>
+        </article>
+      `).join('');
+    }
+
+    async function loadRegisteredClients() {
+      try {
+        registeredClients = await window.api.listRegisteredClients();
+        renderRegisteredClients();
+        refreshRegistryDefaults();
+      } catch (err) {
+        setRegistryStatus(err.message || '登録一覧を取得できません', 'bad');
+      }
+    }
+
+    function updateRegisteredClient(client) {
+      registeredClients = registeredClients.filter(item => item.id !== client.id);
+      registeredClients.push(client);
+      renderRegisteredClients();
+    }
+
+    function registryPayload() {
+      const name = regName.value.trim();
+      return {
+        name,
+        host: regHost.value.trim(),
+        port: regPort.value.trim() || '39210',
+        token: regToken.value,
+        locationName: regLocation.value.trim() || name,
+        serverIp: regServerIp.value.trim() || defaultRegistryServerIp(),
+        serverPort: regServerPort.value.trim() || defaultRegistryServerPort(),
+      };
     }
 
     function deviceOptions(devices, selected, label) {
@@ -821,6 +1076,7 @@
       document.getElementById('mUptime').innerText = `uptime ${fmtUptime(stats.uptimeSec || 0)}`;
       document.getElementById('mCpu').innerText = `${stats.cpu || '0.0'}%`;
       document.getElementById('mAnnounced').innerText = `${stats.announcedIp || '-'} / RTP ${stats.rtcPortRange?.min || '-'}-${stats.rtcPortRange?.max || '-'}`;
+      refreshRegistryDefaults();
 
       if (isDeviceSelectActive()) {
         deferredCardStats = stats;
@@ -896,6 +1152,71 @@
 
     wireClientActions(clientCards);
     wireClientActions(clientCardsFull);
+    loadRegisteredClients();
+
+    regAddBtn.addEventListener('click', async () => {
+      try {
+        setRegistryStatus('saving...');
+        const saved = await window.api.saveRegisteredClient(registryPayload());
+        updateRegisteredClient(saved);
+        regHost.value = '';
+        regToken.value = '';
+        if (!regLocation.value) regName.value = '';
+        setRegistryStatus('registered', 'ok');
+      } catch (err) {
+        setRegistryStatus(err.message || '登録に失敗しました', 'bad');
+      }
+    });
+
+    regReloadBtn.addEventListener('click', () => {
+      setRegistryStatus('reloading...');
+      loadRegisteredClients().then(() => setRegistryStatus('loaded', 'ok'));
+    });
+
+    registeredClientsEl.addEventListener('click', async event => {
+      const button = event.target.closest('button[data-reg-action]');
+      if (!button) return;
+      const id = button.dataset.id;
+      const action = button.dataset.regAction;
+      button.disabled = true;
+      try {
+        if (action === 'probe') {
+          setRegistryStatus('probing...');
+          const result = await window.api.probeRegisteredClient(id);
+          updateRegisteredClient(result.client);
+          setRegistryStatus(result.error ? `offline: ${result.error}` : 'online', result.error ? 'bad' : 'ok');
+        }
+        if (action === 'configure') {
+          setRegistryStatus('pushing config...');
+          const target = registeredClients.find(client => client.id === id);
+          const result = await window.api.configureRegisteredClient(id, {
+            serverIp: target?.serverIp || defaultRegistryServerIp(),
+            serverPort: target?.serverPort || defaultRegistryServerPort(),
+            locationName: target?.locationName || target?.name,
+          });
+          updateRegisteredClient(result.client);
+          setRegistryStatus('config pushed', 'ok');
+        }
+        if (action === 'restart') {
+          if (!confirm('登録クライアントへ再起動指示を送信しますか？')) return;
+          setRegistryStatus('sending restart...');
+          const result = await window.api.restartRegisteredClient(id);
+          updateRegisteredClient(result.client);
+          setRegistryStatus('restart sent', 'ok');
+        }
+        if (action === 'remove') {
+          if (!confirm('登録クライアントを削除しますか？')) return;
+          await window.api.removeRegisteredClient(id);
+          registeredClients = registeredClients.filter(client => client.id !== id);
+          renderRegisteredClients();
+          setRegistryStatus('removed', 'ok');
+        }
+      } catch (err) {
+        setRegistryStatus(err.message || '操作に失敗しました', 'bad');
+      } finally {
+        button.disabled = false;
+      }
+    });
 
     window.api.getServerInfo().then(info => {
       envDisplay.innerText = info.defaultEnvPath || 'Unknown';

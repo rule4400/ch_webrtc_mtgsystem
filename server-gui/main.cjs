@@ -40,6 +40,93 @@ let restartAttempts = 0;
 let stoppingServer = false;
 
 const SERVER_RUNTIME_DIR = 'server-runtime';
+const CLIENT_REGISTRY_FILE = 'registered-clients.json';
+
+function clientRegistryPath() {
+  return path.join(app.getPath('userData'), CLIENT_REGISTRY_FILE);
+}
+
+function readClientRegistry() {
+  try {
+    const items = JSON.parse(fs.readFileSync(clientRegistryPath(), 'utf8'));
+    return Array.isArray(items) ? items : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeClientRegistry(items) {
+  fs.mkdirSync(path.dirname(clientRegistryPath()), { recursive: true });
+  fs.writeFileSync(clientRegistryPath(), JSON.stringify(items, null, 2));
+}
+
+function shortText(value, max = 256) {
+  return String(value ?? '').trim().slice(0, max);
+}
+
+function sanitizeRegisteredClient(input = {}) {
+  const id = shortText(input.id, 80) || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const host = shortText(input.host, 180);
+  const port = Number.parseInt(input.port || '39210', 10);
+  if (!host) throw new Error('クライアントIP/ホストを入力してください');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('管理ポートが不正です');
+  return {
+    id,
+    name: shortText(input.name, 128) || host,
+    host,
+    port,
+    token: shortText(input.token, 512),
+    locationName: shortText(input.locationName, 128) || shortText(input.name, 128) || host,
+    serverIp: shortText(input.serverIp, 128),
+    serverPort: shortText(input.serverPort, 12) || '3000',
+    lastStatus: shortText(input.lastStatus, 32) || 'unknown',
+    lastSeenAt: input.lastSeenAt || null,
+    lastError: shortText(input.lastError, 512),
+  };
+}
+
+function publicRegisteredClient(client) {
+  return {
+    ...client,
+    token: client.token ? '********' : '',
+    hasToken: !!client.token,
+  };
+}
+
+function controlUrl(client, pathname) {
+  return `http://${client.host}:${client.port}${pathname}`;
+}
+
+async function controlRequest(client, pathname, { method = 'GET', body = null, timeoutMs = 4000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const headers = { Accept: 'application/json' };
+    if (client.token) headers['X-SFU-Token'] = client.token;
+    let requestBody;
+    if (body) {
+      headers['Content-Type'] = 'application/json';
+      requestBody = JSON.stringify(body);
+    }
+    const response = await fetch(controlUrl(client, pathname), {
+      method,
+      headers,
+      body: requestBody,
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { raw: text };
+    }
+    if (!response.ok || data.error) throw new Error(data.error || `${response.status} ${response.statusText}`);
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** ウィンドウが生きている場合のみ IPC 送信（終了時クラッシュ防止） */
 function safeSend(channel, ...args) {
@@ -145,6 +232,89 @@ ipcMain.handle('get-server-info', () => {
     bundledServerDir: bundled,
     defaultEnvPath: path.join(bundled, '.env'),
   };
+});
+
+ipcMain.handle('list-registered-clients', () => {
+  return readClientRegistry().map(publicRegisteredClient);
+});
+
+ipcMain.handle('save-registered-client', (_event, rawClient) => {
+  const existing = readClientRegistry();
+  const matching = rawClient?.id
+    ? existing.find(client => client.id === rawClient.id)
+    : existing.find(client => client.host === shortText(rawClient?.host, 180) && String(client.port) === String(rawClient?.port || '39210'));
+  const previous = matching;
+  const merged = {
+    ...rawClient,
+    id: rawClient?.id || previous?.id,
+    token: rawClient?.token === '********' ? previous?.token || '' : rawClient?.token,
+    lastStatus: previous?.lastStatus,
+    lastSeenAt: previous?.lastSeenAt,
+    lastError: previous?.lastError,
+  };
+  const client = sanitizeRegisteredClient(merged);
+  const next = existing.filter(item => item.id !== client.id);
+  next.push(client);
+  writeClientRegistry(next);
+  return publicRegisteredClient(client);
+});
+
+ipcMain.handle('remove-registered-client', (_event, id) => {
+  const existing = readClientRegistry();
+  writeClientRegistry(existing.filter(client => client.id !== id));
+  return true;
+});
+
+ipcMain.handle('probe-registered-client', async (_event, id) => {
+  const clients = readClientRegistry();
+  const client = clients.find(item => item.id === id);
+  if (!client) throw new Error('登録クライアントが見つかりません');
+
+  try {
+    const response = await controlRequest(client, '/health');
+    client.lastStatus = 'online';
+    client.lastSeenAt = new Date().toISOString();
+    client.lastError = '';
+    writeClientRegistry(clients);
+    return { client: publicRegisteredClient(client), response };
+  } catch (err) {
+    client.lastStatus = 'offline';
+    client.lastError = err.name === 'AbortError' ? 'timeout' : err.message;
+    writeClientRegistry(clients);
+    return { client: publicRegisteredClient(client), error: client.lastError };
+  }
+});
+
+ipcMain.handle('configure-registered-client', async (_event, id, config = {}) => {
+  const clients = readClientRegistry();
+  const client = clients.find(item => item.id === id);
+  if (!client) throw new Error('登録クライアントが見つかりません');
+  const payload = {
+    serverIp: shortText(config.serverIp || client.serverIp, 128),
+    serverPort: shortText(config.serverPort || client.serverPort || '3000', 12),
+    locationName: shortText(config.locationName || client.locationName || client.name, 128),
+  };
+  const response = await controlRequest(client, '/configure', { method: 'POST', body: payload, timeoutMs: 6000 });
+  client.serverIp = payload.serverIp;
+  client.serverPort = payload.serverPort;
+  client.locationName = payload.locationName;
+  client.lastStatus = 'configured';
+  client.lastSeenAt = new Date().toISOString();
+  client.lastError = '';
+  writeClientRegistry(clients);
+  return { client: publicRegisteredClient(client), response };
+});
+
+ipcMain.handle('restart-registered-client', async (_event, id) => {
+  const clients = readClientRegistry();
+  const client = clients.find(item => item.id === id);
+  if (!client) throw new Error('登録クライアントが見つかりません');
+  const response = await controlRequest(client, '/restart', { method: 'POST', timeoutMs: 3000 });
+  client.lastStatus = 'restart-sent';
+  client.lastSeenAt = new Date().toISOString();
+  client.lastError = '';
+  writeClientRegistry(clients);
+  return { client: publicRegisteredClient(client), response };
 });
 
 function copyFileIfChanged(src, dest) {

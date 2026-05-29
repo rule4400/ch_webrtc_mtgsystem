@@ -10,6 +10,12 @@ contextBridge.exposeInMainWorld('api', {
   restartClient: (socketId) => ipcRenderer.send('restart-client', socketId),
   setClientDevice: (socketId, kind, deviceId) => ipcRenderer.send('set-client-device', { socketId, kind, deviceId }),
   refreshClientDevices: (socketId) => ipcRenderer.send('refresh-client-devices', socketId),
+  listRegisteredClients: () => ipcRenderer.invoke('list-registered-clients'),
+  saveRegisteredClient: (client) => ipcRenderer.invoke('save-registered-client', client),
+  removeRegisteredClient: (id) => ipcRenderer.invoke('remove-registered-client', id),
+  probeRegisteredClient: (id) => ipcRenderer.invoke('probe-registered-client', id),
+  configureRegisteredClient: (id, config) => ipcRenderer.invoke('configure-registered-client', id, config),
+  restartRegisteredClient: (id) => ipcRenderer.invoke('restart-registered-client', id),
   onServerStatus: (callback) => ipcRenderer.on('server-status', (event, status) => callback(status)),
   onServerLog: (callback) => ipcRenderer.on('server-log', (event, log) => callback(log)),
   onServerStats: (callback) => ipcRenderer.on('server-stats', (event, stats) => callback(stats))
