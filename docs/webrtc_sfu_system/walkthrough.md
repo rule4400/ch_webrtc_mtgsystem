@@ -18,6 +18,10 @@ Macに加えて、Windows向けの実行ファイル（`.exe`）も同時にビ�
 - **Mac用**: `client/release/mac-arm64/MeetingClient.app` または `release/MeetingClient-0.0.0-arm64.dmg`
 - **Windows用**: `client/release/MeetingClient Setup 0.0.0.exe` (インストーラー)
 
+### 閲覧専用クライアント (MeetingViewer)
+- **Mac用**: `viewer/release/mac-arm64/MeetingViewer.app` または `release/MeetingViewer-0.1.0-arm64.dmg`
+- **Windows用**: `viewer/release/MeetingViewer Setup 0.1.0.exe` (インストーラー)
+
 ### サーバーGUI (SFU Server GUI)
 - **Mac用**: `server-gui/release/mac-arm64/SFU Server GUI.app`
 - **Windows用**: `server-gui/release/SFU Server GUI Setup 1.0.0.exe` (インストーラー)
@@ -27,6 +31,7 @@ Macに加えて、Windows向けの実行ファイル（`.exe`）も同時にビ�
 1. Windows PC上で、出力された `.exe` インストーラーを実行してアプリをインストールするか、ポータブル版を起動します。
 2. **サーバー**は、`SFU Server GUI` にSFUサーバー本体・依存ライブラリ・mediasoup workerを内包しています。[Start Server]を押すだけで起動できます。Windows側にNode.jsを別途インストールする必要はありません。
 3. **クライアント**は起動後、プルダウンからUSBカメラなどのデバイスを選択し、正常にプレビューが映ることを確認してから会議室に参加してください。
+4. **閲覧専用クライアント**は、SFUサーバーのIP/ポートを設定すると受信のみを開始します。カメラ/マイクは取得せず、各拠点の映像・音声だけを表示します。
 
 ## VPN拠点間での設定
 
