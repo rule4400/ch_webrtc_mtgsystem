@@ -176,9 +176,14 @@
     <!-- 設定 -->
     <div id="settings" class="panel">
       <div class="settings-row">
-        <label>Server Directory Path</label>
-        <div class="path-display" id="pathDisplay">Not selected</div>
-        <button class="btn-secondary" id="selectBtn">Select Folder</button>
+        <label>Server Runtime</label>
+        <div class="path-display" id="pathDisplay">内蔵サーバーを使用します</div>
+        <button class="btn-secondary" id="selectBtn">外部サーバーフォルダを選択</button>
+        <button class="btn-secondary" id="useBundledBtn">内蔵サーバーに戻す</button>
+      </div>
+      <div class="settings-row">
+        <label>Bundled Server .env</label>
+        <div class="path-display" id="envDisplay">Loading...</div>
       </div>
     </div>
   </div>
@@ -197,13 +202,21 @@
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const selectBtn = document.getElementById('selectBtn');
+    const useBundledBtn = document.getElementById('useBundledBtn');
     const statusDot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
     const logOutput = document.getElementById('logOutput');
     const pathDisplay = document.getElementById('pathDisplay');
+    const envDisplay = document.getElementById('envDisplay');
 
     let currentServerPath = localStorage.getItem('sfuServerPath') || '';
-    pathDisplay.innerText = currentServerPath || 'サーバーのフォルダを選択してください';
+    pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
+
+    window.api.getServerInfo().then(info => {
+      envDisplay.innerText = info.defaultEnvPath || 'Unknown';
+    }).catch(() => {
+      envDisplay.innerText = 'Unknown';
+    });
 
     selectBtn.addEventListener('click', async () => {
       const folder = await window.api.selectFolder();
@@ -212,6 +225,12 @@
         localStorage.setItem('sfuServerPath', folder);
         pathDisplay.innerText = folder;
       }
+    });
+
+    useBundledBtn.addEventListener('click', () => {
+      currentServerPath = '';
+      localStorage.removeItem('sfuServerPath');
+      pathDisplay.innerText = '内蔵サーバーを使用します';
     });
 
     startBtn.addEventListener('click', () => {

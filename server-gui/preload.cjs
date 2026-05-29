@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
   selectFolder: () => ipcRenderer.invoke('select-folder'),
+  getServerInfo: () => ipcRenderer.invoke('get-server-info'),
   startServer: (serverPath) => ipcRenderer.send('start-server', serverPath),
   stopServer: () => ipcRenderer.send('stop-server'),
   kickClient: (socketId) => ipcRenderer.send('kick-client', socketId),

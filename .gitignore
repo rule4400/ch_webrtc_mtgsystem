@@ -20,3 +20,4 @@ client/release/
 server/node_modules/
 server-gui/release/
 server-gui/node_modules/
+server-gui/resources/mediasoup-workers/

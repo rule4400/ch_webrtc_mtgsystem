@@ -5,10 +5,11 @@
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
-    "package": "electron-builder build --mac --arm64 --win --x64",
-    "package:mac": "electron-builder build --mac --arm64",
-    "package:win": "electron-builder build --win --x64",
-    "package:win:arm64": "electron-builder build --win --arm64"
+    "prepare:resources": "node scripts/prepare-bundled-server.cjs",
+    "package": "npm run prepare:resources && electron-builder build --mac --arm64 && electron-builder build --win --x64",
+    "package:mac": "npm run prepare:resources && electron-builder build --mac --arm64",
+    "package:win": "npm run prepare:resources && electron-builder build --win --x64",
+    "package:win:arm64": "echo \"Windows arm64 is not packaged because mediasoup-worker win32-arm64 prebuild is unavailable for this mediasoup version.\" && exit 1"
   },
   "build": {
     "appId": "com.webrtc.servergui",
@@ -23,11 +24,33 @@
     },
     "directories": {
       "output": "release"
-    }
+    },
+    "extraResources": [
+      {
+        "from": "../server",
+        "to": "bundled-server",
+        "filter": [
+          "index.js",
+          "config.js",
+          "package.json",
+          ".env.example"
+        ]
+      },
+      {
+        "from": "resources/mediasoup-workers",
+        "to": "mediasoup-workers"
+      }
+    ]
   },
-  "dependencies": {},
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "mediasoup": "^3.20.0",
+    "socket.io": "^4.8.3"
+  },
   "devDependencies": {
-    "electron": "^latest",
-    "electron-builder": "^latest"
+    "electron": "^42.3.0",
+    "electron-builder": "^26.8.1"
   }
 }

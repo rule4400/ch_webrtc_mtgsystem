@@ -38,6 +38,8 @@ let manualStop = false;
 let restartTimer = null;
 let restartAttempts = 0;
 
+const SERVER_RUNTIME_DIR = 'server-runtime';
+
 /** ウィンドウが生きている場合のみ IPC 送信（終了時クラッシュ防止） */
 function safeSend(channel, ...args) {
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -82,6 +84,73 @@ ipcMain.handle('select-folder', async () => {
   return result.filePaths[0];
 });
 
+ipcMain.handle('get-server-info', () => {
+  const bundled = getBundledServerRuntimeDir();
+  return {
+    bundledServerDir: bundled,
+    defaultEnvPath: path.join(bundled, '.env'),
+  };
+});
+
+function copyFileIfChanged(src, dest) {
+  const srcContent = fs.readFileSync(src);
+  if (fs.existsSync(dest)) {
+    const destContent = fs.readFileSync(dest);
+    if (srcContent.equals(destContent)) return;
+  }
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.writeFileSync(dest, srcContent);
+}
+
+function getBundledServerSourceDir() {
+  const packagedDir = path.join(process.resourcesPath, 'bundled-server');
+  if (fs.existsSync(path.join(packagedDir, 'index.js'))) return packagedDir;
+  return path.resolve(__dirname, '..', 'server');
+}
+
+function getBundledServerRuntimeDir() {
+  return path.join(app.getPath('userData'), SERVER_RUNTIME_DIR);
+}
+
+function ensureBundledServerRuntime() {
+  const sourceDir = getBundledServerSourceDir();
+  const runtimeDir = getBundledServerRuntimeDir();
+  fs.mkdirSync(runtimeDir, { recursive: true });
+
+  for (const file of ['index.js', 'config.js', 'package.json', '.env.example']) {
+    const src = path.join(sourceDir, file);
+    if (fs.existsSync(src)) copyFileIfChanged(src, path.join(runtimeDir, file));
+  }
+
+  const envPath = path.join(runtimeDir, '.env');
+  if (!fs.existsSync(envPath)) {
+    const examplePath = path.join(runtimeDir, '.env.example');
+    if (fs.existsSync(examplePath)) fs.copyFileSync(examplePath, envPath);
+  }
+
+  return runtimeDir;
+}
+
+function getNodePathEnv() {
+  const paths = [
+    path.join(app.getAppPath(), 'node_modules'),
+    path.resolve(__dirname, 'node_modules'),
+    path.resolve(__dirname, '..', 'server', 'node_modules'),
+  ];
+  return paths.filter(p => fs.existsSync(p)).join(path.delimiter);
+}
+
+function getMediasoupWorkerBin() {
+  const fileName = process.platform === 'win32' ? 'mediasoup-worker.exe' : 'mediasoup-worker';
+  const platformArch = `${process.platform}-${process.arch}`;
+  const candidates = [
+    path.join(process.resourcesPath, 'mediasoup-workers', platformArch, fileName),
+    path.join(__dirname, 'resources', 'mediasoup-workers', platformArch, fileName),
+    path.resolve(__dirname, '..', 'server', 'node_modules', 'mediasoup', 'worker', 'out', 'Release', fileName),
+  ];
+  return candidates.find(p => fs.existsSync(p)) || null;
+}
+
 function scheduleServerRestart(exitCode) {
   if (manualStop || !lastServerDir || restartTimer) return;
   const delay = Math.min(30000, 2000 * (2 ** restartAttempts));
@@ -96,7 +165,10 @@ function scheduleServerRestart(exitCode) {
 function startServerProcess(selectedPath, { automatic = false } = {}) {
   if (serverProcess) return;
 
-  const serverDir = selectedPath;
+  const serverDir = selectedPath && fs.existsSync(path.join(selectedPath, 'index.js'))
+    ? selectedPath
+    : ensureBundledServerRuntime();
+
   if (!serverDir || !fs.existsSync(serverDir)) {
     safeSend('server-log', `ERROR: 有効なサーバーディレクトリを選択してください。\n指定されたパス: ${serverDir}`);
     return;
@@ -105,11 +177,26 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
   lastServerDir = serverDir;
   manualStop = false;
   safeSend('server-log', automatic ? `--- サーバー自動再起動: ${serverDir} ---` : `--- サーバー起動開始: ${serverDir} ---`);
+
+  const workerBin = getMediasoupWorkerBin();
+  if (workerBin) {
+    safeSend('server-log', `--- mediasoup worker: ${workerBin} ---`);
+  } else {
+    safeSend('server-log', 'WARN: 内蔵 mediasoup-worker が見つかりません。mediasoup 標準パスで起動を試みます。');
+  }
+
+  const env = {
+    ...process.env,
+    ELECTRON_RUN_AS_NODE: '1',
+    NODE_PATH: getNodePathEnv(),
+  };
+  if (workerBin) env.MEDIASOUP_WORKER_BIN = workerBin;
   
-  // IPCチャネルを開いてNodeプロセスを起動
-  serverProcess = spawn('node', ['index.js'], { 
+  // Electron 同梱の Node ランタイムで内蔵サーバーを起動する。
+  serverProcess = spawn(process.execPath, [path.join(serverDir, 'index.js')], {
     cwd: serverDir,
-    stdio: ['pipe', 'pipe', 'pipe', 'ipc'] 
+    env,
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
   });
 
   serverProcess.stdout.on('data', (data) => {
