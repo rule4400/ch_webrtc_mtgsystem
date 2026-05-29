@@ -152,6 +152,9 @@ function getStatsSnapshot() {
     clients,
     workerPids: workers.map(w => w.pid),
     routerWorkerPid: routerWorker?.pid || null,
+    announcedIp: config.announcedIp,
+    rtcPortRange: config.rtcPortRange,
+    iceServerCount: (config.iceServers || []).length,
   };
 }
 

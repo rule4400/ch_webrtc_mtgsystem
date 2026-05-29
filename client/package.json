@@ -11,7 +11,10 @@
     "preview": "vite preview",
     "electron:start": "cross-env NODE_ENV=development wait-on http://localhost:5173 && electron .",
     "electron:dev": "concurrently -k \"npm run dev\" \"npm run electron:start\"",
-    "package": "npm run build && electron-builder build --mac --win"
+    "package": "npm run build && electron-builder build --mac --arm64 --win --x64",
+    "package:mac": "npm run build && electron-builder build --mac --arm64",
+    "package:win": "npm run build && electron-builder build --win --x64",
+    "package:win:arm64": "npm run build && electron-builder build --win --arm64"
   },
   "build": {
     "appId": "com.webrtc.meetingclient",

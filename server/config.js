@@ -54,6 +54,8 @@ function buildIceServers() {
 module.exports = {
   listenIp: '0.0.0.0',
   listenPort: Number(process.env.PORT) || 3000,
+  announcedIp: localIp,
+  rtcPortRange: { min: rtcMinPort, max: rtcMaxPort },
 
   // クライアントへ配布する ICE サーバー
   iceServers: buildIceServers(),

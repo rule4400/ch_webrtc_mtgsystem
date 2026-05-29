@@ -5,7 +5,10 @@
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
-    "package": "electron-builder build --mac --win"
+    "package": "electron-builder build --mac --arm64 --win --x64",
+    "package:mac": "electron-builder build --mac --arm64",
+    "package:win": "electron-builder build --win --x64",
+    "package:win:arm64": "electron-builder build --win --arm64"
   },
   "build": {
     "appId": "com.webrtc.servergui",
