@@ -127,8 +127,22 @@ function ensureBundledServerRuntime() {
     const examplePath = path.join(runtimeDir, '.env.example');
     if (fs.existsSync(examplePath)) fs.copyFileSync(examplePath, envPath);
   }
+  migrateGeneratedEnv(envPath);
 
   return runtimeDir;
+}
+
+function migrateGeneratedEnv(envPath) {
+  if (!fs.existsSync(envPath)) return;
+  const env = fs.readFileSync(envPath, 'utf8');
+  const looksGenerated =
+    env.includes('# VPN内で全クライアントから到達できるSFUサーバーのIPを指定してください。') &&
+    env.includes('ANNOUNCED_IP=10.0.0.10');
+
+  if (!looksGenerated) return;
+
+  fs.writeFileSync(envPath, env.replace('ANNOUNCED_IP=10.0.0.10', 'ANNOUNCED_IP='));
+  safeSend('server-log', `WARN: 旧バージョンのサンプル ANNOUNCED_IP=10.0.0.10 を無効化しました。必要に応じて Settings の .env を実際のVPN内IPに変更してください: ${envPath}`);
 }
 
 function getNodePathEnv() {

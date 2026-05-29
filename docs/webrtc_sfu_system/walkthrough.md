@@ -43,5 +43,7 @@ Macに加えて、Windows向けの実行ファイル（`.exe`）も同時にビ�
 
 VPN/Firewallでは `PORT` のTCP通信と、`RTC_MIN_PORT`-`RTC_MAX_PORT` のUDP/TCP通信を許可してください。
 
+`ANNOUNCED_IP` が未設定の場合はサーバーPCのLAN/VPN IPを自動検出します。複数NICや複数VPNを持つPCでは誤ったIPが選ばれることがあるため、その場合は `.env` に実際のVPN内IPを明示してください。
+
 > [!NOTE]
 > Windows版では初回起動時に「Windows Defender ファイアウォール」の警告が出ることがあります。その際は「プライベートネットワーク」での通信を許可してください（WebRTCの通信に必要です）。

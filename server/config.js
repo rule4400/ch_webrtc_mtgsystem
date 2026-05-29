@@ -17,10 +17,13 @@ function getLocalIp() {
 // 環境変数 ANNOUNCED_IP で上書き可能（VPN・パブリックIP対応）
 // 拠点間（インターネット/VPN越し）で使う場合は、クライアントから到達可能な
 // グローバルIP または VPN内IP を必ず ANNOUNCED_IP に指定すること。
-const localIp = process.env.ANNOUNCED_IP || getLocalIp();
+const rawAnnouncedIp = (process.env.ANNOUNCED_IP || '').trim();
+const localIp = rawAnnouncedIp || getLocalIp();
 console.log(`[Config] Announced IP: ${localIp}`);
-if (!process.env.ANNOUNCED_IP) {
+if (!rawAnnouncedIp) {
   console.warn('[Config] ANNOUNCED_IP 未設定: LAN IP を自動使用します。拠点間接続では到達可能なIPを ANNOUNCED_IP に設定してください。');
+} else if (rawAnnouncedIp === '10.0.0.10') {
+  console.warn('[Config] ANNOUNCED_IP がサンプル値 10.0.0.10 のままです。実際のVPN内IPか確認してください。');
 }
 
 const rtcMinPort = Number(process.env.RTC_MIN_PORT) || 10000;
@@ -36,7 +39,7 @@ const rtcMaxPort = Number(process.env.RTC_MAX_PORT) || 10200;
  */
 function buildIceServers() {
   const servers = [];
-  const stun = process.env.STUN_URLS || 'stun:stun.l.google.com:19302';
+  const stun = process.env.STUN_URLS || '';
   for (const u of stun.split(',').map(s => s.trim()).filter(Boolean)) {
     servers.push({ urls: u });
   }
