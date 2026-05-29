@@ -39,6 +39,8 @@ export class WebRTCManager {
     this._setupInFlight = null;
     this._consumeInFlight = new Set();
     this._iceRestartTimers = new Map();
+    this._setupRetryTimer = null;
+    this._setupRetryDelay = 1000;
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
 
@@ -72,9 +74,12 @@ export class WebRTCManager {
         console.log('[WebRTC] connected', this.socket.id);
         try {
           await this._setupSession();
+          this._setupRetryDelay = 1000;
           resolve();
         } catch (err) {
           console.error('[WebRTC] init failed', err);
+          this.onConnectionChange?.(false);
+          this._scheduleSetupRetry();
           reject(err);
         }
       });
@@ -86,6 +91,7 @@ export class WebRTCManager {
       this.socket.on('disconnect', (reason) => {
         console.warn('[WebRTC] disconnected:', reason);
         this._initialized = false;
+        this._clearSetupRetry();
         this.onConnectionChange?.(false);
         if (!this._manualDisconnect && reason === 'io server disconnect') {
           setTimeout(() => this.socket?.connect(), 2000);
@@ -97,8 +103,11 @@ export class WebRTCManager {
         console.log('[WebRTC] reconnected, rebuilding session');
         try {
           await this._setupSession();
+          this._setupRetryDelay = 1000;
         } catch (err) {
           console.error('[WebRTC] reconnect setup failed', err);
+          this.onConnectionChange?.(false);
+          this._scheduleSetupRetry();
         }
       });
 
@@ -110,6 +119,7 @@ export class WebRTCManager {
   async _setupSession() {
     if (this._setupInFlight) return this._setupInFlight;
     this._setupInFlight = (async () => {
+      this._clearSetupRetry();
       this.socket.emit('setMetadata', { locationName: this._locationName, appType: 'client' });
       await this._initMediasoup();
       this._initialized = true;
@@ -131,6 +141,32 @@ export class WebRTCManager {
     } finally {
       this._setupInFlight = null;
     }
+  }
+
+  _scheduleSetupRetry() {
+    if (this._manualDisconnect || !this.socket?.connected || this._setupRetryTimer) return;
+    const delay = this._setupRetryDelay;
+    this._setupRetryDelay = Math.min(30000, Math.round(this._setupRetryDelay * 1.7));
+
+    this._setupRetryTimer = setTimeout(async () => {
+      this._setupRetryTimer = null;
+      if (this._manualDisconnect || !this.socket?.connected) return;
+      console.warn(`[WebRTC] retrying media setup in-place after ${delay}ms backoff`);
+      try {
+        await this._setupSession();
+        this._setupRetryDelay = 1000;
+      } catch (err) {
+        console.error('[WebRTC] setup retry failed', err);
+        this.onConnectionChange?.(false);
+        this._scheduleSetupRetry();
+      }
+    }, delay);
+  }
+
+  _clearSetupRetry() {
+    if (!this._setupRetryTimer) return;
+    clearTimeout(this._setupRetryTimer);
+    this._setupRetryTimer = null;
   }
 
   _bindServerEvents() {
@@ -196,9 +232,11 @@ export class WebRTCManager {
       this._initialized = false;
       try {
         await this._setupSession();
+        this._setupRetryDelay = 1000;
       } catch (err) {
         console.error('[WebRTC] media layer rebuild failed', err);
         this.onConnectionChange?.(false);
+        this._scheduleSetupRetry();
       }
     });
   }
@@ -572,6 +610,7 @@ export class WebRTCManager {
     try { this.recvTransport?.close(); } catch { /* ignore close errors */ }
     for (const timer of this._iceRestartTimers.values()) clearTimeout(timer);
     this._iceRestartTimers.clear();
+    this._clearSetupRetry();
     this.socket?.disconnect();
     this.peers.clear();
     this.consumers.clear();

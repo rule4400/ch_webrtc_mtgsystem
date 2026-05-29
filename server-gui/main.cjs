@@ -37,6 +37,7 @@ let lastServerDir = null;
 let manualStop = false;
 let restartTimer = null;
 let restartAttempts = 0;
+let stoppingServer = false;
 
 const SERVER_RUNTIME_DIR = 'server-runtime';
 
@@ -44,6 +45,68 @@ const SERVER_RUNTIME_DIR = 'server-runtime';
 function safeSend(channel, ...args) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(channel, ...args);
+  }
+}
+
+function sendToServer(message) {
+  if (!serverProcess || !serverProcess.connected || !serverProcess.send) {
+    safeSend('server-log', 'WARN: サーバープロセスへ送信できません。サーバー状態を確認してください。');
+    return false;
+  }
+
+  try {
+    serverProcess.send(message);
+    return true;
+  } catch (err) {
+    safeSend('server-log', `ERROR: サーバープロセスIPC送信失敗: ${err.message}`);
+    return false;
+  }
+}
+
+function killServerTree(pid) {
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    spawn('taskkill', ['/pid', String(pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' });
+    return;
+  }
+
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // Process may have already exited.
+  }
+}
+
+function stopServerProcess({ manual = true } = {}) {
+  if (manual) manualStop = true;
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
+  }
+  if (!serverProcess) return;
+
+  const proc = serverProcess;
+  stoppingServer = true;
+  safeSend('server-log', manual ? '--- サーバーを手動停止します ---' : '--- サーバーを停止します ---');
+
+  const forceTimer = setTimeout(() => {
+    if (serverProcess === proc) {
+      safeSend('server-log', 'WARN: サーバー停止に時間がかかっています。プロセスツリーを強制終了します。');
+      killServerTree(proc.pid);
+    }
+  }, 5000);
+  forceTimer.unref?.();
+
+  proc.once('close', () => {
+    clearTimeout(forceTimer);
+    stoppingServer = false;
+  });
+
+  try {
+    proc.kill('SIGTERM');
+  } catch (err) {
+    safeSend('server-log', `ERROR: サーバー停止信号の送信に失敗: ${err.message}`);
+    killServerTree(proc.pid);
   }
 }
 
@@ -62,15 +125,7 @@ function createWindow() {
 app.whenReady().then(createWindow);
 
 app.on('window-all-closed', () => {
-  manualStop = true;
-  if (restartTimer) {
-    clearTimeout(restartTimer);
-    restartTimer = null;
-  }
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-  }
+  stopServerProcess();
   mainWindow = null; // safeSend がウィンドウ破棄後に送信しないようにする
   if (process.platform !== 'darwin') app.quit();
 });
@@ -178,6 +233,7 @@ function scheduleServerRestart(exitCode) {
 
 function startServerProcess(selectedPath, { automatic = false } = {}) {
   if (serverProcess) return;
+  stoppingServer = false;
 
   const serverDir = selectedPath && fs.existsSync(path.join(selectedPath, 'index.js'))
     ? selectedPath
@@ -240,6 +296,7 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
     safeSend('server-status', 'Stopped');
     safeSend('server-log', `--- サーバー停止 (終了コード: ${code}) ---`);
     serverProcess = null;
+    stoppingServer = false;
     if (code === 0) restartAttempts = 0;
     scheduleServerRestart(code);
   });
@@ -253,50 +310,38 @@ ipcMain.on('start-server', (event, selectedPath) => {
 });
 
 ipcMain.on('stop-server', () => {
-  manualStop = true;
-  if (restartTimer) {
-    clearTimeout(restartTimer);
-    restartTimer = null;
-  }
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-    safeSend('server-status', 'Stopped');
-    safeSend('server-log', '--- サーバーを手動停止しました ---');
-  }
+  if (stoppingServer) return;
+  stopServerProcess();
 });
 
 // Admin commands
 ipcMain.on('kick-client', (event, socketId) => {
-  if (serverProcess && serverProcess.send) {
-    serverProcess.send({ type: 'kick', socketId });
-  }
+  sendToServer({ type: 'kick', socketId });
 });
 
 ipcMain.on('restart-client', (_event, socketId) => {
-  if (serverProcess && serverProcess.send) {
+  if (serverProcess) {
     safeSend('server-log', `[Admin] クライアント個別再起動を送信: ${socketId}`);
-    serverProcess.send({ type: 'restart-client', socketId });
+    sendToServer({ type: 'restart-client', socketId });
   }
 });
 
-ipcMain.on('set-client-device', (_event, { socketId, kind, deviceId }) => {
-  if (serverProcess && serverProcess.send) {
+ipcMain.on('set-client-device', (_event, payload = {}) => {
+  const { socketId, kind, deviceId } = payload;
+  if (serverProcess) {
     safeSend('server-log', `[Admin] デバイス切替を送信: ${socketId} ${kind}`);
-    serverProcess.send({ type: 'set-client-device', socketId, kind, deviceId });
+    sendToServer({ type: 'set-client-device', socketId, kind, deviceId });
   }
 });
 
 ipcMain.on('refresh-client-devices', (_event, socketId) => {
-  if (serverProcess && serverProcess.send) {
-    serverProcess.send({ type: 'refresh-client-devices', socketId });
-  }
+  sendToServer({ type: 'refresh-client-devices', socketId });
 });
 
 ipcMain.on('restart-all', () => {
-  if (serverProcess && serverProcess.send) {
+  if (serverProcess) {
     safeSend('server-log', '[Admin] 全クライアントへ再起動信号を送信しました');
-    serverProcess.send({ type: 'restart-all' });
+    sendToServer({ type: 'restart-all' });
   } else {
     safeSend('server-log', 'WARN: サーバー未起動のため、再起動信号を送信できません');
   }

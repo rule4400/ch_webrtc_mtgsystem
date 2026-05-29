@@ -55,6 +55,8 @@ const RESTART_ACK_TIMEOUT_MS = 2500;
  * }
  */
 const peers = {};
+const MAX_DEVICE_LIST = 32;
+const MAX_MONITOR_PEERS = 32;
 
 // ── Workers ──────────────────────────────────────────────
 
@@ -133,6 +135,100 @@ function resetPeerMedia(peer) {
   peer.transports.clear();
   peer.producers.clear();
   peer.consumers.clear();
+}
+
+function asObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function shortString(value, max = 256) {
+  if (value == null) return '';
+  return String(value).slice(0, max);
+}
+
+function safeCallback(callback, payload) {
+  if (typeof callback === 'function') callback(payload);
+}
+
+function getPeerForRequest(socket, callback) {
+  const peer = peers[socket.id];
+  if (!peer) safeCallback(callback, { error: 'peer not found' });
+  return peer || null;
+}
+
+function sanitizeDeviceList(devices) {
+  if (!Array.isArray(devices)) return [];
+  return devices.slice(0, MAX_DEVICE_LIST).map(device => {
+    const item = asObject(device);
+    return {
+      deviceId: shortString(item.deviceId, 256),
+      groupId: shortString(item.groupId, 256),
+      kind: shortString(item.kind, 32),
+      label: shortString(item.label || item.kind || 'device', 160),
+    };
+  });
+}
+
+function sanitizeTelemetry(report) {
+  const data = asObject(report);
+  const devices = asObject(data.devices);
+  const selectedDevices = asObject(data.selectedDevices);
+  const localMedia = asObject(data.localMedia);
+  const remoteMonitor = asObject(data.remoteMonitor);
+  const connection = asObject(data.connection);
+  const transports = asObject(data.transports);
+
+  const monitorPeers = Array.isArray(remoteMonitor.peers)
+    ? remoteMonitor.peers.slice(0, MAX_MONITOR_PEERS).map(peer => {
+      const item = asObject(peer);
+      return {
+        socketId: shortString(item.socketId, 128),
+        name: shortString(item.name || 'unknown', 128),
+        videoPaused: !!item.videoPaused,
+        audioPaused: !!item.audioPaused,
+        receivingVideo: !!item.receivingVideo,
+        receivingAudio: !!item.receivingAudio,
+        video: asObject(item.video),
+        audio: asObject(item.audio),
+      };
+    })
+    : [];
+
+  return {
+    appType: shortString(data.appType || 'client', 24),
+    locationName: shortString(data.locationName || '', 128),
+    status: shortString(data.status || '', 32),
+    clientTime: Number.isFinite(data.clientTime) ? data.clientTime : null,
+    devices: {
+      video: sanitizeDeviceList(devices.video),
+      audioInput: sanitizeDeviceList(devices.audioInput),
+      audioOutput: sanitizeDeviceList(devices.audioOutput),
+    },
+    selectedDevices: {
+      video: shortString(selectedDevices.video, 256),
+      audioInput: shortString(selectedDevices.audioInput, 256),
+      audioOutput: shortString(selectedDevices.audioOutput, 256),
+    },
+    localMedia,
+    remoteMonitor: {
+      peerCount: Number(remoteMonitor.peerCount) || monitorPeers.length,
+      receivingVideoCount: Number(remoteMonitor.receivingVideoCount) || 0,
+      receivingAudioCount: Number(remoteMonitor.receivingAudioCount) || 0,
+      peers: monitorPeers,
+    },
+    connection,
+    transports,
+    consumers: Array.isArray(data.consumers) ? data.consumers.slice(0, MAX_MONITOR_PEERS) : [],
+  };
+}
+
+function safeProcessSend(message) {
+  if (!process.send || process.connected === false) return;
+  try {
+    process.send(message);
+  } catch (err) {
+    console.error('[IPC] send failed:', err.message);
+  }
 }
 
 function healthStatus(peer, now = Date.now()) {
@@ -217,9 +313,13 @@ function getStatsSnapshot() {
 }
 
 app.get('/health', (_, res) => res.json(getStatsSnapshot()));
+app.get('/ready', (_, res) => {
+  const ready = !!router && workers.length > 0 && !recovering;
+  res.status(ready ? 200 : 503).json({ ready, recovering, workers: workers.length });
+});
 
 function sendAdminLog(message) {
-  if (process.send) process.send({ type: 'admin-log', data: message });
+  if (process.send) safeProcessSend({ type: 'admin-log', data: message });
   else console.log(message);
 }
 
@@ -295,10 +395,10 @@ io.on('connection', async socket => {
 
   // ── 拠点名の設定 ──
   socket.on('setMetadata', (metadata = {}) => {
-    const { locationName, appType } = metadata;
+    const { locationName, appType } = asObject(metadata);
     if (peers[socket.id]) {
-      peers[socket.id].locationName = locationName || '不明';
-      if (appType) peers[socket.id].appType = appType;
+      peers[socket.id].locationName = shortString(locationName || '不明', 128);
+      if (appType) peers[socket.id].appType = shortString(appType, 24);
       console.log(`[Meta] ${socket.id} → "${locationName}"`);
     }
   });
@@ -306,44 +406,50 @@ io.on('connection', async socket => {
   socket.on('clientTelemetry', (report = {}, callback) => {
     const peer = peers[socket.id];
     if (!peer) return callback?.({ error: 'peer not found' });
+    const clean = sanitizeTelemetry(report);
 
     peer.lastHeartbeatAt = Date.now();
-    peer.telemetry = report;
-    peer.appType = report.appType || peer.appType || 'client';
-    if (report.locationName) peer.locationName = report.locationName;
-    peer.rttMs = Number.isFinite(report.connection?.telemetryRttMs)
-      ? Math.round(report.connection.telemetryRttMs)
+    peer.telemetry = clean;
+    peer.appType = clean.appType || peer.appType || 'client';
+    if (clean.locationName) peer.locationName = clean.locationName;
+    peer.rttMs = Number.isFinite(clean.connection?.telemetryRttMs)
+      ? Math.round(clean.connection.telemetryRttMs)
       : peer.rttMs;
     peer.deviceState = {
-      devices: report.devices || peer.deviceState.devices,
-      selectedDevices: report.selectedDevices || peer.deviceState.selectedDevices,
+      devices: clean.devices || peer.deviceState.devices,
+      selectedDevices: clean.selectedDevices || peer.deviceState.selectedDevices,
     };
     peer.monitorState = {
-      localMedia: report.localMedia || {},
-      remoteMonitor: report.remoteMonitor || {},
-      connection: report.connection || {},
-      transports: report.transports || {},
-      consumers: report.consumers || [],
+      localMedia: clean.localMedia || {},
+      remoteMonitor: clean.remoteMonitor || {},
+      connection: clean.connection || {},
+      transports: clean.transports || {},
+      consumers: clean.consumers || [],
     };
     callback?.({ ok: true, serverTime: Date.now() });
   });
 
   // ── Router capabilities ──
   socket.on('getRouterRtpCapabilities', (_, callback) => {
-    callback(router.rtpCapabilities);
+    if (!router) return safeCallback(callback, { error: 'router not ready' });
+    safeCallback(callback, router.rtpCapabilities);
   });
 
   // ── サーバー設定（ICE サーバーなど）──
   socket.on('getServerConfig', (_, callback) => {
-    callback({ iceServers: config.iceServers || [] });
+    safeCallback(callback, { iceServers: config.iceServers || [] });
   });
 
   // ── Transport 生成 ──
-  socket.on('createWebRtcTransport', async ({ forceTcp }, callback) => {
+  socket.on('createWebRtcTransport', async (payload = {}, callback) => {
     try {
+      const peer = getPeerForRequest(socket, callback);
+      if (!peer) return;
+      if (!router) return safeCallback(callback, { error: 'router not ready' });
+      const { forceTcp } = asObject(payload);
       const transport = await createWebRtcTransport(router, !!forceTcp);
-      peers[socket.id].transports.set(transport.id, transport);
-      callback({
+      peer.transports.set(transport.id, transport);
+      safeCallback(callback, {
         params: {
           id:              transport.id,
           iceParameters:   transport.iceParameters,
@@ -353,64 +459,75 @@ io.on('connection', async socket => {
       });
     } catch (err) {
       console.error('[createWebRtcTransport]', err);
-      callback({ error: err.message });
+      safeCallback(callback, { error: err.message });
     }
   });
 
   // ── Transport 接続 ──
-  socket.on('connectTransport', async ({ transportId, dtlsParameters }, callback) => {
+  socket.on('connectTransport', async (payload = {}, callback) => {
     try {
-      const transport = peers[socket.id].transports.get(transportId);
-      if (!transport) return callback({ error: 'transport not found' });
+      const peer = getPeerForRequest(socket, callback);
+      if (!peer) return;
+      const { transportId, dtlsParameters } = asObject(payload);
+      const transport = peer.transports.get(transportId);
+      if (!transport) return safeCallback(callback, { error: 'transport not found' });
       await transport.connect({ dtlsParameters });
-      callback({});
+      safeCallback(callback, {});
     } catch (err) {
-      callback({ error: err.message });
+      safeCallback(callback, { error: err.message });
     }
   });
 
   // ── Produce（映像/音声の送信開始）──
-  socket.on('produce', async ({ transportId, kind, rtpParameters, appData }, callback) => {
+  socket.on('produce', async (payload = {}, callback) => {
     try {
-      const transport = peers[socket.id].transports.get(transportId);
-      if (!transport) return callback({ error: 'transport not found' });
+      const peer = getPeerForRequest(socket, callback);
+      if (!peer) return;
+      const { transportId, kind, rtpParameters, appData } = asObject(payload);
+      if (!['audio', 'video'].includes(kind)) return safeCallback(callback, { error: 'invalid producer kind' });
+      const transport = peer.transports.get(transportId);
+      if (!transport) return safeCallback(callback, { error: 'transport not found' });
       const producer = await transport.produce({ kind, rtpParameters, appData });
 
-      peers[socket.id].producers.set(producer.id, { producer, kind, paused: false });
+      peer.producers.set(producer.id, { producer, kind, paused: false });
 
       producer.on('transportclose', () => {
         producer.close();
         peers[socket.id]?.producers.delete(producer.id);
       });
 
-      callback({ id: producer.id });
+      safeCallback(callback, { id: producer.id });
 
       // 他の全ピアへ通知（拠点名・kind・paused 状態も含む）
       socket.broadcast.emit('newProducer', {
         producerId:    producer.id,
         socketId:      socket.id,
-        locationName:  peers[socket.id].locationName,
+        locationName:  peer.locationName,
         kind:          producer.kind,
         paused:        false,
       });
 
     } catch (err) {
       console.error('[produce]', err);
-      callback({ error: err.message });
+      safeCallback(callback, { error: err.message });
     }
   });
 
   // ── Consume（他拠点の受信開始）──
-  socket.on('consume', async ({ transportId, producerId, rtpCapabilities }, callback) => {
+  socket.on('consume', async (payload = {}, callback) => {
     try {
-      const transport = peers[socket.id].transports.get(transportId);
-      if (!transport) return callback({ error: 'transport not found' });
+      const peer = getPeerForRequest(socket, callback);
+      if (!peer) return;
+      if (!router) return safeCallback(callback, { error: 'router not ready' });
+      const { transportId, producerId, rtpCapabilities } = asObject(payload);
+      const transport = peer.transports.get(transportId);
+      if (!transport) return safeCallback(callback, { error: 'transport not found' });
       if (!router.canConsume({ producerId, rtpCapabilities })) {
-        return callback({ error: 'cannot consume' });
+        return safeCallback(callback, { error: 'cannot consume' });
       }
       const consumer = await transport.consume({ producerId, rtpCapabilities, paused: true });
 
-      peers[socket.id].consumers.set(consumer.id, consumer);
+      peer.consumers.set(consumer.id, consumer);
 
       consumer.on('transportclose', () => {
         consumer.close();
@@ -422,7 +539,7 @@ io.on('connection', async socket => {
         peers[socket.id]?.consumers.delete(consumer.id);
       });
 
-      callback({
+      safeCallback(callback, {
         params: {
           id:            consumer.id,
           producerId:    consumer.producerId,
@@ -432,31 +549,37 @@ io.on('connection', async socket => {
       });
     } catch (err) {
       console.error('[consume]', err);
-      callback({ error: err.message });
+      safeCallback(callback, { error: err.message });
     }
   });
 
   // ── Consumer 再生開始 ──
-  socket.on('resume', async ({ consumerId }, callback) => {
+  socket.on('resume', async (payload = {}, callback) => {
     try {
-      const consumer = peers[socket.id].consumers.get(consumerId);
-      if (!consumer) return callback({ error: 'consumer not found' });
+      const peer = getPeerForRequest(socket, callback);
+      if (!peer) return;
+      const { consumerId } = asObject(payload);
+      const consumer = peer.consumers.get(consumerId);
+      if (!consumer) return safeCallback(callback, { error: 'consumer not found' });
       await consumer.resume();
-      callback({});
+      safeCallback(callback, {});
     } catch (err) {
-      callback({ error: err.message });
+      safeCallback(callback, { error: err.message });
     }
   });
 
   // ── ICE restart（VPN/拠点間の経路切替・一時断からの復旧）──
-  socket.on('restartIce', async ({ transportId }, callback) => {
+  socket.on('restartIce', async (payload = {}, callback) => {
     try {
-      const transport = peers[socket.id]?.transports.get(transportId);
-      if (!transport) return callback({ error: 'transport not found' });
+      const peer = getPeerForRequest(socket, callback);
+      if (!peer) return;
+      const { transportId } = asObject(payload);
+      const transport = peer.transports.get(transportId);
+      if (!transport) return safeCallback(callback, { error: 'transport not found' });
       const iceParameters = await transport.restartIce();
-      callback({ iceParameters });
+      safeCallback(callback, { iceParameters });
     } catch (err) {
-      callback({ error: err.message });
+      safeCallback(callback, { error: err.message });
     }
   });
 
@@ -475,7 +598,7 @@ io.on('connection', async socket => {
         });
       }
     }
-    callback(list);
+    safeCallback(callback, list);
   });
 
   // ── 全ピア状態を返す（1秒ポーリング用）──
@@ -493,12 +616,13 @@ io.on('connection', async socket => {
         producers,
       });
     }
-    callback(list);
+    safeCallback(callback, list);
   });
 
   // ── カメラ/マイク OFF（Producer 一時停止）──
-  socket.on('pauseProducer', async ({ producerId }, callback) => {
+  socket.on('pauseProducer', async (payload = {}, callback) => {
     try {
+      const { producerId } = asObject(payload);
       const entry = peers[socket.id]?.producers.get(producerId);
       if (!entry) return callback?.({ error: 'not found' });
       await entry.producer.pause();
@@ -511,8 +635,9 @@ io.on('connection', async socket => {
   });
 
   // ── カメラ/マイク ON（Producer 再開）──
-  socket.on('resumeProducer', async ({ producerId }, callback) => {
+  socket.on('resumeProducer', async (payload = {}, callback) => {
     try {
+      const { producerId } = asObject(payload);
       const entry = peers[socket.id]?.producers.get(producerId);
       if (!entry) return callback?.({ error: 'not found' });
       await entry.producer.resume();
@@ -544,34 +669,42 @@ io.on('connection', async socket => {
 
 if (process.send) {
   let lastCpuUsage = process.cpuUsage();
+  let lastCpuAt = process.hrtime.bigint();
 
   setInterval(() => {
+    const now = process.hrtime.bigint();
     const cu = process.cpuUsage(lastCpuUsage);
     lastCpuUsage = process.cpuUsage();
-    const cpuPercent = ((cu.user + cu.system) / 1_000 / 2000 * 100).toFixed(1);
+    const elapsedMs = Number(now - lastCpuAt) / 1_000_000;
+    lastCpuAt = now;
+    const cpuPercent = elapsedMs > 0
+      ? ((cu.user + cu.system) / 1_000 / elapsedMs * 100).toFixed(1)
+      : '0.0';
     const snapshot = getStatsSnapshot();
-    process.send({
+    safeProcessSend({
       type: 'stats',
       data: { ...snapshot, cpu: cpuPercent },
     });
-  }, 2000);
+  }, 1000);
 
-  process.on('message', msg => {
-    if (msg.type === 'kick' && msg.socketId) {
-      io.sockets.sockets.get(msg.socketId)?.disconnect(true);
-    } else if (msg.type === 'restart-client' && msg.socketId) {
-      const socket = io.sockets.sockets.get(msg.socketId);
-      if (socket) emitRestartCommand(socket, 1, `server-gui:${msg.socketId}`);
-      else sendAdminLog(`[Admin] restart-client failed: client not connected socket=${msg.socketId}`);
-    } else if (msg.type === 'set-client-device' && msg.socketId) {
+  process.on('message', rawMessage => {
+    const msg = asObject(rawMessage);
+    const socketId = shortString(msg.socketId, 128);
+    if (msg.type === 'kick' && socketId) {
+      io.sockets.sockets.get(socketId)?.disconnect(true);
+    } else if (msg.type === 'restart-client' && socketId) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket) emitRestartCommand(socket, 1, `server-gui:${socketId}`);
+      else sendAdminLog(`[Admin] restart-client failed: client not connected socket=${socketId}`);
+    } else if (msg.type === 'set-client-device' && socketId) {
       emitTargetCommand(
-        msg.socketId,
+        socketId,
         'adminSetDevice',
-        { kind: msg.kind, deviceId: msg.deviceId },
+        { kind: shortString(msg.kind, 32), deviceId: shortString(msg.deviceId, 256) },
         `set-device kind=${msg.kind}`,
       );
-    } else if (msg.type === 'refresh-client-devices' && msg.socketId) {
-      emitTargetCommand(msg.socketId, 'adminRefreshDevices', {}, 'refresh-devices');
+    } else if (msg.type === 'refresh-client-devices' && socketId) {
+      emitTargetCommand(socketId, 'adminRefreshDevices', {}, 'refresh-devices');
     } else if (msg.type === 'restart-all') {
       emitRestartCommand(io, io.sockets.sockets.size, 'server-gui');
     }

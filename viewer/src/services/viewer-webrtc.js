@@ -18,6 +18,8 @@ export class ViewerWebRTCManager {
     this._setupInFlight = null;
     this._consumeInFlight = new Set();
     this._iceRestartTimers = new Map();
+    this._setupRetryTimer = null;
+    this._setupRetryDelay = 1000;
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
 
@@ -49,9 +51,12 @@ export class ViewerWebRTCManager {
         console.log('[ViewerWebRTC] connected', this.socket.id);
         try {
           await this._setupSession();
+          this._setupRetryDelay = 1000;
           resolve();
         } catch (err) {
           console.error('[ViewerWebRTC] init failed', err);
+          this.onConnectionChange?.(false);
+          this._scheduleSetupRetry();
           reject(err);
         }
       });
@@ -63,6 +68,7 @@ export class ViewerWebRTCManager {
       this.socket.on('disconnect', (reason) => {
         console.warn('[ViewerWebRTC] disconnected:', reason);
         this._initialized = false;
+        this._clearSetupRetry();
         this.onConnectionChange?.(false);
         if (!this._manualDisconnect && reason === 'io server disconnect') {
           setTimeout(() => this.socket?.connect(), 2000);
@@ -73,8 +79,11 @@ export class ViewerWebRTCManager {
         console.log('[ViewerWebRTC] reconnected, rebuilding session');
         try {
           await this._setupSession();
+          this._setupRetryDelay = 1000;
         } catch (err) {
           console.error('[ViewerWebRTC] reconnect setup failed', err);
+          this.onConnectionChange?.(false);
+          this._scheduleSetupRetry();
         }
       });
 
@@ -86,6 +95,7 @@ export class ViewerWebRTCManager {
     if (this._setupInFlight) return this._setupInFlight;
 
     this._setupInFlight = (async () => {
+      this._clearSetupRetry();
       this.socket.emit('setMetadata', { locationName: this._viewerName, appType: 'viewer' });
       await this._initMediasoup();
       this._initialized = true;
@@ -103,6 +113,32 @@ export class ViewerWebRTCManager {
     } finally {
       this._setupInFlight = null;
     }
+  }
+
+  _scheduleSetupRetry() {
+    if (this._manualDisconnect || !this.socket?.connected || this._setupRetryTimer) return;
+    const delay = this._setupRetryDelay;
+    this._setupRetryDelay = Math.min(30000, Math.round(this._setupRetryDelay * 1.7));
+
+    this._setupRetryTimer = setTimeout(async () => {
+      this._setupRetryTimer = null;
+      if (this._manualDisconnect || !this.socket?.connected) return;
+      console.warn(`[ViewerWebRTC] retrying media setup in-place after ${delay}ms backoff`);
+      try {
+        await this._setupSession();
+        this._setupRetryDelay = 1000;
+      } catch (err) {
+        console.error('[ViewerWebRTC] setup retry failed', err);
+        this.onConnectionChange?.(false);
+        this._scheduleSetupRetry();
+      }
+    }, delay);
+  }
+
+  _clearSetupRetry() {
+    if (!this._setupRetryTimer) return;
+    clearTimeout(this._setupRetryTimer);
+    this._setupRetryTimer = null;
   }
 
   _bindServerEvents() {
@@ -168,9 +204,11 @@ export class ViewerWebRTCManager {
       this._initialized = false;
       try {
         await this._setupSession();
+        this._setupRetryDelay = 1000;
       } catch (err) {
         console.error('[ViewerWebRTC] media layer rebuild failed', err);
         this.onConnectionChange?.(false);
+        this._scheduleSetupRetry();
       }
     });
   }
@@ -446,6 +484,7 @@ export class ViewerWebRTCManager {
     try { this.recvTransport?.close(); } catch { /* ignore close errors */ }
     for (const timer of this._iceRestartTimers.values()) clearTimeout(timer);
     this._iceRestartTimers.clear();
+    this._clearSetupRetry();
     this.socket?.disconnect();
     this.peers.clear();
     this.consumers.clear();
