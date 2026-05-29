@@ -41,15 +41,17 @@
 
     .shell {
       display: grid;
-      grid-template-rows: 60px 44px 1fr;
+      grid-template-rows: auto auto minmax(0, 1fr);
       height: 100vh;
-      min-width: 920px;
+      min-width: 0;
     }
 
     .topbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 14px;
+      min-height: 60px;
       padding: 0 20px;
       background: #15181d;
       border-bottom: 1px solid var(--border);
@@ -59,6 +61,7 @@
       display: flex;
       align-items: center;
       gap: 12px;
+      min-width: 0;
     }
 
     .brand-mark {
@@ -75,12 +78,18 @@
     .brand-title {
       font-size: 0.98rem;
       font-weight: 700;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .brand-sub {
       margin-top: 2px;
       color: var(--muted);
       font-size: 0.74rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .status-pill {
@@ -114,6 +123,7 @@
       display: flex;
       align-items: center;
       gap: 8px;
+      flex-shrink: 0;
     }
 
     .btn {
@@ -143,6 +153,8 @@
       padding: 0 14px;
       background: #15181d;
       border-bottom: 1px solid var(--border);
+      min-height: 44px;
+      overflow-x: auto;
     }
 
     .tab {
@@ -187,7 +199,7 @@
 
     .metrics {
       display: grid;
-      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 10px;
     }
 
@@ -197,6 +209,7 @@
       border-radius: 8px;
       padding: 12px;
       min-height: 78px;
+      min-width: 0;
     }
 
     .metric-label {
@@ -206,8 +219,12 @@
     }
 
     .metric-value {
-      font-size: 1.45rem;
+      font-size: 1.35rem;
       font-weight: 800;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .metric-note {
@@ -223,7 +240,7 @@
       min-height: 0;
       overflow: auto;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
       align-content: start;
       gap: 12px;
       padding-right: 4px;
@@ -243,7 +260,7 @@
 
     .client-head {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 12px;
       padding: 12px;
       border-bottom: 1px solid var(--border);
@@ -275,8 +292,10 @@
 
     .client-actions {
       display: flex;
+      flex-wrap: wrap;
       gap: 6px;
       align-items: center;
+      justify-content: flex-end;
     }
 
     .mini-btn {
@@ -300,7 +319,7 @@
 
     .kv-grid {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));
       gap: 8px;
     }
 
@@ -337,9 +356,11 @@
 
     .device-grid {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 8px;
     }
+
+    .device-control { min-width: 0; }
 
     .device-control label {
       display: block;
@@ -350,6 +371,7 @@
 
     .device-control select {
       width: 100%;
+      min-width: 0;
       min-height: 32px;
       color: var(--text);
       background: #11151a;
@@ -357,6 +379,7 @@
       border-radius: 6px;
       padding: 0 8px;
       outline: none;
+      text-overflow: ellipsis;
     }
     .device-control select:disabled { color: #64748b; opacity: 0.7; }
 
@@ -463,6 +486,36 @@
       margin-bottom: 10px;
       font-size: 0.82rem;
     }
+
+    @media (max-width: 760px) {
+      .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 12px 14px;
+      }
+
+      .top-actions {
+        width: 100%;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+      }
+
+      .metrics {
+        grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      }
+
+      .panel {
+        padding: 12px;
+      }
+
+      .client-head {
+        grid-template-columns: 1fr;
+      }
+
+      .client-actions {
+        justify-content: flex-start;
+      }
+    }
   </style>
 </head>
 <body>
@@ -548,6 +601,9 @@
 
     let currentServerPath = localStorage.getItem('sfuServerPath') || '';
     let latestStats = null;
+    let deferredCardStats = null;
+    let lastCardsHtml = '';
+    let deviceSelectHoldUntil = 0;
     pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
 
     const healthText = {
@@ -720,6 +776,34 @@
       `;
     }
 
+    function holdClientCardRender(ms = 8000) {
+      deviceSelectHoldUntil = Math.max(deviceSelectHoldUntil, Date.now() + ms);
+    }
+
+    function isDeviceSelectActive() {
+      const active = document.activeElement;
+      return Date.now() < deviceSelectHoldUntil ||
+        !!active?.matches?.('select[data-action="device"]');
+    }
+
+    function renderClientCards(stats) {
+      const clients = stats.clients || [];
+      const html = clients.length
+        ? clients.map(clientCard).join('')
+        : '<div class="empty">接続端末がありません</div>';
+      if (html === lastCardsHtml) return;
+      lastCardsHtml = html;
+      clientCards.innerHTML = html;
+      clientCardsFull.innerHTML = html;
+    }
+
+    function flushDeferredCardStats() {
+      if (!deferredCardStats || isDeviceSelectActive()) return;
+      const stats = deferredCardStats;
+      deferredCardStats = null;
+      renderClientCards(stats);
+    }
+
     function renderStats(stats) {
       latestStats = stats;
       const clients = stats.clients || [];
@@ -738,11 +822,12 @@
       document.getElementById('mCpu').innerText = `${stats.cpu || '0.0'}%`;
       document.getElementById('mAnnounced').innerText = `${stats.announcedIp || '-'} / RTP ${stats.rtcPortRange?.min || '-'}-${stats.rtcPortRange?.max || '-'}`;
 
-      const html = clients.length
-        ? clients.map(clientCard).join('')
-        : '<div class="empty">接続端末がありません</div>';
-      clientCards.innerHTML = html;
-      clientCardsFull.innerHTML = html;
+      if (isDeviceSelectActive()) {
+        deferredCardStats = stats;
+      } else {
+        deferredCardStats = null;
+        renderClientCards(stats);
+      }
     }
 
     function resetStats() {
@@ -789,7 +874,23 @@
       container.addEventListener('change', event => {
         const select = event.target.closest('select[data-action="device"]');
         if (!select) return;
+        holdClientCardRender(1200);
         window.api.setClientDevice(select.dataset.socket, select.dataset.kind, select.value);
+        setTimeout(flushDeferredCardStats, 1300);
+      });
+
+      container.addEventListener('focusin', event => {
+        if (event.target.closest('select[data-action="device"]')) holdClientCardRender();
+      });
+
+      container.addEventListener('pointerdown', event => {
+        if (event.target.closest('select[data-action="device"]')) holdClientCardRender();
+      });
+
+      container.addEventListener('focusout', event => {
+        if (!event.target.closest('select[data-action="device"]')) return;
+        deviceSelectHoldUntil = Math.max(deviceSelectHoldUntil, Date.now() + 250);
+        setTimeout(flushDeferredCardStats, 300);
       });
     }
 

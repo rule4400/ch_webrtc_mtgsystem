@@ -272,6 +272,7 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     selectedDevices: peer.deviceState?.selectedDevices || {},
     localMedia: peer.monitorState?.localMedia || {},
     remoteMonitor: peer.monitorState?.remoteMonitor || {},
+    viewerPresence: !!peer.viewerPresenceActive,
     connection: peer.monitorState?.connection || {},
     transports: peer.monitorState?.transports || {},
     telemetry: peer.telemetry || null,
@@ -357,6 +358,42 @@ function emitTargetCommand(socketId, eventName, payload, label) {
   });
 }
 
+function computeViewerPresence(now = Date.now()) {
+  const activeTargets = new Set();
+
+  for (const [viewerId, peer] of Object.entries(peers)) {
+    const appType = peer.appType || peer.telemetry?.appType;
+    if (appType !== 'viewer') continue;
+    if (!peer.lastHeartbeatAt || now - peer.lastHeartbeatAt > 10000) continue;
+
+    const monitorPeers = peer.monitorState?.remoteMonitor?.peers || [];
+    for (const item of monitorPeers) {
+      const targetId = shortString(item?.socketId, 128);
+      if (!targetId || targetId === viewerId) continue;
+      if (peers[targetId]) activeTargets.add(targetId);
+    }
+  }
+
+  return activeTargets;
+}
+
+function broadcastViewerPresence() {
+  const activeTargets = computeViewerPresence();
+
+  for (const [socketId, peer] of Object.entries(peers)) {
+    const appType = peer.appType || peer.telemetry?.appType;
+    if (appType === 'viewer') continue;
+
+    const active = activeTargets.has(socketId);
+    if (peer.viewerPresenceActive === active) continue;
+    peer.viewerPresenceActive = active;
+    peer.socket.emit('viewerPresence', { active, serverTime: Date.now() });
+  }
+}
+
+const viewerPresenceTimer = setInterval(broadcastViewerPresence, 2000);
+viewerPresenceTimer.unref?.();
+
 // ── Transport ─────────────────────────────────────────────
 
 async function createWebRtcTransport(router, forceTcp = false) {
@@ -391,6 +428,7 @@ io.on('connection', async socket => {
     transports: new Map(),
     producers: new Map(),
     consumers: new Map(),
+    viewerPresenceActive: false,
   };
 
   // ── 拠点名の設定 ──
@@ -426,6 +464,7 @@ io.on('connection', async socket => {
       transports: clean.transports || {},
       consumers: clean.consumers || [],
     };
+    broadcastViewerPresence();
     callback?.({ ok: true, serverTime: Date.now() });
   });
 
@@ -662,6 +701,7 @@ io.on('connection', async socket => {
     delete peers[socket.id];
     // 全拠点に切断を通知
     io.emit('peerDisconnected', { socketId: socket.id });
+    broadcastViewerPresence();
   });
 });
 

@@ -268,6 +268,7 @@ export default function MainView() {
   const [sfuStatus,  setSfuStatus]  = useState('connecting');
   const [selfName,   setSelfName]   = useState('自拠点');
   const [camError,   setCamError]   = useState(null);
+  const [viewerPresenceActive, setViewerPresenceActive] = useState(false);
 
   // refs（クリーンアップ・デバイス変更用）
   const webrtcRef = useRef(null);
@@ -408,7 +409,11 @@ export default function MainView() {
         rtcManager.onPeerRemoved = (socketId) => {
           setPeers(prev => { const m = new Map(prev); m.delete(socketId); return m; });
         };
-        rtcManager.onConnectionChange = (ok) => setSfuStatus(ok ? 'connected' : 'error');
+        rtcManager.onConnectionChange = (ok) => {
+          setSfuStatus(ok ? 'connected' : 'error');
+          if (!ok) setViewerPresenceActive(false);
+        };
+        rtcManager.onViewerPresenceChange = setViewerPresenceActive;
         rtcManager.onRestartCommand = () => window.electronAPI?.restartApp?.();
         rtcManager.onAdminSetDevice = (payload) => {
           if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
@@ -668,6 +673,10 @@ export default function MainView() {
           />
         ))}
       </div>
+
+      {viewerPresenceActive && (
+        <div className="viewer-presence-dot" aria-hidden="true" />
+      )}
 
       {/* ── コントロールバー ── */}
       <div className="control-bar">

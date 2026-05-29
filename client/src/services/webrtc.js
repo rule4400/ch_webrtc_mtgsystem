@@ -51,6 +51,7 @@ export class WebRTCManager {
     this.onAdminSetDevice   = null;  // ({ kind, deviceId }) => Promise
     this.onAdminRefreshDevices = null; // () => Promise
     this.onConnectionChange = null;  // (connected: bool) => void
+    this.onViewerPresenceChange = null; // (active: bool) => void
   }
 
   // ── 接続（mediasoup 初期化＋ローカル produce まで await）──────────────
@@ -183,6 +184,10 @@ export class WebRTCManager {
     this.socket.on('producerClosed', ({ producerId }) => this._handleProducerClosed(producerId));
     this.socket.on('producerPaused',  ({ producerId, socketId }) => this._setProducerPaused(producerId, socketId, true));
     this.socket.on('producerResumed', ({ producerId, socketId }) => this._setProducerPaused(producerId, socketId, false));
+
+    this.socket.on('viewerPresence', (payload = {}) => {
+      this.onViewerPresenceChange?.(!!payload.active);
+    });
 
     this.socket.on('peerDisconnected', ({ socketId }) => {
       const peer = this.peers.get(socketId);

@@ -28,6 +28,7 @@ body {
 .main-layout {
   display: flex;
   flex-direction: column;
+  position: relative;
   height: 100vh;
   overflow: hidden;
 }
@@ -172,6 +173,19 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.viewer-presence-dot {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #2f80ff;
+  box-shadow: 0 0 0 3px rgba(47,128,255,0.18), 0 0 16px rgba(47,128,255,0.6);
+  z-index: 500;
+  pointer-events: none;
 }
 
 /* ── コントロールバー ──────────────────────────────── */

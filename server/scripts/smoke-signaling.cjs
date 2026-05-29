@@ -70,6 +70,7 @@ async function run() {
   });
 
   let socket;
+  let viewerSocket;
   const adminLogs = [];
   const stats = [];
 
@@ -99,6 +100,8 @@ async function run() {
     await onceWithTimeout(socket, 'connect', 5000);
 
     socket.emit('setMetadata', { locationName: 'smoke-client', appType: 'client' });
+    const viewerPresenceEvents = [];
+    socket.on('viewerPresence', payload => viewerPresenceEvents.push(payload));
 
     const telemetry = await emitAck(socket, 'clientTelemetry', {
       appType: 'client',
@@ -120,6 +123,34 @@ async function run() {
       connection: { telemetryRttMs: 3, appStatus: 'connected' },
     });
     if (!telemetry?.ok) throw new Error('telemetry ack failed');
+
+    viewerSocket = io(`http://127.0.0.1:${httpPort}`, { transports: ['websocket'], timeout: 3000 });
+    await onceWithTimeout(viewerSocket, 'connect', 5000);
+    viewerSocket.emit('setMetadata', { locationName: 'smoke-viewer', appType: 'viewer' });
+    const viewerTelemetry = await emitAck(viewerSocket, 'clientTelemetry', {
+      appType: 'viewer',
+      locationName: 'smoke-viewer',
+      devices: { video: [], audioInput: [], audioOutput: [] },
+      selectedDevices: {},
+      localMedia: { cameraEnabled: false, micEnabled: false, speakerMuted: false },
+      remoteMonitor: {
+        peerCount: 1,
+        receivingVideoCount: 1,
+        receivingAudioCount: 0,
+        peers: [{
+          socketId: socket.id,
+          name: 'smoke-client',
+          receivingVideo: true,
+          receivingAudio: false,
+        }],
+      },
+      connection: { telemetryRttMs: 4, appStatus: 'connected' },
+    });
+    if (!viewerTelemetry?.ok) throw new Error('viewer telemetry ack failed');
+    await wait(250);
+    if (!viewerPresenceEvents.some(event => event?.active === true)) {
+      throw new Error('viewerPresence active event was not delivered to client');
+    }
 
     const caps = await emitAck(socket, 'getRouterRtpCapabilities', {});
     if (!Array.isArray(caps?.codecs)) throw new Error('router capabilities missing');
@@ -151,6 +182,14 @@ async function run() {
     const health = await fetch(`http://127.0.0.1:${httpPort}/health`).then(response => response.json());
     const healthClient = health.clients?.find(client => client.id === socket.id);
     if (healthClient?.health !== 'healthy') throw new Error('health snapshot did not include healthy client');
+    if (healthClient?.viewerPresence !== true) throw new Error('health snapshot did not include viewer presence');
+
+    viewerSocket.disconnect();
+    viewerSocket = null;
+    await wait(350);
+    if (!viewerPresenceEvents.some(event => event?.active === false)) {
+      throw new Error('viewerPresence inactive event was not delivered after viewer disconnect');
+    }
 
     await wait(1100);
     if (!stats.some(snapshot => snapshot.clients?.some(client => client.id === socket.id))) {
@@ -162,6 +201,7 @@ async function run() {
 
     console.log('[smoke] signaling, telemetry, admin commands ok');
   } finally {
+    viewerSocket?.disconnect();
     socket?.disconnect();
     child.kill('SIGTERM');
     await wait(300);
