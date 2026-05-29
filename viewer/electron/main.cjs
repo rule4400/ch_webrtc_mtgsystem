@@ -1,9 +1,11 @@
 const { app, BrowserWindow, ipcMain, session } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
+const { pathToFileURL } = require('url');
 
 let mainWindow;
 let restartInProgress = false;
+let productionIndexUrl = null;
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -49,6 +51,12 @@ function restartApp() {
   app.exit(0);
 }
 
+function loadProductionApp() {
+  const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
+  productionIndexUrl = pathToFileURL(indexPath).toString();
+  return mainWindow.loadURL(productionIndexUrl);
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -68,8 +76,7 @@ function createWindow() {
     mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   } else {
-    const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
-    mainWindow.loadURL(`file://${indexPath}`);
+    loadProductionApp();
   }
 
   mainWindow.on('closed', () => { mainWindow = null; });
@@ -77,9 +84,21 @@ function createWindow() {
   mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.error(`[Load] failed code=${code} url=${url} ${desc}`);
     setTimeout(() => {
-      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (isDev) mainWindow.reload();
+      else loadProductionApp();
     }, 3000);
   });
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isDev || !productionIndexUrl) return;
+    if (url === productionIndexUrl || url.startsWith(`${productionIndexUrl}#`)) return;
+    event.preventDefault();
+    console.warn(`[Navigation] blocked unexpected top-level navigation: ${url}`);
+    loadProductionApp();
+  });
+
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
 
   mainWindow.webContents.on('render-process-gone', (_e, details) => {
     console.error(`[Renderer] gone: ${details.reason}`);
