@@ -5,191 +5,554 @@
   <title>SFU Server Admin Dashboard</title>
   <style>
     :root {
-      --bg: #1e1e1e;
-      --bg-panel: #2d2d30;
-      --text: #d4d4d4;
-      --border: #3e3e42;
-      --accent: #007acc;
-      --danger: #f44336;
-      --success: #4caf50;
+      --bg: #101214;
+      --surface: #171a1f;
+      --surface-2: #20242b;
+      --surface-3: #2a3038;
+      --border: rgba(255,255,255,0.1);
+      --text: #eef2f5;
+      --muted: #94a3b8;
+      --blue: #5ab0ff;
+      --green: #38d996;
+      --amber: #f6c35b;
+      --red: #ef5b5b;
+      --violet: #a78bfa;
     }
+
+    * { box-sizing: border-box; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background-color: var(--bg);
-      color: var(--text);
       margin: 0;
-      display: flex;
-      flex-direction: column;
       height: 100vh;
-      box-sizing: border-box;
+      overflow: hidden;
+      color: var(--text);
+      background: var(--bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      letter-spacing: 0;
     }
-    /* ヘッダー */
-    .header {
+
+    button, select, input {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      cursor: pointer;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-rows: 60px 44px 1fr;
+      height: 100vh;
+      min-width: 920px;
+    }
+
+    .topbar {
       display: flex;
-      justify-content: space-between;
       align-items: center;
-      padding: 15px 20px;
-      background-color: var(--bg-panel);
+      justify-content: space-between;
+      padding: 0 20px;
+      background: #15181d;
       border-bottom: 1px solid var(--border);
     }
-    .status-area {
+
+    .brand {
       display: flex;
       align-items: center;
-      gap: 10px;
-      font-size: 1.1rem;
-      font-weight: bold;
+      gap: 12px;
     }
-    .indicator {
-      width: 12px; height: 12px; border-radius: 50%;
-      background-color: var(--danger);
+
+    .brand-mark {
+      width: 34px;
+      height: 34px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(135deg, var(--blue), var(--green));
+      color: #071016;
+      font-weight: 800;
     }
-    .indicator.running { background-color: var(--success); }
-    .controls button {
-      padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer;
-      font-weight: bold; color: white; margin-left: 8px;
+
+    .brand-title {
+      font-size: 0.98rem;
+      font-weight: 700;
     }
-    #startBtn { background-color: var(--success); }
-    #stopBtn { background-color: var(--danger); }
-    
-    /* タブナビゲーション */
+
+    .brand-sub {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 0.74rem;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 11px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.78rem;
+      min-width: 112px;
+      justify-content: center;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--red);
+      box-shadow: 0 0 14px currentColor;
+      color: var(--red);
+    }
+    .dot.running { background: var(--green); color: var(--green); }
+    .dot.healthy { background: var(--green); color: var(--green); }
+    .dot.degraded, .dot.warming { background: var(--amber); color: var(--amber); }
+    .dot.stale, .dot.offline { background: var(--red); color: var(--red); }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 34px;
+      padding: 0 13px;
+      border-radius: 6px;
+      color: var(--text);
+      background: var(--surface-3);
+      border: 1px solid var(--border);
+      font-size: 0.8rem;
+      font-weight: 650;
+    }
+    .btn:hover { filter: brightness(1.08); }
+    .btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    .btn.primary { color: #061016; background: var(--green); border-color: transparent; }
+    .btn.danger { color: #fff; background: var(--red); border-color: transparent; }
+    .btn.ghost { background: rgba(255,255,255,0.05); }
+
     .tabs {
-      display: flex; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: stretch;
+      gap: 2px;
+      padding: 0 14px;
+      background: #15181d;
+      border-bottom: 1px solid var(--border);
     }
+
     .tab {
-      padding: 10px 20px; cursor: pointer; color: #888;
+      display: flex;
+      align-items: center;
+      padding: 0 14px;
+      color: var(--muted);
       border-bottom: 2px solid transparent;
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 650;
     }
-    .tab:hover { color: var(--text); }
-    .tab.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
-    
-    /* コンテンツエリア */
+    .tab.active {
+      color: var(--text);
+      border-color: var(--blue);
+    }
+
     .content {
-      flex: 1; overflow: hidden; position: relative; padding: 20px;
+      min-height: 0;
+      overflow: hidden;
     }
+
     .panel {
-      display: none; height: 100%; flex-direction: column;
+      display: none;
+      height: 100%;
+      min-height: 0;
+      padding: 16px;
     }
-    .panel.active { display: flex; }
-    
-    /* ダッシュボード */
-    .dashboard-grid {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
+    .panel.active { display: flex; flex-direction: column; }
+
+    .dashboard-layout {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 14px;
+      min-height: 0;
     }
-    .card {
-      background: var(--bg-panel); border: 1px solid var(--border);
-      border-radius: 6px; padding: 20px; text-align: center;
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
     }
-    .card-title { font-size: 0.9rem; color: #888; margin-bottom: 10px; }
-    .card-value { font-size: 2rem; font-weight: bold; }
-    
-    /* クライアントテーブル */
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border); }
-    th { color: #888; font-weight: normal; }
-    .btn-kick { background: transparent; border: 1px solid var(--danger); color: var(--danger); padding: 4px 10px; border-radius: 4px; cursor: pointer; }
-    .btn-kick:hover { background: var(--danger); color: white; }
-    
-    /* ログ */
+
+    .metric {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      min-height: 78px;
+    }
+
+    .metric-label {
+      color: var(--muted);
+      font-size: 0.72rem;
+      margin-bottom: 8px;
+    }
+
+    .metric-value {
+      font-size: 1.45rem;
+      font-weight: 800;
+    }
+
+    .metric-note {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .client-grid {
+      min-height: 0;
+      overflow: auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      align-content: start;
+      gap: 12px;
+      padding-right: 4px;
+    }
+
+    .client-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .client-card.healthy { border-color: rgba(56,217,150,0.45); }
+    .client-card.degraded, .client-card.warming { border-color: rgba(246,195,91,0.5); }
+    .client-card.stale, .client-card.offline { border-color: rgba(239,91,91,0.5); }
+
+    .client-head {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.025);
+    }
+
+    .client-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      font-weight: 760;
+    }
+
+    .client-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .client-meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.72rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .client-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .mini-btn {
+      min-height: 28px;
+      padding: 0 9px;
+      border-radius: 5px;
+      background: var(--surface-3);
+      color: var(--text);
+      border: 1px solid var(--border);
+      font-size: 0.72rem;
+      font-weight: 700;
+    }
+    .mini-btn.danger { background: rgba(239,91,91,0.18); border-color: rgba(239,91,91,0.4); color: #ffb3b3; }
+    .mini-btn.blue { background: rgba(90,176,255,0.15); border-color: rgba(90,176,255,0.38); color: #b8dcff; }
+
+    .client-body {
+      padding: 12px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .kv-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+    }
+
+    .kv {
+      background: rgba(255,255,255,0.045);
+      border-radius: 6px;
+      padding: 8px;
+      min-width: 0;
+    }
+
+    .kv span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.68rem;
+      margin-bottom: 5px;
+    }
+
+    .kv strong {
+      display: block;
+      font-size: 0.82rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .section-title {
+      color: var(--muted);
+      font-size: 0.7rem;
+      font-weight: 760;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 7px;
+    }
+
+    .device-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .device-control label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.68rem;
+      margin-bottom: 4px;
+    }
+
+    .device-control select {
+      width: 100%;
+      min-height: 32px;
+      color: var(--text);
+      background: #11151a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0 8px;
+      outline: none;
+    }
+    .device-control select:disabled { color: #64748b; opacity: 0.7; }
+
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-height: 26px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      color: var(--muted);
+      font-size: 0.7rem;
+      border: 1px solid transparent;
+      max-width: 100%;
+    }
+    .chip.ok { color: #b8f7dc; background: rgba(56,217,150,0.12); border-color: rgba(56,217,150,0.24); }
+    .chip.warn { color: #ffe0a3; background: rgba(246,195,91,0.12); border-color: rgba(246,195,91,0.28); }
+    .chip.bad { color: #ffc0c0; background: rgba(239,91,91,0.12); border-color: rgba(239,91,91,0.28); }
+    .chip.blue { color: #b8dcff; background: rgba(90,176,255,0.12); border-color: rgba(90,176,255,0.24); }
+
+    .monitor-list {
+      display: grid;
+      gap: 6px;
+      max-height: 150px;
+      overflow: auto;
+    }
+
+    .monitor-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      align-items: center;
+      gap: 6px;
+      min-height: 30px;
+      padding: 5px 7px;
+      background: rgba(255,255,255,0.035);
+      border-radius: 6px;
+    }
+
+    .monitor-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.76rem;
+    }
+
+    .empty {
+      color: var(--muted);
+      font-size: 0.8rem;
+      padding: 18px;
+      text-align: center;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+    }
+
     .log-container {
-      flex: 1; background-color: #000; border-radius: 4px; padding: 10px;
-      font-family: "Courier New", monospace; overflow-y: auto; font-size: 0.9rem;
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 12px;
+      background: #050607;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.78rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
     }
-    
-    /* 設定 */
-    .settings-row { margin-bottom: 15px; }
-    .settings-row label { display: block; margin-bottom: 5px; color: #888; }
-    .path-display { padding: 10px; background: #000; border: 1px solid var(--border); border-radius: 4px; margin-bottom: 10px;}
-    .btn-secondary { background: #555; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; }
+
+    .settings-wrap {
+      max-width: 860px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .settings-row {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .settings-row label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.75rem;
+      margin-bottom: 8px;
+    }
+
+    .path-display {
+      padding: 10px;
+      background: #080a0d;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: #cbd5e1;
+      word-break: break-all;
+      margin-bottom: 10px;
+      font-size: 0.82rem;
+    }
   </style>
 </head>
 <body>
-  <div class="header">
-    <div class="status-area">
-      <div id="statusDot" class="indicator"></div>
-      <span id="statusText">Stopped</span>
-    </div>
-    <div class="controls">
-      <button id="startBtn">Start Server</button>
-      <button id="stopBtn">Stop Server</button>
-    </div>
-  </div>
-  
-  <div class="tabs">
-    <div class="tab active" data-target="dashboard">Dashboard</div>
-    <div class="tab" data-target="clients">Clients</div>
-    <div class="tab" data-target="logs">Logs</div>
-    <div class="tab" data-target="settings">Settings</div>
-  </div>
-  
-  <div class="content">
-    <!-- ダッシュボード -->
-    <div id="dashboard" class="panel active">
-      <div class="dashboard-grid">
-        <div class="card">
-          <div class="card-title">Connected Peers</div>
-          <div class="card-value" id="valPeers">0</div>
-        </div>
-        <div class="card">
-          <div class="card-title">Total Streams (Prod / Cons)</div>
-          <div class="card-value" id="valStreams">0 / 0</div>
-        </div>
-        <div class="card">
-          <div class="card-title">Memory Usage</div>
-          <div class="card-value" id="valMem">0 MB</div>
-        </div>
-        <div class="card">
-          <div class="card-title">CPU Usage</div>
-          <div class="card-value" id="valCpu">0.0 %</div>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">SFU</div>
+        <div>
+          <div class="brand-title">WebRTC 常時接続 管理ダッシュボード</div>
+          <div class="brand-sub">端末状態、受信監視、デバイス制御</div>
         </div>
       </div>
-      <div style="margin-top: 20px; text-align: right;">
-        <button id="restartAllBtn" style="background: var(--danger); color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer;">⚠ Force Restart All Clients</button>
+      <div class="top-actions">
+        <div class="status-pill">
+          <span id="statusDot" class="dot"></span>
+          <span id="statusText">Stopped</span>
+        </div>
+        <button id="startBtn" class="btn primary">Start</button>
+        <button id="stopBtn" class="btn danger">Stop</button>
       </div>
-    </div>
-    
-    <!-- クライアント管理 -->
-    <div id="clients" class="panel">
-      <div style="overflow-y: auto; flex: 1; border: 1px solid var(--border); border-radius: 4px;">
-        <table>
-          <thead>
-            <tr>
-              <th>Socket ID</th>
-              <th>Producers</th>
-              <th>Consumers</th>
-              <th>Action</th>
-            </tr>
-          </thead>
-          <tbody id="clientsTableBody">
-            <tr><td colspan="4" style="text-align: center; color: #888;">No clients connected</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-    
-    <!-- ログ -->
-    <div id="logs" class="panel">
-      <div class="log-container" id="logOutput">
-        === SFU Server Logs ===
-      </div>
-    </div>
-    
-    <!-- 設定 -->
-    <div id="settings" class="panel">
-      <div class="settings-row">
-        <label>Server Runtime</label>
-        <div class="path-display" id="pathDisplay">内蔵サーバーを使用します</div>
-        <button class="btn-secondary" id="selectBtn">外部サーバーフォルダを選択</button>
-        <button class="btn-secondary" id="useBundledBtn">内蔵サーバーに戻す</button>
-      </div>
-      <div class="settings-row">
-        <label>Bundled Server .env</label>
-        <div class="path-display" id="envDisplay">Loading...</div>
-      </div>
-    </div>
+    </header>
+
+    <nav class="tabs">
+      <div class="tab active" data-target="dashboard">Dashboard</div>
+      <div class="tab" data-target="clients">Clients</div>
+      <div class="tab" data-target="logs">Logs</div>
+      <div class="tab" data-target="settings">Settings</div>
+    </nav>
+
+    <main class="content">
+      <section id="dashboard" class="panel active dashboard-layout">
+        <div class="metrics">
+          <div class="metric"><div class="metric-label">Connected</div><div class="metric-value" id="mPeers">0</div><div class="metric-note" id="mHealth">waiting</div></div>
+          <div class="metric"><div class="metric-label">Media Streams</div><div class="metric-value" id="mStreams">0 / 0</div><div class="metric-note">producers / consumers</div></div>
+          <div class="metric"><div class="metric-label">Receive OK</div><div class="metric-value" id="mReceive">0</div><div class="metric-note">client-side monitor</div></div>
+          <div class="metric"><div class="metric-label">Memory</div><div class="metric-value" id="mMemory">0 MB</div><div class="metric-note" id="mUptime">uptime 0s</div></div>
+          <div class="metric"><div class="metric-label">CPU</div><div class="metric-value" id="mCpu">0.0%</div><div class="metric-note" id="mAnnounced">ANNOUNCED_IP</div></div>
+          <div class="metric"><div class="metric-label">Actions</div><button id="restartAllBtn" class="btn danger" style="width:100%; margin-top:4px;">Restart All</button><div class="metric-note">all connected clients</div></div>
+        </div>
+        <div id="clientCards" class="client-grid">
+          <div class="empty">サーバー起動後、接続端末の状態がここに表示されます</div>
+        </div>
+      </section>
+
+      <section id="clients" class="panel">
+        <div id="clientCardsFull" class="client-grid"></div>
+      </section>
+
+      <section id="logs" class="panel">
+        <div class="log-container" id="logOutput">=== SFU Server Logs ===</div>
+      </section>
+
+      <section id="settings" class="panel">
+        <div class="settings-wrap">
+          <div class="settings-row">
+            <label>Server Runtime</label>
+            <div class="path-display" id="pathDisplay">内蔵サーバーを使用します</div>
+            <button class="btn ghost" id="selectBtn">外部サーバーフォルダを選択</button>
+            <button class="btn ghost" id="useBundledBtn">内蔵サーバーに戻す</button>
+          </div>
+          <div class="settings-row">
+            <label>Bundled Server .env</label>
+            <div class="path-display" id="envDisplay">Loading...</div>
+          </div>
+        </div>
+      </section>
+    </main>
   </div>
 
   <script>
-    // Tab logic
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const selectBtn = document.getElementById('selectBtn');
+    const useBundledBtn = document.getElementById('useBundledBtn');
+    const restartAllBtn = document.getElementById('restartAllBtn');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const logOutput = document.getElementById('logOutput');
+    const pathDisplay = document.getElementById('pathDisplay');
+    const envDisplay = document.getElementById('envDisplay');
+    const clientCards = document.getElementById('clientCards');
+    const clientCardsFull = document.getElementById('clientCardsFull');
+
+    let currentServerPath = localStorage.getItem('sfuServerPath') || '';
+    let latestStats = null;
+    pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
+
+    const healthText = {
+      healthy: '正常',
+      degraded: '注意',
+      warming: '準備中',
+      stale: '応答なし',
+      offline: '切断',
+    };
+
     document.querySelectorAll('.tab').forEach(tab => {
       tab.addEventListener('click', () => {
         document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -199,19 +562,220 @@
       });
     });
 
-    const startBtn = document.getElementById('startBtn');
-    const stopBtn = document.getElementById('stopBtn');
-    const selectBtn = document.getElementById('selectBtn');
-    const useBundledBtn = document.getElementById('useBundledBtn');
-    const statusDot = document.getElementById('statusDot');
-    const statusText = document.getElementById('statusText');
-    const logOutput = document.getElementById('logOutput');
-    const pathDisplay = document.getElementById('pathDisplay');
-    const envDisplay = document.getElementById('envDisplay');
-    const restartAllBtn = document.getElementById('restartAllBtn');
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, char => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      }[char]));
+    }
 
-    let currentServerPath = localStorage.getItem('sfuServerPath') || '';
-    pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
+    function fmtMs(ms) {
+      if (ms == null) return '-';
+      if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+      return `${Math.round(ms / 1000)}s`;
+    }
+
+    function fmtUptime(sec) {
+      const s = Number(sec) || 0;
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      if (h > 0) return `${h}h ${m}m`;
+      return `${m}m ${s % 60}s`;
+    }
+
+    function shortId(id) {
+      return String(id || '').slice(0, 8);
+    }
+
+    function deviceOptions(devices, selected, label) {
+      if (!Array.isArray(devices) || devices.length === 0) {
+        return `<option value="">${label}なし</option>`;
+      }
+      return devices.map(device => {
+        const value = escapeHtml(device.deviceId);
+        const text = escapeHtml(device.label || device.kind || 'device');
+        const active = device.deviceId === selected ? 'selected' : '';
+        return `<option value="${value}" ${active}>${text}</option>`;
+      }).join('');
+    }
+
+    function mediaChip(label, ok, warn = false) {
+      const cls = ok ? 'ok' : (warn ? 'warn' : 'bad');
+      return `<span class="chip ${cls}">${escapeHtml(label)}</span>`;
+    }
+
+    function monitorRows(client) {
+      const peers = client.remoteMonitor?.peers || [];
+      if (!peers.length) return '<div class="empty">受信モニターなし</div>';
+      return `<div class="monitor-list">${peers.map(peer => `
+        <div class="monitor-row">
+          <div class="monitor-name">${escapeHtml(peer.name || peer.socketId || 'unknown')}</div>
+          ${mediaChip('Video', !!peer.receivingVideo, !!peer.videoPaused)}
+          ${mediaChip('Audio', !!peer.receivingAudio, !!peer.audioPaused)}
+        </div>
+      `).join('')}</div>`;
+    }
+
+    function clientCard(client) {
+      const devices = client.devices || {};
+      const selected = client.selectedDevices || {};
+      const local = client.localMedia || {};
+      const remote = client.remoteMonitor || {};
+      const transports = client.transports || {};
+      const isViewer = client.appType === 'viewer';
+      const health = client.health || 'warming';
+      const videoDisabled = isViewer || !(devices.video || []).length;
+      const micDisabled = isViewer || !(devices.audioInput || []).length;
+      const speakerDisabled = !(devices.audioOutput || []).length;
+      const recvOk = (remote.receivingVideoCount || 0) + (remote.receivingAudioCount || 0);
+
+      return `
+        <article class="client-card ${escapeHtml(health)}">
+          <div class="client-head">
+            <div>
+              <div class="client-title">
+                <span class="dot ${escapeHtml(health)}"></span>
+                <span class="client-name">${escapeHtml(client.name || '不明')}</span>
+                <span class="chip blue">${escapeHtml(client.appType || 'client')}</span>
+              </div>
+              <div class="client-meta">${escapeHtml(shortId(client.id))} / ${escapeHtml(client.remoteAddress || '-')}</div>
+            </div>
+            <div class="client-actions">
+              <button class="mini-btn blue" data-action="refresh" data-socket="${escapeHtml(client.id)}">Devices</button>
+              <button class="mini-btn danger" data-action="restart" data-socket="${escapeHtml(client.id)}">Restart</button>
+              <button class="mini-btn" data-action="kick" data-socket="${escapeHtml(client.id)}">Kick</button>
+            </div>
+          </div>
+          <div class="client-body">
+            <div class="kv-grid">
+              <div class="kv"><span>Health</span><strong>${escapeHtml(healthText[health] || health)}</strong></div>
+              <div class="kv"><span>Last seen</span><strong>${fmtMs(client.heartbeatAgeMs)}</strong></div>
+              <div class="kv"><span>RTT</span><strong>${fmtMs(client.rttMs)}</strong></div>
+              <div class="kv"><span>Recv OK</span><strong>${recvOk}</strong></div>
+            </div>
+
+            <div>
+              <div class="section-title">Media State</div>
+              <div class="chip-row">
+                ${mediaChip('Camera', !!local.cameraEnabled && local.video?.readyState === 'live', !local.cameraEnabled)}
+                ${mediaChip('Mic', !!local.micEnabled && local.audio?.readyState === 'live', !local.micEnabled)}
+                ${mediaChip('Speaker', !local.speakerMuted, !!local.speakerMuted)}
+                <span class="chip blue">Send ${escapeHtml(transports.sendState || 'none')}</span>
+                <span class="chip blue">Recv ${escapeHtml(transports.recvState || 'none')}</span>
+              </div>
+            </div>
+
+            <div>
+              <div class="section-title">Device Control</div>
+              <div class="device-grid">
+                <div class="device-control">
+                  <label>Camera</label>
+                  <select data-action="device" data-socket="${escapeHtml(client.id)}" data-kind="video" ${videoDisabled ? 'disabled' : ''}>
+                    ${deviceOptions(devices.video, selected.video, 'Camera')}
+                  </select>
+                </div>
+                <div class="device-control">
+                  <label>Microphone</label>
+                  <select data-action="device" data-socket="${escapeHtml(client.id)}" data-kind="audioInput" ${micDisabled ? 'disabled' : ''}>
+                    ${deviceOptions(devices.audioInput, selected.audioInput, 'Mic')}
+                  </select>
+                </div>
+                <div class="device-control">
+                  <label>Speaker</label>
+                  <select data-action="device" data-socket="${escapeHtml(client.id)}" data-kind="audioOutput" ${speakerDisabled ? 'disabled' : ''}>
+                    ${deviceOptions(devices.audioOutput, selected.audioOutput, 'Speaker')}
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <div class="section-title">Client Receive Monitor</div>
+              ${monitorRows(client)}
+            </div>
+          </div>
+        </article>
+      `;
+    }
+
+    function renderStats(stats) {
+      latestStats = stats;
+      const clients = stats.clients || [];
+      const health = stats.healthCounts || {};
+      const receiveOk = clients.reduce((sum, client) => {
+        const remote = client.remoteMonitor || {};
+        return sum + (remote.receivingVideoCount || 0) + (remote.receivingAudioCount || 0);
+      }, 0);
+
+      document.getElementById('mPeers').innerText = stats.peerCount ?? 0;
+      document.getElementById('mHealth').innerText = `正常 ${health.healthy || 0} / 注意 ${(health.degraded || 0) + (health.warming || 0)} / 応答なし ${(health.stale || 0) + (health.offline || 0)}`;
+      document.getElementById('mStreams').innerText = `${stats.totalProducers || 0} / ${stats.totalConsumers || 0}`;
+      document.getElementById('mReceive').innerText = receiveOk;
+      document.getElementById('mMemory').innerText = `${Math.round((stats.memory || 0) / 1024 / 1024)} MB`;
+      document.getElementById('mUptime').innerText = `uptime ${fmtUptime(stats.uptimeSec || 0)}`;
+      document.getElementById('mCpu').innerText = `${stats.cpu || '0.0'}%`;
+      document.getElementById('mAnnounced').innerText = `${stats.announcedIp || '-'} / RTP ${stats.rtcPortRange?.min || '-'}-${stats.rtcPortRange?.max || '-'}`;
+
+      const html = clients.length
+        ? clients.map(clientCard).join('')
+        : '<div class="empty">接続端末がありません</div>';
+      clientCards.innerHTML = html;
+      clientCardsFull.innerHTML = html;
+    }
+
+    function resetStats() {
+      renderStats({
+        peerCount: 0,
+        totalProducers: 0,
+        totalConsumers: 0,
+        memory: 0,
+        uptimeSec: 0,
+        cpu: '0.0',
+        clients: [],
+        healthCounts: {},
+      });
+    }
+
+    function appendLog(log) {
+      const p = document.createElement('div');
+      p.innerText = String(log || '').trim();
+      if (/ERROR|error|failed|失敗/.test(p.innerText)) p.style.color = 'var(--red)';
+      if (/WARN|注意|timeout/.test(p.innerText)) p.style.color = 'var(--amber)';
+      if (p.innerText.includes('[Admin]')) p.style.color = 'var(--blue)';
+      logOutput.appendChild(p);
+      logOutput.scrollTop = logOutput.scrollHeight;
+      if (logOutput.childNodes.length > 2000) logOutput.removeChild(logOutput.firstChild);
+    }
+
+    function wireClientActions(container) {
+      container.addEventListener('click', event => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const socketId = button.dataset.socket;
+        const action = button.dataset.action;
+        if (action === 'restart' && confirm(`クライアント ${socketId} を再起動しますか？`)) {
+          window.api.restartClient(socketId);
+        }
+        if (action === 'kick' && confirm(`クライアント ${socketId} を切断しますか？`)) {
+          window.api.kickClient(socketId);
+        }
+        if (action === 'refresh') {
+          window.api.refreshClientDevices(socketId);
+        }
+      });
+
+      container.addEventListener('change', event => {
+        const select = event.target.closest('select[data-action="device"]');
+        if (!select) return;
+        window.api.setClientDevice(select.dataset.socket, select.dataset.kind, select.value);
+      });
+    }
+
+    wireClientActions(clientCards);
+    wireClientActions(clientCardsFull);
 
     window.api.getServerInfo().then(info => {
       envDisplay.innerText = info.defaultEnvPath || 'Unknown';
@@ -234,87 +798,30 @@
       pathDisplay.innerText = '内蔵サーバーを使用します';
     });
 
-    startBtn.addEventListener('click', () => {
-      window.api.startServer(currentServerPath);
-    });
+    startBtn.addEventListener('click', () => window.api.startServer(currentServerPath));
+    stopBtn.addEventListener('click', () => window.api.stopServer());
 
-    stopBtn.addEventListener('click', () => {
-      window.api.stopServer();
+    restartAllBtn.addEventListener('click', () => {
+      if (!confirm('全クライアントへ再起動指示を送信しますか？')) return;
+      restartAllBtn.disabled = true;
+      restartAllBtn.innerText = 'Sending...';
+      window.api.restartAll();
+      setTimeout(() => {
+        restartAllBtn.disabled = false;
+        restartAllBtn.innerText = 'Restart All';
+      }, 6000);
     });
 
     window.api.onServerStatus((status) => {
       statusText.innerText = status;
-      if (status === 'Running') {
-        statusDot.classList.add('running');
-      } else {
-        statusDot.classList.remove('running');
-        // Reset stats
-        document.getElementById('valPeers').innerText = '0';
-        document.getElementById('valStreams').innerText = '0 / 0';
-        document.getElementById('valMem').innerText = '0 MB';
-        document.getElementById('valCpu').innerText = '0.0 %';
-        document.getElementById('clientsTableBody').innerHTML = '<tr><td colspan="4" style="text-align: center; color: #888;">Server stopped</td></tr>';
-      }
+      statusDot.classList.toggle('running', status === 'Running');
+      if (status !== 'Running') resetStats();
     });
 
-    window.api.onServerLog((log) => {
-      const p = document.createElement('div');
-      p.innerText = log.trim();
-      if(log.includes('ERROR') || log.includes('error')) p.style.color = 'var(--danger)';
-      if(log.includes('[Admin]')) p.style.color = 'var(--accent)';
-      
-      logOutput.appendChild(p);
-      logOutput.scrollTop = logOutput.scrollHeight;
-      if (logOutput.childNodes.length > 2000) logOutput.removeChild(logOutput.firstChild);
-    });
+    window.api.onServerLog(appendLog);
+    window.api.onServerStats(renderStats);
 
-    window.api.onServerStats((stats) => {
-      document.getElementById('valPeers').innerText = stats.peerCount;
-      document.getElementById('valStreams').innerText = `${stats.totalProducers} / ${stats.totalConsumers}`;
-      document.getElementById('valMem').innerText = `${Math.round(stats.memory / 1024 / 1024)} MB`;
-      document.getElementById('valCpu').innerText = `${stats.cpu} %`;
-
-      const tbody = document.getElementById('clientsTableBody');
-      if (stats.clients.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: #888;">No clients connected</td></tr>';
-      } else {
-        tbody.innerHTML = '';
-        stats.clients.forEach(c => {
-          const tr = document.createElement('tr');
-          tr.innerHTML = `
-            <td>${c.id}</td>
-            <td>${c.producers}</td>
-            <td>${c.consumers}</td>
-            <td><button class="btn-kick" data-id="${c.id}">Kick</button></td>
-          `;
-          tbody.appendChild(tr);
-        });
-
-        // Add kick listeners
-        document.querySelectorAll('.btn-kick').forEach(btn => {
-          btn.addEventListener('click', (e) => {
-            const id = e.target.dataset.id;
-            if (confirm(`本当にクライアント ${id} を切断しますか？`)) {
-              window.api.kickClient(id);
-            }
-          });
-        });
-      }
-    });
-
-    restartAllBtn.addEventListener('click', () => {
-      if (confirm('警告: 全てのクライアントを強制的に再起動させます。よろしいですか？')) {
-        restartAllBtn.disabled = true;
-        restartAllBtn.style.opacity = '0.65';
-        restartAllBtn.innerText = 'Sending restart...';
-        window.api.restartAll();
-        setTimeout(() => {
-          restartAllBtn.disabled = false;
-          restartAllBtn.style.opacity = '1';
-          restartAllBtn.innerText = '⚠ Force Restart All Clients';
-        }, 6000);
-      }
-    });
+    resetStats();
   </script>
 </body>
 </html>

@@ -28,7 +28,12 @@ const app = express();
 app.use(cors());
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, {
+  cors: { origin: '*' },
+  pingInterval: 10000,
+  pingTimeout: 30000,
+  connectTimeout: 15000,
+});
 
 let workers = [];
 let nextWorkerIdx = 0;
@@ -44,6 +49,9 @@ const RESTART_ACK_TIMEOUT_MS = 2500;
  *   transports: Map<transportId, Transport>,
  *   producers: Map<producerId, { producer, kind, paused }>,
  *   consumers: Map<consumerId, Consumer>,
+ *   deviceState: object,
+ *   monitorState: object,
+ *   lastHeartbeatAt: number,
  * }
  */
 const peers = {};
@@ -127,21 +135,69 @@ function resetPeerMedia(peer) {
   peer.consumers.clear();
 }
 
+function healthStatus(peer, now = Date.now()) {
+  if (!peer) return 'offline';
+  if (!peer.lastHeartbeatAt) return 'warming';
+  const age = now - peer.lastHeartbeatAt;
+  if (age <= 7000) return 'healthy';
+  if (age <= 20000) return 'degraded';
+  return 'stale';
+}
+
+function getPeerClientSnapshot(id, peer, now = Date.now()) {
+  const producerList = Array.from(peer.producers.entries()).map(([producerId, { kind, paused }]) => ({
+    producerId,
+    kind,
+    paused,
+  }));
+  const consumerList = Array.from(peer.consumers.entries()).map(([consumerId, consumer]) => ({
+    consumerId,
+    producerId: consumer.producerId,
+    kind: consumer.kind,
+    paused: consumer.paused,
+    closed: consumer.closed,
+  }));
+  const heartbeatAgeMs = peer.lastHeartbeatAt ? now - peer.lastHeartbeatAt : null;
+
+  return {
+    id,
+    name: peer.locationName,
+    appType: peer.appType || peer.telemetry?.appType || 'client',
+    remoteAddress: peer.socket.handshake.address,
+    connectedAt: peer.connectedAt,
+    heartbeatAgeMs,
+    health: healthStatus(peer, now),
+    rttMs: peer.rttMs ?? null,
+    producers: peer.producers.size,
+    consumers: peer.consumers.size,
+    producerList,
+    consumerList,
+    devices: peer.deviceState?.devices || { video: [], audioInput: [], audioOutput: [] },
+    selectedDevices: peer.deviceState?.selectedDevices || {},
+    localMedia: peer.monitorState?.localMedia || {},
+    remoteMonitor: peer.monitorState?.remoteMonitor || {},
+    connection: peer.monitorState?.connection || {},
+    transports: peer.monitorState?.transports || {},
+    telemetry: peer.telemetry || null,
+  };
+}
+
 function getStatsSnapshot() {
   let totalProducers = 0;
   let totalConsumers = 0;
   const clients = [];
+  const now = Date.now();
 
   for (const [id, peer] of Object.entries(peers)) {
     totalProducers += peer.producers.size;
     totalConsumers += peer.consumers.size;
-    clients.push({
-      id,
-      name: peer.locationName,
-      producers: peer.producers.size,
-      consumers: peer.consumers.size,
-    });
+    clients.push(getPeerClientSnapshot(id, peer, now));
   }
+
+  const healthCounts = clients.reduce((acc, client) => {
+    acc[client.health] = (acc[client.health] || 0) + 1;
+    return acc;
+  }, {});
 
   return {
     status: recovering ? 'recovering' : 'ok',
@@ -150,6 +206,7 @@ function getStatsSnapshot() {
     peerCount: Object.keys(peers).length,
     totalProducers,
     totalConsumers,
+    healthCounts,
     clients,
     workerPids: workers.map(w => w.pid),
     routerWorkerPid: routerWorker?.pid || null,
@@ -162,8 +219,8 @@ function getStatsSnapshot() {
 app.get('/health', (_, res) => res.json(getStatsSnapshot()));
 
 function sendAdminLog(message) {
-  console.log(message);
   if (process.send) process.send({ type: 'admin-log', data: message });
+  else console.log(message);
 }
 
 function emitRestartCommand(target, recipientCount, reason) {
@@ -174,11 +231,29 @@ function emitRestartCommand(target, recipientCount, reason) {
   if (recipientCount === 0) return;
 
   target.timeout(RESTART_ACK_TIMEOUT_MS).emit('restartCommand', payload, (err, responses = []) => {
-    const acknowledged = Array.isArray(responses) ? responses.length : 0;
+    const acknowledged = Array.isArray(responses) ? responses.length : (responses ? 1 : 0);
     const timedOut = err ? Math.max(recipientCount - acknowledged, 0) : 0;
     const elapsedMs = Date.now() - issuedAt;
     const suffix = timedOut > 0 ? ` timeout=${timedOut}` : '';
     sendAdminLog(`[Admin] restartCommand ack=${acknowledged}/${recipientCount}${suffix} elapsed=${elapsedMs}ms`);
+  });
+}
+
+function emitTargetCommand(socketId, eventName, payload, label) {
+  const socket = io.sockets.sockets.get(socketId);
+  if (!socket) {
+    sendAdminLog(`[Admin] ${label} failed: client not connected socket=${socketId}`);
+    return;
+  }
+
+  const issuedAt = Date.now();
+  socket.timeout(RESTART_ACK_TIMEOUT_MS).emit(eventName, payload || {}, (err, response) => {
+    const elapsedMs = Date.now() - issuedAt;
+    if (err || response?.error) {
+      sendAdminLog(`[Admin] ${label} failed socket=${socketId} error=${response?.error || err.message} elapsed=${elapsedMs}ms`);
+      return;
+    }
+    sendAdminLog(`[Admin] ${label} ok socket=${socketId} elapsed=${elapsedMs}ms`);
   });
 }
 
@@ -206,17 +281,51 @@ io.on('connection', async socket => {
   peers[socket.id] = {
     socket,
     locationName: '接続中...',
+    appType: 'client',
+    connectedAt: Date.now(),
+    lastHeartbeatAt: null,
+    rttMs: null,
+    telemetry: null,
+    deviceState: { devices: { video: [], audioInput: [], audioOutput: [] }, selectedDevices: {} },
+    monitorState: {},
     transports: new Map(),
     producers: new Map(),
     consumers: new Map(),
   };
 
   // ── 拠点名の設定 ──
-  socket.on('setMetadata', ({ locationName }) => {
+  socket.on('setMetadata', (metadata = {}) => {
+    const { locationName, appType } = metadata;
     if (peers[socket.id]) {
       peers[socket.id].locationName = locationName || '不明';
+      if (appType) peers[socket.id].appType = appType;
       console.log(`[Meta] ${socket.id} → "${locationName}"`);
     }
+  });
+
+  socket.on('clientTelemetry', (report = {}, callback) => {
+    const peer = peers[socket.id];
+    if (!peer) return callback?.({ error: 'peer not found' });
+
+    peer.lastHeartbeatAt = Date.now();
+    peer.telemetry = report;
+    peer.appType = report.appType || peer.appType || 'client';
+    if (report.locationName) peer.locationName = report.locationName;
+    peer.rttMs = Number.isFinite(report.connection?.telemetryRttMs)
+      ? Math.round(report.connection.telemetryRttMs)
+      : peer.rttMs;
+    peer.deviceState = {
+      devices: report.devices || peer.deviceState.devices,
+      selectedDevices: report.selectedDevices || peer.deviceState.selectedDevices,
+    };
+    peer.monitorState = {
+      localMedia: report.localMedia || {},
+      remoteMonitor: report.remoteMonitor || {},
+      connection: report.connection || {},
+      transports: report.transports || {},
+      consumers: report.consumers || [],
+    };
+    callback?.({ ok: true, serverTime: Date.now() });
   });
 
   // ── Router capabilities ──
@@ -450,6 +559,19 @@ if (process.send) {
   process.on('message', msg => {
     if (msg.type === 'kick' && msg.socketId) {
       io.sockets.sockets.get(msg.socketId)?.disconnect(true);
+    } else if (msg.type === 'restart-client' && msg.socketId) {
+      const socket = io.sockets.sockets.get(msg.socketId);
+      if (socket) emitRestartCommand(socket, 1, `server-gui:${msg.socketId}`);
+      else sendAdminLog(`[Admin] restart-client failed: client not connected socket=${msg.socketId}`);
+    } else if (msg.type === 'set-client-device' && msg.socketId) {
+      emitTargetCommand(
+        msg.socketId,
+        'adminSetDevice',
+        { kind: msg.kind, deviceId: msg.deviceId },
+        `set-device kind=${msg.kind}`,
+      );
+    } else if (msg.type === 'refresh-client-devices' && msg.socketId) {
+      emitTargetCommand(msg.socketId, 'adminRefreshDevices', {}, 'refresh-devices');
     } else if (msg.type === 'restart-all') {
       emitRestartCommand(io, io.sockets.sockets.size, 'server-gui');
     }

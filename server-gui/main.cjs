@@ -273,6 +273,26 @@ ipcMain.on('kick-client', (event, socketId) => {
   }
 });
 
+ipcMain.on('restart-client', (_event, socketId) => {
+  if (serverProcess && serverProcess.send) {
+    safeSend('server-log', `[Admin] クライアント個別再起動を送信: ${socketId}`);
+    serverProcess.send({ type: 'restart-client', socketId });
+  }
+});
+
+ipcMain.on('set-client-device', (_event, { socketId, kind, deviceId }) => {
+  if (serverProcess && serverProcess.send) {
+    safeSend('server-log', `[Admin] デバイス切替を送信: ${socketId} ${kind}`);
+    serverProcess.send({ type: 'set-client-device', socketId, kind, deviceId });
+  }
+});
+
+ipcMain.on('refresh-client-devices', (_event, socketId) => {
+  if (serverProcess && serverProcess.send) {
+    serverProcess.send({ type: 'refresh-client-devices', socketId });
+  }
+});
+
 ipcMain.on('restart-all', () => {
   if (serverProcess && serverProcess.send) {
     safeSend('server-log', '[Admin] 全クライアントへ再起動信号を送信しました');

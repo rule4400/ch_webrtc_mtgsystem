@@ -225,6 +225,26 @@ function getGridCols(n) {
   return 4;
 }
 
+function serializeDevices(devices) {
+  return devices.map(device => ({
+    deviceId: device.deviceId,
+    groupId: device.groupId,
+    kind: device.kind,
+    label: device.label || device.kind,
+  }));
+}
+
+function trackReport(track) {
+  if (!track) return { present: false, readyState: 'missing', enabled: false, muted: false, label: '' };
+  return {
+    present: true,
+    readyState: track.readyState,
+    enabled: track.enabled,
+    muted: !!track.muted,
+    label: track.label || '',
+  };
+}
+
 // ─── メインビュー ─────────────────────────────────────────
 export default function MainView() {
   const navigate = useNavigate();
@@ -254,6 +274,40 @@ export default function MainView() {
   const streamRef = useRef(null);
   const configRef = useRef({});
   const mediaRecoveryRef = useRef(false);
+  const telemetryStateRef = useRef({});
+  const adminHandlersRef = useRef({});
+
+  useEffect(() => {
+    telemetryStateRef.current = {
+      videoDevices,
+      audioInDevices,
+      audioOutDevices,
+      selectedVideoId,
+      selectedAudioInId,
+      selectedAudioOutId,
+      micEnabled,
+      camEnabled,
+      speakerMuted,
+      peers,
+      sfuStatus,
+      selfName,
+      camError,
+    };
+  }, [
+    videoDevices,
+    audioInDevices,
+    audioOutDevices,
+    selectedVideoId,
+    selectedAudioInId,
+    selectedAudioOutId,
+    micEnabled,
+    camEnabled,
+    speakerMuted,
+    peers,
+    sfuStatus,
+    selfName,
+    camError,
+  ]);
 
   // ─── デバイス一覧を取得 ──────────────────────────────────
   const refreshDevices = useCallback(async () => {
@@ -356,6 +410,14 @@ export default function MainView() {
         };
         rtcManager.onConnectionChange = (ok) => setSfuStatus(ok ? 'connected' : 'error');
         rtcManager.onRestartCommand = () => window.electronAPI?.restartApp?.();
+        rtcManager.onAdminSetDevice = (payload) => {
+          if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
+          return adminHandlersRef.current.setDevice(payload);
+        };
+        rtcManager.onAdminRefreshDevices = () => {
+          if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
+          return adminHandlersRef.current.refreshDevices();
+        };
 
         // 送信トラックを manager に登録（接続/再接続のたびに自動で produce される）
         const s = streamRef.current;
@@ -431,6 +493,99 @@ export default function MainView() {
     const conf = { ...configRef.current, selectedAudioOutId: deviceId };
     configRef.current = conf;
     localStorage.setItem('sfu_config', JSON.stringify(conf));
+  }, []);
+
+  useEffect(() => {
+    adminHandlersRef.current = {
+      setDevice: async ({ kind, deviceId }) => {
+        if (!deviceId && deviceId !== '') throw new Error('deviceId is required');
+        if (kind === 'video') {
+          await changeMediaDevice('video', deviceId);
+          return { selectedDevices: { video: deviceId } };
+        }
+        if (kind === 'audioInput') {
+          await changeMediaDevice('audioIn', deviceId);
+          return { selectedDevices: { audioInput: deviceId } };
+        }
+        if (kind === 'audioOutput') {
+          changeSpeaker(deviceId);
+          return { selectedDevices: { audioOutput: deviceId } };
+        }
+        throw new Error(`unsupported device kind: ${kind}`);
+      },
+      refreshDevices: async () => {
+        const devices = await refreshDevices();
+        return {
+          devices: {
+            video: serializeDevices(devices.video),
+            audioInput: serializeDevices(devices.audioIn),
+            audioOutput: serializeDevices(devices.audioOut),
+          },
+        };
+      },
+    };
+  }, [changeMediaDevice, changeSpeaker, refreshDevices]);
+
+  useEffect(() => {
+    const sendTelemetry = () => {
+      const manager = webrtcRef.current;
+      if (!manager) return;
+      const state = telemetryStateRef.current;
+      const stream = streamRef.current;
+      const videoTrack = stream?.getVideoTracks()[0] || null;
+      const audioTrack = stream?.getAudioTracks()[0] || null;
+      const remotePeers = Array.from((state.peers || new Map()).entries()).map(([socketId, peer]) => {
+        const video = peer.stream?.getVideoTracks()[0] || null;
+        const audio = peer.stream?.getAudioTracks()[0] || null;
+        return {
+          socketId,
+          name: peer.locationName,
+          videoPaused: !!peer.videoPaused,
+          audioPaused: !!peer.audioPaused,
+          video: trackReport(video),
+          audio: trackReport(audio),
+          receivingVideo: !!video && video.readyState === 'live' && !peer.videoPaused,
+          receivingAudio: !!audio && audio.readyState === 'live' && !peer.audioPaused,
+        };
+      });
+
+      manager.sendTelemetry({
+        appType: 'client',
+        locationName: state.selfName,
+        status: state.sfuStatus,
+        devices: {
+          video: serializeDevices(state.videoDevices || []),
+          audioInput: serializeDevices(state.audioInDevices || []),
+          audioOutput: serializeDevices(state.audioOutDevices || []),
+        },
+        selectedDevices: {
+          video: state.selectedVideoId,
+          audioInput: state.selectedAudioInId,
+          audioOutput: state.selectedAudioOutId,
+        },
+        localMedia: {
+          cameraEnabled: !!state.camEnabled,
+          micEnabled: !!state.micEnabled,
+          speakerMuted: !!state.speakerMuted,
+          video: trackReport(videoTrack),
+          audio: trackReport(audioTrack),
+          error: state.camError || null,
+        },
+        remoteMonitor: {
+          peerCount: remotePeers.length,
+          receivingVideoCount: remotePeers.filter(peer => peer.receivingVideo).length,
+          receivingAudioCount: remotePeers.filter(peer => peer.receivingAudio).length,
+          peers: remotePeers,
+        },
+        connection: {
+          appStatus: state.sfuStatus,
+        },
+      });
+    };
+
+    sendTelemetry();
+    const id = setInterval(sendTelemetry, 2000);
+    return () => clearInterval(id);
   }, []);
 
   // ─── カメラ ON/OFF ────────────────────────────────────────

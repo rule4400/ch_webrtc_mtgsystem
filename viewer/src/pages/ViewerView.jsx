@@ -10,6 +10,26 @@ function getGridCols(n) {
   return 4;
 }
 
+function serializeDevices(devices) {
+  return devices.map(device => ({
+    deviceId: device.deviceId,
+    groupId: device.groupId,
+    kind: device.kind,
+    label: device.label || device.kind,
+  }));
+}
+
+function trackReport(track) {
+  if (!track) return { present: false, readyState: 'missing', enabled: false, muted: false, label: '' };
+  return {
+    present: true,
+    readyState: track.readyState,
+    enabled: track.enabled,
+    muted: !!track.muted,
+    label: track.label || '',
+  };
+}
+
 const VideoCell = React.memo(function VideoCell({
   label, stream, videoPaused, audioPaused, speakerDeviceId, speakerMuted,
 }) {
@@ -103,20 +123,36 @@ export default function ViewerView() {
 
   const managerRef = useRef(null);
   const configRef = useRef({});
+  const telemetryStateRef = useRef({});
+  const adminHandlersRef = useRef({});
 
   const refreshAudioOutputs = useCallback(async () => {
     try {
-      if (!navigator.mediaDevices?.enumerateDevices) return;
+      if (!navigator.mediaDevices?.enumerateDevices) return [];
       const devices = await navigator.mediaDevices.enumerateDevices();
       const outputs = devices.filter(device => device.kind === 'audiooutput');
       setAudioOutDevices(outputs);
       if (!selectedAudioOutId && outputs[0]?.deviceId) {
         setSelectedAudioOutId(outputs[0].deviceId);
       }
+      return outputs;
     } catch {
       // setSinkId/audiooutput enumeration is not available on every platform.
+      return [];
     }
   }, [selectedAudioOutId]);
+
+  useEffect(() => {
+    telemetryStateRef.current = {
+      peers,
+      status,
+      error,
+      speakerMuted,
+      audioOutDevices,
+      selectedAudioOutId,
+      viewerName: configRef.current.viewerName || '閲覧端末',
+    };
+  }, [peers, status, error, speakerMuted, audioOutDevices, selectedAudioOutId]);
 
   useEffect(() => {
     let manager = null;
@@ -150,6 +186,14 @@ export default function ViewerView() {
       };
       manager.onConnectionChange = (ok) => setStatus(ok ? 'connected' : 'error');
       manager.onRestartCommand = () => window.electronAPI?.restartApp?.();
+      manager.onAdminSetDevice = (payload) => {
+        if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
+        return adminHandlersRef.current.setDevice(payload);
+      };
+      manager.onAdminRefreshDevices = () => {
+        if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
+        return adminHandlersRef.current.refreshDevices();
+      };
 
       try {
         const serverUrl = `http://${config.serverIp}:${config.serverPort || 3000}`;
@@ -182,6 +226,81 @@ export default function ViewerView() {
     const config = { ...configRef.current, selectedAudioOutId: deviceId };
     configRef.current = config;
     localStorage.setItem('sfu_viewer_config', JSON.stringify(config));
+  }, []);
+
+  useEffect(() => {
+    adminHandlersRef.current = {
+      setDevice: async ({ kind, deviceId }) => {
+        if (kind !== 'audioOutput') throw new Error(`unsupported device kind: ${kind}`);
+        changeSpeaker(deviceId);
+        return { selectedDevices: { audioOutput: deviceId } };
+      },
+      refreshDevices: async () => {
+        const outputs = await refreshAudioOutputs();
+        return {
+          devices: {
+            video: [],
+            audioInput: [],
+            audioOutput: serializeDevices(outputs),
+          },
+        };
+      },
+    };
+  }, [changeSpeaker, refreshAudioOutputs]);
+
+  useEffect(() => {
+    const sendTelemetry = () => {
+      const manager = managerRef.current;
+      if (!manager) return;
+      const state = telemetryStateRef.current;
+      const remotePeers = Array.from((state.peers || new Map()).entries()).map(([socketId, peer]) => {
+        const video = peer.stream?.getVideoTracks()[0] || null;
+        const audio = peer.stream?.getAudioTracks()[0] || null;
+        return {
+          socketId,
+          name: peer.locationName,
+          videoPaused: !!peer.videoPaused,
+          audioPaused: !!peer.audioPaused,
+          video: trackReport(video),
+          audio: trackReport(audio),
+          receivingVideo: !!video && video.readyState === 'live' && !peer.videoPaused,
+          receivingAudio: !!audio && audio.readyState === 'live' && !peer.audioPaused,
+        };
+      });
+
+      manager.sendTelemetry({
+        appType: 'viewer',
+        locationName: state.viewerName,
+        status: state.status,
+        devices: {
+          video: [],
+          audioInput: [],
+          audioOutput: serializeDevices(state.audioOutDevices || []),
+        },
+        selectedDevices: {
+          audioOutput: state.selectedAudioOutId,
+        },
+        localMedia: {
+          cameraEnabled: false,
+          micEnabled: false,
+          speakerMuted: !!state.speakerMuted,
+          error: state.error || null,
+        },
+        remoteMonitor: {
+          peerCount: remotePeers.length,
+          receivingVideoCount: remotePeers.filter(peer => peer.receivingVideo).length,
+          receivingAudioCount: remotePeers.filter(peer => peer.receivingAudio).length,
+          peers: remotePeers,
+        },
+        connection: {
+          appStatus: state.status,
+        },
+      });
+    };
+
+    sendTelemetry();
+    const id = setInterval(sendTelemetry, 2000);
+    return () => clearInterval(id);
   }, []);
 
   const peerList = Array.from(peers.entries());

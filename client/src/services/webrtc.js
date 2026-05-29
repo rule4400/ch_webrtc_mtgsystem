@@ -37,11 +37,17 @@ export class WebRTCManager {
     this._locationName   = '';
     this._manualDisconnect = false;
     this._setupInFlight = null;
+    this._consumeInFlight = new Set();
+    this._iceRestartTimers = new Map();
+    this._lastTelemetryRtt = null;
+    this._lastTelemetryAckAt = null;
 
     // コールバック
     this.onPeerUpdated      = null;  // (socketId, peer) => void
     this.onPeerRemoved      = null;  // (socketId) => void
     this.onRestartCommand   = null;  // () => void
+    this.onAdminSetDevice   = null;  // ({ kind, deviceId }) => Promise
+    this.onAdminRefreshDevices = null; // () => Promise
     this.onConnectionChange = null;  // (connected: bool) => void
   }
 
@@ -52,10 +58,14 @@ export class WebRTCManager {
     this._manualDisconnect = false;
     return new Promise((resolve, reject) => {
       this.socket = io(serverUrl, {
+        transports: ['websocket', 'polling'],
+        upgrade: true,
+        rememberUpgrade: true,
         reconnectionAttempts: Infinity,   // 常時接続用途: 無限リトライ
         reconnectionDelay: 1000,
-        reconnectionDelayMax: 5000,
-        timeout: 10000,
+        reconnectionDelayMax: 8000,
+        randomizationFactor: 0.5,
+        timeout: 12000,
       });
 
       this.socket.once('connect', async () => {
@@ -100,7 +110,7 @@ export class WebRTCManager {
   async _setupSession() {
     if (this._setupInFlight) return this._setupInFlight;
     this._setupInFlight = (async () => {
-      this.socket.emit('setMetadata', { locationName: this._locationName });
+      this.socket.emit('setMetadata', { locationName: this._locationName, appType: 'client' });
       await this._initMediasoup();
       this._initialized = true;
 
@@ -159,6 +169,26 @@ export class WebRTCManager {
         ack({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
       }
       setTimeout(() => this.onRestartCommand?.(payload), 100);
+    });
+
+    this.socket.on('adminSetDevice', async (payload, ack) => {
+      try {
+        if (!this.onAdminSetDevice) throw new Error('device control is not ready');
+        const result = await this.onAdminSetDevice(payload || {});
+        ack?.({ ok: true, ...result });
+      } catch (err) {
+        ack?.({ error: err.message });
+      }
+    });
+
+    this.socket.on('adminRefreshDevices', async (_payload, ack) => {
+      try {
+        if (!this.onAdminRefreshDevices) throw new Error('device refresh is not ready');
+        const result = await this.onAdminRefreshDevices();
+        ack?.({ ok: true, ...result });
+      } catch (err) {
+        ack?.({ error: err.message });
+      }
     });
 
     this.socket.on('mediaLayerRestarted', async () => {
@@ -233,7 +263,7 @@ export class WebRTCManager {
     });
     this.sendTransport.on('connectionstatechange', (s) => {
       console.log('[sendTransport]', s);
-      if (s === 'failed') this._restartTransportIce(this.sendTransport).catch(err => console.warn('[sendTransport restartIce]', err.message));
+      if (s === 'failed' || s === 'disconnected') this._scheduleIceRestart(this.sendTransport, 'sendTransport');
     });
   }
 
@@ -246,8 +276,19 @@ export class WebRTCManager {
     });
     this.recvTransport.on('connectionstatechange', (s) => {
       console.log('[recvTransport]', s);
-      if (s === 'failed') this._restartTransportIce(this.recvTransport).catch(err => console.warn('[recvTransport restartIce]', err.message));
+      if (s === 'failed' || s === 'disconnected') this._scheduleIceRestart(this.recvTransport, 'recvTransport');
     });
+  }
+
+  _scheduleIceRestart(transport, label) {
+    if (!transport || transport.closed) return;
+    if (this._iceRestartTimers.has(transport.id)) return;
+
+    const timer = setTimeout(() => {
+      this._iceRestartTimers.delete(transport.id);
+      this._restartTransportIce(transport).catch(err => console.warn(`[${label} restartIce]`, err.message));
+    }, 1500);
+    this._iceRestartTimers.set(transport.id, timer);
   }
 
   async _restartTransportIce(transport) {
@@ -350,6 +391,8 @@ export class WebRTCManager {
   async _consumePeer(producerId, socketId, locationName, kind, paused) {
     if (!this.recvTransport) { console.warn('[consume] recvTransport not ready'); return; }
     if (this.consumers.has(producerId)) return; // 重複消費を防ぐ
+    if (this._consumeInFlight.has(producerId)) return;
+    this._consumeInFlight.add(producerId);
 
     try {
       const { params } = await this._request('consume', {
@@ -387,6 +430,8 @@ export class WebRTCManager {
       console.log(`[consume] ${socketId} ${kind} ok`);
     } catch (err) {
       console.error('[_consumePeer]', err);
+    } finally {
+      this._consumeInFlight.delete(producerId);
     }
   }
 
@@ -458,6 +503,50 @@ export class WebRTCManager {
 
   // ── ユーティリティ ────────────────────────────────────────
 
+  sendTelemetry(report) {
+    if (!this.socket?.connected) return;
+    const sentAt = Date.now();
+    const payload = {
+      ...report,
+      clientTime: sentAt,
+      connection: {
+        ...(report.connection || {}),
+        telemetryRttMs: this._lastTelemetryRtt,
+        lastTelemetryAckAt: this._lastTelemetryAckAt,
+      },
+      transports: this.getTransportReport(),
+      consumers: this.getConsumerReport(),
+    };
+
+    this.socket.timeout(1500).emit('clientTelemetry', payload, (err) => {
+      if (err) return;
+      this._lastTelemetryRtt = Date.now() - sentAt;
+      this._lastTelemetryAckAt = Date.now();
+    });
+  }
+
+  getTransportReport() {
+    return {
+      socketConnected: !!this.socket?.connected,
+      sendState: this.sendTransport?.connectionState || 'none',
+      recvState: this.recvTransport?.connectionState || 'none',
+      sendClosed: !!this.sendTransport?.closed,
+      recvClosed: !!this.recvTransport?.closed,
+    };
+  }
+
+  getConsumerReport() {
+    return Array.from(this.consumers.entries()).map(([producerId, consumer]) => ({
+      producerId,
+      id: consumer.id,
+      kind: consumer.kind,
+      closed: !!consumer.closed,
+      paused: !!consumer.paused,
+      trackReadyState: consumer.track?.readyState || 'missing',
+      trackMuted: !!consumer.track?.muted,
+    }));
+  }
+
   _request(type, data = {}) {
     return new Promise((resolve, reject) => {
       if (!this.socket?.connected) return reject(new Error('not connected'));
@@ -481,6 +570,8 @@ export class WebRTCManager {
     this.consumers.forEach(c => { try { c.close(); } catch { /* ignore close errors */ } });
     try { this.sendTransport?.close(); } catch { /* ignore close errors */ }
     try { this.recvTransport?.close(); } catch { /* ignore close errors */ }
+    for (const timer of this._iceRestartTimers.values()) clearTimeout(timer);
+    this._iceRestartTimers.clear();
     this.socket?.disconnect();
     this.peers.clear();
     this.consumers.clear();
