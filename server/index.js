@@ -35,6 +35,7 @@ let nextWorkerIdx = 0;
 let router;
 let routerWorker;        // router が載っている worker
 let recovering = false;  // 二重リカバリ防止
+const RESTART_ACK_TIMEOUT_MS = 2500;
 
 /**
  * peers[socket.id] = {
@@ -159,6 +160,27 @@ function getStatsSnapshot() {
 }
 
 app.get('/health', (_, res) => res.json(getStatsSnapshot()));
+
+function sendAdminLog(message) {
+  console.log(message);
+  if (process.send) process.send({ type: 'admin-log', data: message });
+}
+
+function emitRestartCommand(target, recipientCount, reason) {
+  const issuedAt = Date.now();
+  const payload = { issuedAt, reason };
+
+  sendAdminLog(`[Admin] restartCommand requested reason=${reason} recipients=${recipientCount}`);
+  if (recipientCount === 0) return;
+
+  target.timeout(RESTART_ACK_TIMEOUT_MS).emit('restartCommand', payload, (err, responses = []) => {
+    const acknowledged = Array.isArray(responses) ? responses.length : 0;
+    const timedOut = err ? Math.max(recipientCount - acknowledged, 0) : 0;
+    const elapsedMs = Date.now() - issuedAt;
+    const suffix = timedOut > 0 ? ` timeout=${timedOut}` : '';
+    sendAdminLog(`[Admin] restartCommand ack=${acknowledged}/${recipientCount}${suffix} elapsed=${elapsedMs}ms`);
+  });
+}
 
 // ── Transport ─────────────────────────────────────────────
 
@@ -395,7 +417,7 @@ io.on('connection', async socket => {
 
   // ── Admin: クライアントキック ──
   socket.on('forceRestart', () => {
-    socket.broadcast.emit('restartCommand');
+    emitRestartCommand(socket.broadcast, Math.max(io.sockets.sockets.size - 1, 0), `socket:${socket.id}`);
   });
 
   // ── 切断 ──
@@ -429,7 +451,7 @@ if (process.send) {
     if (msg.type === 'kick' && msg.socketId) {
       io.sockets.sockets.get(msg.socketId)?.disconnect(true);
     } else if (msg.type === 'restart-all') {
-      io.emit('restartCommand');
+      emitRestartCommand(io, io.sockets.sockets.size, 'server-gui');
     }
   });
 }

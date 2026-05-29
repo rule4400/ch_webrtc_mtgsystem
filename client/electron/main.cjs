@@ -1,7 +1,53 @@
 const { app, BrowserWindow, ipcMain, session } = require('electron');
+const { spawn } = require('child_process');
 const path = require('path');
 
 let mainWindow;
+let restartInProgress = false;
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function relaunchArgs() {
+  return process.argv.slice(1).filter(arg => !arg.startsWith('--squirrel-'));
+}
+
+async function honorRestartDelay() {
+  const delayMs = Number.parseInt(process.env.SFU_RESTART_DELAY_MS || '0', 10);
+  if (Number.isFinite(delayMs) && delayMs > 0) await delay(Math.min(delayMs, 5000));
+}
+
+function restartApp() {
+  if (restartInProgress) return;
+  restartInProgress = true;
+
+  const args = relaunchArgs();
+  console.log(`[Restart] requested platform=${process.platform} packaged=${app.isPackaged}`);
+
+  try {
+    if (process.platform === 'win32') {
+      const child = spawn(process.execPath, args, {
+        cwd: app.isPackaged ? path.dirname(process.execPath) : process.cwd(),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+        env: {
+          ...process.env,
+          SFU_RESTART_DELAY_MS: '1200',
+        },
+      });
+      child.unref();
+    } else {
+      app.relaunch({ execPath: process.execPath, args });
+    }
+  } catch (err) {
+    console.error('[Restart] relaunch failed:', err);
+    app.relaunch({ execPath: process.execPath, args });
+  }
+
+  app.exit(0);
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -56,7 +102,9 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  await honorRestartDelay();
+
   // カメラ・マイク権限を許可
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
     const allowed = ['media', 'mediaKeySystem', 'geolocation', 'notifications', 'fullscreen', 'display-capture'];
@@ -78,6 +126,5 @@ app.on('window-all-closed', () => {
 });
 
 ipcMain.on('restart-app', () => {
-  app.relaunch();
-  app.exit();
+  restartApp();
 });

@@ -46,7 +46,10 @@ function initWatchdog() {
   });
 
   // サーバーからの強制再起動コマンド
-  socket.on('restartCommand', () => {
+  socket.on('restartCommand', (_payload, ack) => {
+    if (typeof ack === 'function') {
+      ack({ ok: true, socketId: socket.id, receivedAt: Date.now(), watcher: true });
+    }
     console.log('Received restartCommand from SFU server! Force restarting app...');
     startApp();
   });

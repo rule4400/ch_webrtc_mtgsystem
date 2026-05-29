@@ -126,7 +126,12 @@ export class ViewerWebRTCManager {
       this.onPeerRemoved?.(socketId);
     });
 
-    this.socket.on('restartCommand', () => this.onRestartCommand?.());
+    this.socket.on('restartCommand', (payload, ack) => {
+      if (typeof ack === 'function') {
+        ack({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
+      }
+      setTimeout(() => this.onRestartCommand?.(payload), 100);
+    });
 
     this.socket.on('mediaLayerRestarted', async () => {
       console.warn('[ViewerWebRTC] media layer restarted, rebuilding session');

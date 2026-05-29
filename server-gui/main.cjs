@@ -231,6 +231,8 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
   serverProcess.on('message', (msg) => {
     if (msg.type === 'stats') {
       safeSend('server-stats', msg.data);
+    } else if (msg.type === 'admin-log') {
+      safeSend('server-log', msg.data);
     }
   });
 
@@ -273,6 +275,9 @@ ipcMain.on('kick-client', (event, socketId) => {
 
 ipcMain.on('restart-all', () => {
   if (serverProcess && serverProcess.send) {
+    safeSend('server-log', '[Admin] 全クライアントへ再起動信号を送信しました');
     serverProcess.send({ type: 'restart-all' });
+  } else {
+    safeSend('server-log', 'WARN: サーバー未起動のため、再起動信号を送信できません');
   }
 });

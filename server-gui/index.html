@@ -208,6 +208,7 @@
     const logOutput = document.getElementById('logOutput');
     const pathDisplay = document.getElementById('pathDisplay');
     const envDisplay = document.getElementById('envDisplay');
+    const restartAllBtn = document.getElementById('restartAllBtn');
 
     let currentServerPath = localStorage.getItem('sfuServerPath') || '';
     pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
@@ -301,9 +302,17 @@
       }
     });
 
-    document.getElementById('restartAllBtn').addEventListener('click', () => {
+    restartAllBtn.addEventListener('click', () => {
       if (confirm('警告: 全てのクライアントを強制的に再起動させます。よろしいですか？')) {
+        restartAllBtn.disabled = true;
+        restartAllBtn.style.opacity = '0.65';
+        restartAllBtn.innerText = 'Sending restart...';
         window.api.restartAll();
+        setTimeout(() => {
+          restartAllBtn.disabled = false;
+          restartAllBtn.style.opacity = '1';
+          restartAllBtn.innerText = '⚠ Force Restart All Clients';
+        }, 6000);
       }
     });
   </script>
