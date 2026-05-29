@@ -150,10 +150,15 @@
       align-items: center;
       padding: 0 14px;
       color: var(--muted);
+      background: transparent;
       border-bottom: 2px solid transparent;
       cursor: pointer;
       font-size: 0.82rem;
       font-weight: 650;
+    }
+    .tab:focus-visible {
+      outline: 2px solid var(--blue);
+      outline-offset: -2px;
     }
     .tab.active {
       color: var(--text);
@@ -172,9 +177,9 @@
       padding: 16px;
     }
     .panel.active { display: flex; flex-direction: column; }
+    .panel.active.dashboard-layout { display: grid; }
 
     .dashboard-layout {
-      display: grid;
       grid-template-rows: auto 1fr;
       gap: 14px;
       min-height: 0;
@@ -480,15 +485,15 @@
       </div>
     </header>
 
-    <nav class="tabs">
-      <div class="tab active" data-target="dashboard">Dashboard</div>
-      <div class="tab" data-target="clients">Clients</div>
-      <div class="tab" data-target="logs">Logs</div>
-      <div class="tab" data-target="settings">Settings</div>
+    <nav class="tabs" role="tablist" aria-label="Server dashboard sections">
+      <button type="button" class="tab active" data-target="dashboard" role="tab" aria-selected="true" aria-controls="dashboard">Dashboard</button>
+      <button type="button" class="tab" data-target="clients" role="tab" aria-selected="false" aria-controls="clients">Clients</button>
+      <button type="button" class="tab" data-target="logs" role="tab" aria-selected="false" aria-controls="logs">Logs</button>
+      <button type="button" class="tab" data-target="settings" role="tab" aria-selected="false" aria-controls="settings">Settings</button>
     </nav>
 
     <main class="content">
-      <section id="dashboard" class="panel active dashboard-layout">
+      <section id="dashboard" class="panel active dashboard-layout" role="tabpanel">
         <div class="metrics">
           <div class="metric"><div class="metric-label">Connected</div><div class="metric-value" id="mPeers">0</div><div class="metric-note" id="mHealth">waiting</div></div>
           <div class="metric"><div class="metric-label">Media Streams</div><div class="metric-value" id="mStreams">0 / 0</div><div class="metric-note">producers / consumers</div></div>
@@ -502,15 +507,15 @@
         </div>
       </section>
 
-      <section id="clients" class="panel">
+      <section id="clients" class="panel" role="tabpanel" hidden>
         <div id="clientCardsFull" class="client-grid"></div>
       </section>
 
-      <section id="logs" class="panel">
+      <section id="logs" class="panel" role="tabpanel" hidden>
         <div class="log-container" id="logOutput">=== SFU Server Logs ===</div>
       </section>
 
-      <section id="settings" class="panel">
+      <section id="settings" class="panel" role="tabpanel" hidden>
         <div class="settings-wrap">
           <div class="settings-row">
             <label>Server Runtime</label>
@@ -553,12 +558,26 @@
       offline: '切断',
     };
 
+    function activateTab(target) {
+      const nextPanel = document.getElementById(target);
+      if (!nextPanel) return;
+
+      document.querySelectorAll('.tab').forEach(tab => {
+        const selected = tab.dataset.target === target;
+        tab.classList.toggle('active', selected);
+        tab.setAttribute('aria-selected', String(selected));
+      });
+
+      document.querySelectorAll('.panel').forEach(panel => {
+        const selected = panel.id === target;
+        panel.classList.toggle('active', selected);
+        panel.hidden = !selected;
+      });
+    }
+
     document.querySelectorAll('.tab').forEach(tab => {
       tab.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-        tab.classList.add('active');
-        document.getElementById(tab.dataset.target).classList.add('active');
+        activateTab(tab.dataset.target);
       });
     });
 
