@@ -183,6 +183,7 @@ function startControlServer() {
     console.warn(`[Control] disabled: invalid SFU_CLIENT_CONTROL_PORT=${process.env.SFU_CLIENT_CONTROL_PORT}`);
     return;
   }
+  if (controlServer) return;
 
   controlServer = http.createServer(async (req, res) => {
     try {
@@ -231,6 +232,15 @@ function startControlServer() {
   });
   controlServer.listen(CONTROL_PORT, CONTROL_HOST, () => {
     console.log(`[Control] listening on ${CONTROL_HOST}:${CONTROL_PORT}${CONTROL_TOKEN ? ' token=required' : ' token=none'}`);
+  });
+}
+
+function stopControlServer() {
+  if (!controlServer) return;
+  const server = controlServer;
+  controlServer = null;
+  server.close(err => {
+    if (err) console.error(`[Control] close failed: ${err.message}`);
   });
 }
 
@@ -322,12 +332,14 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  controlServer?.close();
-  if (process.platform !== 'darwin') app.quit();
+  if (process.platform !== 'darwin') {
+    stopControlServer();
+    app.quit();
+  }
 });
 
 app.on('before-quit', () => {
-  controlServer?.close();
+  stopControlServer();
 });
 
 ipcMain.on('restart-app', () => {

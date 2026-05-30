@@ -38,6 +38,7 @@ let manualStop = false;
 let restartTimer = null;
 let restartAttempts = 0;
 let stoppingServer = false;
+let isQuitting = false;
 
 const SERVER_RUNTIME_DIR = 'server-runtime';
 const CLIENT_REGISTRY_FILE = 'registered-clients.json';
@@ -170,6 +171,7 @@ function stopServerProcess({ manual = true } = {}) {
     clearTimeout(restartTimer);
     restartTimer = null;
   }
+  if (stoppingServer) return;
   if (!serverProcess) return;
 
   const proc = serverProcess;
@@ -207,14 +209,37 @@ function createWindow() {
     }
   });
   mainWindow.loadFile('index.html');
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    safeSend('server-status', serverProcess ? 'Running' : 'Stopped');
+    if (lastServerDir) {
+      safeSend('server-log', `--- ダッシュボード接続: ${lastServerDir} ---`);
+    }
+  });
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  createWindow();
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
 
 app.on('window-all-closed', () => {
-  stopServerProcess();
-  mainWindow = null; // safeSend がウィンドウ破棄後に送信しないようにする
+  if (process.platform !== 'darwin' || isQuitting) {
+    stopServerProcess();
+  }
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  isQuitting = true;
+  stopServerProcess();
 });
 
 ipcMain.handle('select-folder', async () => {

@@ -30,6 +30,42 @@ function trackReport(track) {
   };
 }
 
+const defaultViewerConfig = {
+  serverIp: '127.0.0.1',
+  serverPort: '3000',
+  viewerName: '閲覧端末',
+};
+
+function sanitizeViewerConfig(config) {
+  const raw = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
+  const serverIp = String(raw.serverIp || defaultViewerConfig.serverIp).trim() || defaultViewerConfig.serverIp;
+  const rawPort = String(raw.serverPort || defaultViewerConfig.serverPort).trim();
+  const serverPort = /^\d{1,5}$/.test(rawPort) && Number(rawPort) >= 1 && Number(rawPort) <= 65535
+    ? rawPort
+    : defaultViewerConfig.serverPort;
+  const viewerName = String(raw.viewerName || defaultViewerConfig.viewerName).trim() || defaultViewerConfig.viewerName;
+
+  return {
+    ...raw,
+    serverIp,
+    serverPort,
+    viewerName,
+  };
+}
+
+function loadViewerConfig() {
+  const saved = localStorage.getItem('sfu_viewer_config');
+  if (!saved) return defaultViewerConfig;
+
+  try {
+    return sanitizeViewerConfig(JSON.parse(saved));
+  } catch (err) {
+    console.warn('[Config] invalid sfu_viewer_config ignored:', err.message);
+    localStorage.removeItem('sfu_viewer_config');
+    return defaultViewerConfig;
+  }
+}
+
 const VideoCell = React.memo(function VideoCell({
   label, stream, videoPaused, audioPaused, speakerDeviceId, speakerMuted,
 }) {
@@ -123,16 +159,19 @@ export default function ViewerView() {
 
   const managerRef = useRef(null);
   const configRef = useRef({});
+  const selectedAudioOutIdRef = useRef('');
   const telemetryStateRef = useRef({});
   const adminHandlersRef = useRef({});
 
-  const refreshAudioOutputs = useCallback(async () => {
+  const refreshAudioOutputs = useCallback(async (preferredId = null) => {
     try {
       if (!navigator.mediaDevices?.enumerateDevices) return [];
       const devices = await navigator.mediaDevices.enumerateDevices();
       const outputs = devices.filter(device => device.kind === 'audiooutput');
       setAudioOutDevices(outputs);
-      if (!selectedAudioOutId && outputs[0]?.deviceId) {
+      const currentId = preferredId ?? selectedAudioOutIdRef.current;
+      if (!currentId && outputs[0]?.deviceId) {
+        selectedAudioOutIdRef.current = outputs[0].deviceId;
         setSelectedAudioOutId(outputs[0].deviceId);
       }
       return outputs;
@@ -140,7 +179,7 @@ export default function ViewerView() {
       // setSinkId/audiooutput enumeration is not available on every platform.
       return [];
     }
-  }, [selectedAudioOutId]);
+  }, []);
 
   useEffect(() => {
     telemetryStateRef.current = {
@@ -158,14 +197,12 @@ export default function ViewerView() {
     let manager = null;
 
     const init = async () => {
-      const saved = localStorage.getItem('sfu_viewer_config');
-      const config = saved
-        ? JSON.parse(saved)
-        : { serverIp: '127.0.0.1', serverPort: '3000', viewerName: '閲覧端末' };
+      const config = loadViewerConfig();
       configRef.current = config;
+      selectedAudioOutIdRef.current = config.selectedAudioOutId || '';
       setSelectedAudioOutId(config.selectedAudioOutId || '');
 
-      await refreshAudioOutputs();
+      await refreshAudioOutputs(config.selectedAudioOutId || '');
 
       manager = new ViewerWebRTCManager();
       managerRef.current = manager;
@@ -222,6 +259,7 @@ export default function ViewerView() {
   }, []);
 
   const changeSpeaker = useCallback((deviceId) => {
+    selectedAudioOutIdRef.current = deviceId;
     setSelectedAudioOutId(deviceId);
     const config = { ...configRef.current, selectedAudioOutId: deviceId };
     configRef.current = config;

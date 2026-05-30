@@ -245,6 +245,42 @@ function trackReport(track) {
   };
 }
 
+const defaultClientConfig = {
+  serverIp: '127.0.0.1',
+  serverPort: '3000',
+  locationName: '自拠点',
+};
+
+function sanitizeClientConfig(config) {
+  const raw = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
+  const serverIp = String(raw.serverIp || defaultClientConfig.serverIp).trim() || defaultClientConfig.serverIp;
+  const rawPort = String(raw.serverPort || defaultClientConfig.serverPort).trim();
+  const serverPort = /^\d{1,5}$/.test(rawPort) && Number(rawPort) >= 1 && Number(rawPort) <= 65535
+    ? rawPort
+    : defaultClientConfig.serverPort;
+  const locationName = String(raw.locationName || defaultClientConfig.locationName).trim() || defaultClientConfig.locationName;
+
+  return {
+    ...raw,
+    serverIp,
+    serverPort,
+    locationName,
+  };
+}
+
+function loadClientConfig() {
+  const saved = localStorage.getItem('sfu_config');
+  if (!saved) return defaultClientConfig;
+
+  try {
+    return sanitizeClientConfig(JSON.parse(saved));
+  } catch (err) {
+    console.warn('[Config] invalid sfu_config ignored:', err.message);
+    localStorage.removeItem('sfu_config');
+    return defaultClientConfig;
+  }
+}
+
 // ─── メインビュー ─────────────────────────────────────────
 export default function MainView() {
   const navigate = useNavigate();
@@ -374,8 +410,7 @@ export default function MainView() {
 
     const init = async () => {
       // 設定読み込み
-      const saved = localStorage.getItem('sfu_config');
-      const conf  = saved ? JSON.parse(saved) : { serverIp: '127.0.0.1', serverPort: '3000', locationName: '自拠点' };
+      const conf = loadClientConfig();
       configRef.current = conf;
       setSelfName(conf.locationName || '自拠点');
 
