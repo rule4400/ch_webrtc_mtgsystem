@@ -8,7 +8,7 @@
  *   - ビデオセルは常に <video> 要素をレンダリング（可視性だけ CSS で制御）
  */
 
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Mic, MicOff, Video, VideoOff,
@@ -223,6 +223,96 @@ function getGridCols(n) {
   if (n <= 4) return 2;
   if (n <= 9) return 3;
   return 4;
+}
+
+const VIDEO_ASPECT = 16 / 9;
+const GRID_GAP_PX = 8;
+
+function calculateGridLayout(cellCount, width, height) {
+  const count = Math.max(1, cellCount);
+  const availableWidth = Math.max(1, width);
+  const availableHeight = Math.max(1, height);
+  let best = {
+    cols: getGridCols(count),
+    rows: Math.ceil(count / getGridCols(count)),
+    cellWidth: 1,
+    cellHeight: 1,
+    score: 0,
+  };
+
+  for (let cols = 1; cols <= count; cols += 1) {
+    const rows = Math.ceil(count / cols);
+    const totalGapX = GRID_GAP_PX * (cols - 1);
+    const totalGapY = GRID_GAP_PX * (rows - 1);
+    const maxCellWidth = (availableWidth - totalGapX) / cols;
+    const maxCellHeight = (availableHeight - totalGapY) / rows;
+    if (maxCellWidth <= 0 || maxCellHeight <= 0) continue;
+
+    const cellWidth = Math.min(maxCellWidth, maxCellHeight * VIDEO_ASPECT);
+    const cellHeight = cellWidth / VIDEO_ASPECT;
+    const score = cellWidth * cellHeight;
+    const usesFewerRows = score === best.score && rows < best.rows;
+
+    if (score > best.score || usesFewerRows) {
+      best = { cols, rows, cellWidth, cellHeight, score };
+    }
+  }
+
+  return {
+    cols: best.cols,
+    rows: best.rows,
+    cellWidth: Math.floor(best.cellWidth),
+    cellHeight: Math.floor(best.cellHeight),
+  };
+}
+
+function useFittedVideoGrid(cellCount) {
+  const gridRef = useRef(null);
+  const [layout, setLayout] = useState(() => {
+    const cols = getGridCols(cellCount);
+    return { cols, rows: Math.ceil(Math.max(1, cellCount) / cols), cellWidth: 0, cellHeight: 0 };
+  });
+
+  useLayoutEffect(() => {
+    const element = gridRef.current;
+    if (!element) return undefined;
+
+    let frame = 0;
+    const update = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        const rect = element.getBoundingClientRect();
+        const next = calculateGridLayout(cellCount, rect.width, rect.height);
+        setLayout(prev => (
+          prev.cols === next.cols &&
+          prev.rows === next.rows &&
+          prev.cellWidth === next.cellWidth &&
+          prev.cellHeight === next.cellHeight
+            ? prev
+            : next
+        ));
+      });
+    };
+
+    update();
+
+    if (typeof ResizeObserver === 'function') {
+      const observer = new ResizeObserver(update);
+      observer.observe(element);
+      return () => {
+        cancelAnimationFrame(frame);
+        observer.disconnect();
+      };
+    }
+
+    window.addEventListener('resize', update);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('resize', update);
+    };
+  }, [cellCount]);
+
+  return { gridRef, layout };
 }
 
 function serializeDevices(devices) {
@@ -641,7 +731,7 @@ export default function MainView() {
 
   // ─── グリッド ────────────────────────────────────────────
   const totalCells = peers.size + 1;
-  const cols = getGridCols(totalCells);
+  const { gridRef, layout: gridLayout } = useFittedVideoGrid(totalCells);
 
   return (
     <div className="main-layout">
@@ -677,8 +767,12 @@ export default function MainView() {
 
       {/* ── ビデオグリッド ── */}
       <div
+        ref={gridRef}
         className="video-grid"
-        style={{ gridTemplateColumns: `repeat(${cols}, 1fr)` }}
+        style={{
+          gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, ${gridLayout.cellWidth || 1}px))`,
+          gridTemplateRows: `repeat(${gridLayout.rows}, minmax(0, ${gridLayout.cellHeight || 1}px))`,
+        }}
       >
         {/* 自拠点 */}
         <VideoCell
