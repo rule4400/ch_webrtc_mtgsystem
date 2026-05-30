@@ -415,12 +415,7 @@ export default function MainView() {
       setSelfName(conf.locationName || '自拠点');
 
       // ── STEP 1: カメラ・マイク取得（SFU とは独立して必ず実行）──
-      // まず権限を取り、ラベル付きデバイス一覧を得てから目的のストリームを取る。
-      try {
-        await navigator.mediaDevices.getUserMedia({ video: true, audio: true }).then(s => s.getTracks().forEach(t => t.stop()));
-      } catch {
-        // Permission errors are surfaced by the real acquisition step below.
-      }
+      // OS権限は Electron main 側で初回だけ確認する。ここでは実際に使うストリームだけ取得する。
       const devs = await refreshDevices();
 
       const videoId = conf.selectedVideoId   || devs.video[0]?.deviceId    || '';

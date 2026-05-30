@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session } = require('electron');
+const { app, BrowserWindow, ipcMain, session, systemPreferences } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
@@ -27,6 +27,24 @@ function relaunchArgs() {
 async function honorRestartDelay() {
   const delayMs = Number.parseInt(process.env.SFU_RESTART_DELAY_MS || '0', 10);
   if (Number.isFinite(delayMs) && delayMs > 0) await delay(Math.min(delayMs, 5000));
+}
+
+async function ensureMacMediaAccess() {
+  if (process.platform !== 'darwin') return;
+
+  for (const mediaType of ['camera', 'microphone']) {
+    const status = systemPreferences.getMediaAccessStatus(mediaType);
+    if (status === 'granted') {
+      console.log(`[Permission] ${mediaType}=granted`);
+      continue;
+    }
+    if (status === 'not-determined') {
+      const granted = await systemPreferences.askForMediaAccess(mediaType);
+      console.log(`[Permission] ${mediaType}=${granted ? 'granted' : 'denied'}`);
+      continue;
+    }
+    console.warn(`[Permission] ${mediaType}=${status}. macOS System Settings must be changed manually.`);
+  }
 }
 
 function restartApp() {
@@ -313,6 +331,7 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   await honorRestartDelay();
+  await ensureMacMediaAccess();
 
   // カメラ・マイク権限を許可
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
