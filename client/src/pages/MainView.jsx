@@ -8,7 +8,7 @@
  *   - ビデオセルは常に <video> 要素をレンダリング（可視性だけ CSS で制御）
  */
 
-import React, { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Mic, MicOff, Video, VideoOff,
@@ -66,7 +66,7 @@ function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, on
 // ─── ビデオセル ───────────────────────────────────────────
 
 const VideoCell = React.memo(function VideoCell({
-  label, stream, isSelf, videoPaused, audioPaused, speakerDeviceId, speakerMuted,
+  label, stream, isSelf, videoPaused, audioPaused, speakerDeviceId, speakerMuted, volume = 1,
 }) {
   const videoRef = useRef(null);
 
@@ -78,6 +78,7 @@ const VideoCell = React.memo(function VideoCell({
     if (!video) return;
     // 自拠点プレビューは常にミュート（ハウリング防止）。他拠点は speakerMuted に従う。
     video.muted = isSelf ? true : !!speakerMuted;
+    video.volume = isSelf || speakerMuted ? 0 : volume;
     if (video.srcObject !== stream) {
       video.srcObject = stream || null;
     }
@@ -100,7 +101,7 @@ const VideoCell = React.memo(function VideoCell({
       }
     };
     tryPlay();
-  }, [stream, isSelf, speakerMuted]);
+  }, [stream, isSelf, speakerMuted, volume]);
 
   // スピーカーデバイス変更
   useEffect(() => {
@@ -170,7 +171,13 @@ async function acquireMedia({ videoId, audioId, wantVideo = true, wantAudio = tr
   }
 
   const videoBase = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
-  const audioBase = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  const audioBase = {
+    echoCancellation: { ideal: true },
+    noiseSuppression: { ideal: true },
+    autoGainControl: { ideal: true },
+    channelCount: { ideal: 1 },
+    sampleRate: { ideal: 48000 },
+  };
 
   // 試行リスト: ①指定デバイス(exact) → ②指定デバイス(ideal) → ③デバイス無指定
   const buildConstraints = (mode) => {
@@ -215,6 +222,32 @@ async function acquireMedia({ videoId, audioId, wantVideo = true, wantAudio = tr
     lastErr?.name === 'NotReadableError'? 'カメラ/マイクが他のアプリに使用されています。他のアプリを閉じて再起動してください。' :
     `カメラ・マイク取得に失敗しました: ${lastErr?.name || lastErr?.message || '不明なエラー'}`;
   return { stream: null, error: msg };
+}
+
+const SPEAKER_AUDIO_PROFILE = {
+  maxRemoteVolume: 0.86,
+  minRemoteVolume: 0.42,
+  localTalkDucking: 0.72,
+  localTalkFloor: 0.32,
+  localSpeechThreshold: 0.025,
+  localSpeechHoldMs: 650,
+  monitorFpsMs: 80,
+};
+
+function calculateRemoteAudioVolume({ audiblePeerCount, localSpeaking, speakerMuted }) {
+  if (speakerMuted || audiblePeerCount <= 0) return 0;
+
+  const countAdjustedVolume = SPEAKER_AUDIO_PROFILE.maxRemoteVolume / Math.sqrt(audiblePeerCount);
+  const roomSafeVolume = Math.max(
+    SPEAKER_AUDIO_PROFILE.minRemoteVolume,
+    Math.min(SPEAKER_AUDIO_PROFILE.maxRemoteVolume, countAdjustedVolume),
+  );
+
+  if (!localSpeaking) return roomSafeVolume;
+  return Math.max(
+    SPEAKER_AUDIO_PROFILE.localTalkFloor,
+    roomSafeVolume * SPEAKER_AUDIO_PROFILE.localTalkDucking,
+  );
 }
 
 // ─── グリッド列数 ─────────────────────────────────────────
@@ -395,6 +428,7 @@ export default function MainView() {
   const [selfName,   setSelfName]   = useState('自拠点');
   const [camError,   setCamError]   = useState(null);
   const [viewerPresenceActive, setViewerPresenceActive] = useState(false);
+  const [localSpeaking, setLocalSpeaking] = useState(false);
 
   // refs（クリーンアップ・デバイス変更用）
   const webrtcRef = useRef(null);
@@ -403,6 +437,104 @@ export default function MainView() {
   const mediaRecoveryRef = useRef(false);
   const telemetryStateRef = useRef({});
   const adminHandlersRef = useRef({});
+  const audioMonitorRef = useRef({});
+
+  const audiblePeerCount = useMemo(() => (
+    Array.from(peers.values()).filter((peer) => {
+      const audio = peer.stream?.getAudioTracks()[0] || null;
+      return !!audio && audio.readyState === 'live' && !peer.audioPaused;
+    }).length
+  ), [peers]);
+
+  const remoteAudioVolume = useMemo(() => calculateRemoteAudioVolume({
+    audiblePeerCount,
+    localSpeaking,
+    speakerMuted,
+  }), [audiblePeerCount, localSpeaking, speakerMuted]);
+
+  const stopLocalAudioMonitor = useCallback(() => {
+    const monitor = audioMonitorRef.current;
+    if (monitor.frame) cancelAnimationFrame(monitor.frame);
+    if (monitor.track && monitor.onEnded) monitor.track.removeEventListener('ended', monitor.onEnded);
+    try {
+      monitor.source?.disconnect();
+    } catch {
+      // すでに切断済みなら何もしない
+    }
+    if (monitor.context && monitor.context.state !== 'closed') {
+      monitor.context.close().catch(() => {});
+    }
+    audioMonitorRef.current = {};
+    setLocalSpeaking(false);
+  }, []);
+
+  const startLocalAudioMonitor = useCallback((stream) => {
+    stopLocalAudioMonitor();
+
+    const track = stream?.getAudioTracks()[0] || null;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!track || !AudioContextClass) return;
+
+    try {
+      const audioOnlyStream = new MediaStream([track]);
+      const context = new AudioContextClass();
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 512;
+      analyser.smoothingTimeConstant = 0.55;
+
+      const source = context.createMediaStreamSource(audioOnlyStream);
+      source.connect(analyser);
+
+      const samples = new Uint8Array(analyser.fftSize);
+      const monitor = {
+        analyser,
+        context,
+        source,
+        track,
+        frame: 0,
+        lastSpeechAt: Number.NEGATIVE_INFINITY,
+        lastSampleAt: 0,
+        resumePending: false,
+        onEnded: () => stopLocalAudioMonitor(),
+      };
+      audioMonitorRef.current = monitor;
+      track.addEventListener('ended', monitor.onEnded, { once: true });
+
+      const tick = (now) => {
+        if (audioMonitorRef.current !== monitor) return;
+
+        if (context.state === 'suspended' && !monitor.resumePending) {
+          monitor.resumePending = true;
+          context.resume()
+            .catch(() => {})
+            .finally(() => { monitor.resumePending = false; });
+        }
+
+        if (now - monitor.lastSampleAt >= SPEAKER_AUDIO_PROFILE.monitorFpsMs) {
+          analyser.getByteTimeDomainData(samples);
+          let sumSquares = 0;
+          for (const sample of samples) {
+            const normalized = (sample - 128) / 128;
+            sumSquares += normalized * normalized;
+          }
+          const rms = Math.sqrt(sumSquares / samples.length);
+          if (rms >= SPEAKER_AUDIO_PROFILE.localSpeechThreshold) {
+            monitor.lastSpeechAt = now;
+          }
+          const speaking = now - monitor.lastSpeechAt <= SPEAKER_AUDIO_PROFILE.localSpeechHoldMs;
+          setLocalSpeaking(prev => (prev === speaking ? prev : speaking));
+          monitor.lastSampleAt = now;
+        }
+
+        monitor.frame = requestAnimationFrame(tick);
+      };
+
+      monitor.frame = requestAnimationFrame(tick);
+    } catch (err) {
+      console.warn('[audioMonitor]', err.message);
+      stopLocalAudioMonitor();
+    }
+  }, [stopLocalAudioMonitor]);
 
   useEffect(() => {
     telemetryStateRef.current = {
@@ -419,6 +551,9 @@ export default function MainView() {
       sfuStatus,
       selfName,
       camError,
+      localSpeaking,
+      audiblePeerCount,
+      remoteAudioVolume,
     };
   }, [
     videoDevices,
@@ -434,6 +569,9 @@ export default function MainView() {
     sfuStatus,
     selfName,
     camError,
+    localSpeaking,
+    audiblePeerCount,
+    remoteAudioVolume,
   ]);
 
   // ─── デバイス一覧を取得 ──────────────────────────────────
@@ -473,12 +611,13 @@ export default function MainView() {
     streamRef.current = newStream;
     setLocalStream(newStream);
     setCamError(error);
+    startLocalAudioMonitor(newStream);
 
     if (stopPrevious && oldStream && oldStream !== newStream) {
       oldStream.getTracks().forEach(t => t.stop());
     }
     return true;
-  }, [camEnabled, micEnabled]);
+  }, [camEnabled, micEnabled, startLocalAudioMonitor]);
 
   const recoverLocalMedia = useCallback(async () => {
     if (mediaRecoveryRef.current) return;
@@ -565,6 +704,7 @@ export default function MainView() {
     return () => {
       navigator.mediaDevices.removeEventListener('devicechange', refreshDevices);
       rtcManager?.disconnect();
+      stopLocalAudioMonitor();
       streamRef.current?.getTracks().forEach(t => t.stop());
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -695,6 +835,12 @@ export default function MainView() {
           video: trackReport(videoTrack),
           audio: trackReport(audioTrack),
           error: state.camError || null,
+          audioProfile: {
+            mode: 'speaker-room',
+            localSpeaking: !!state.localSpeaking,
+            audiblePeerCount: state.audiblePeerCount || 0,
+            remoteAudioVolume: Number((state.remoteAudioVolume || 0).toFixed(2)),
+          },
         },
         remoteMonitor: {
           peerCount: remotePeers.length,
@@ -794,6 +940,7 @@ export default function MainView() {
             audioPaused={peer.audioPaused}
             speakerDeviceId={selectedAudioOutId}
             speakerMuted={speakerMuted}
+            volume={remoteAudioVolume}
           />
         ))}
       </div>
