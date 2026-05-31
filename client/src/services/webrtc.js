@@ -43,6 +43,7 @@ export class WebRTCManager {
     this._setupRetryDelay = 1000;
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
+    this._connectGeneration = 0;
 
     // コールバック
     this.onPeerUpdated      = null;  // (socketId, peer) => void
@@ -60,6 +61,18 @@ export class WebRTCManager {
     this._locationName = locationName;
     this._manualDisconnect = false;
     return new Promise((resolve, reject) => {
+      let settled = false;
+      const resolveOnce = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const rejectOnce = (err) => {
+        if (settled) return;
+        settled = true;
+        reject(err);
+      };
+
       this.socket = io(serverUrl, {
         transports: ['websocket', 'polling'],
         upgrade: true,
@@ -71,45 +84,46 @@ export class WebRTCManager {
         timeout: 12000,
       });
 
-      this.socket.once('connect', async () => {
+      this.socket.on('connect', async () => {
+        const generation = this._connectGeneration + 1;
+        this._connectGeneration = generation;
         console.log('[WebRTC] connected', this.socket.id);
         try {
           await this._setupSession();
           this._setupRetryDelay = 1000;
-          resolve();
+          if (generation === this._connectGeneration) resolveOnce();
         } catch (err) {
-          console.error('[WebRTC] init failed', err);
+          console.error('[WebRTC] connect setup failed', err);
           this.onConnectionChange?.(false);
           this._scheduleSetupRetry();
-          reject(err);
+          rejectOnce(err);
         }
       });
 
-      this.socket.once('connect_error', (err) => {
-        reject(new Error(`接続失敗: ${err.message}`));
+      this.socket.on('connect_error', (err) => {
+        console.warn('[WebRTC] connect_error:', err.message);
+        this._initialized = false;
+        this.onConnectionChange?.(false);
       });
 
       this.socket.on('disconnect', (reason) => {
         console.warn('[WebRTC] disconnected:', reason);
+        this._connectGeneration += 1;
         this._initialized = false;
         this._clearSetupRetry();
+        this._resetMediaSession({ notifyPeers: true });
         this.onConnectionChange?.(false);
         if (!this._manualDisconnect && reason === 'io server disconnect') {
           setTimeout(() => this.socket?.connect(), 2000);
         }
       });
 
-      // socket.io の自動再接続後に毎回セッションを張り直す
-      this.socket.io.on('reconnect', async () => {
-        console.log('[WebRTC] reconnected, rebuilding session');
-        try {
-          await this._setupSession();
-          this._setupRetryDelay = 1000;
-        } catch (err) {
-          console.error('[WebRTC] reconnect setup failed', err);
-          this.onConnectionChange?.(false);
-          this._scheduleSetupRetry();
-        }
+      this.socket.io.on('reconnect_attempt', () => {
+        if (!this._manualDisconnect) this.onConnectionChange?.(false);
+      });
+
+      this.socket.io.on('reconnect', () => {
+        console.log('[WebRTC] reconnect transport restored');
       });
 
       this._bindServerEvents();
@@ -135,6 +149,7 @@ export class WebRTCManager {
       await this._reproduceLocal();
 
       this.onConnectionChange?.(true);
+      await this.syncPeers();
     })();
 
     try {
@@ -168,6 +183,31 @@ export class WebRTCManager {
     if (!this._setupRetryTimer) return;
     clearTimeout(this._setupRetryTimer);
     this._setupRetryTimer = null;
+  }
+
+  _resetMediaSession({ notifyPeers = false } = {}) {
+    try { this.videoProducer?.close(); } catch { /* ignore close errors */ }
+    try { this.audioProducer?.close(); } catch { /* ignore close errors */ }
+    this.consumers.forEach(consumer => {
+      try { consumer.close(); } catch { /* ignore close errors */ }
+    });
+    try { this.sendTransport?.close(); } catch { /* ignore close errors */ }
+    try { this.recvTransport?.close(); } catch { /* ignore close errors */ }
+
+    for (const timer of this._iceRestartTimers.values()) clearTimeout(timer);
+    this._iceRestartTimers.clear();
+    this._consumeInFlight.clear();
+    this._pendingQueue = [];
+    this.consumers.clear();
+    this.sendTransport = null;
+    this.recvTransport = null;
+    this.videoProducer = null;
+    this.audioProducer = null;
+
+    if (notifyPeers) {
+      for (const socketId of this.peers.keys()) this.onPeerRemoved?.(socketId);
+    }
+    this.peers.clear();
   }
 
   _bindServerEvents() {
@@ -608,18 +648,8 @@ export class WebRTCManager {
   disconnect() {
     this._manualDisconnect = true;
     this._initialized = false;
-    try { this.videoProducer?.close(); } catch { /* ignore close errors */ }
-    try { this.audioProducer?.close(); } catch { /* ignore close errors */ }
-    this.consumers.forEach(c => { try { c.close(); } catch { /* ignore close errors */ } });
-    try { this.sendTransport?.close(); } catch { /* ignore close errors */ }
-    try { this.recvTransport?.close(); } catch { /* ignore close errors */ }
-    for (const timer of this._iceRestartTimers.values()) clearTimeout(timer);
-    this._iceRestartTimers.clear();
     this._clearSetupRetry();
+    this._resetMediaSession({ notifyPeers: true });
     this.socket?.disconnect();
-    this.peers.clear();
-    this.consumers.clear();
-    this.videoProducer = null;
-    this.audioProducer = null;
   }
 }
