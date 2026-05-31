@@ -141,3 +141,7 @@ app.on('window-all-closed', () => {
 ipcMain.on('restart-app', () => {
   restartApp();
 });
+
+ipcMain.on('quick-restart-result', (_event, result) => {
+  console.log(`[QuickRestart] renderer result ${JSON.stringify(result || {})}`);
+});

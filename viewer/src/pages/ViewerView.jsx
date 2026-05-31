@@ -35,6 +35,27 @@ const defaultViewerConfig = {
   serverPort: '3000',
   viewerName: '閲覧端末',
 };
+const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
+
+async function connectWithinStartupWindow(manager, serverUrl, viewerName) {
+  let timedOut = false;
+  const connectPromise = manager.connect(serverUrl, viewerName)
+    .then(() => 'connected')
+    .catch((err) => {
+      if (timedOut) {
+        console.warn('[ViewerQuickRestart] connection failed after startup window:', err.message);
+        return 'failed-late';
+      }
+      throw err;
+    });
+  const timeoutPromise = new Promise(resolve => {
+    setTimeout(() => {
+      timedOut = true;
+      resolve('pending');
+    }, QUICK_RESTART_CONNECT_WINDOW_MS);
+  });
+  return Promise.race([connectPromise, timeoutPromise]);
+}
 
 function sanitizeViewerConfig(config) {
   const raw = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
@@ -156,12 +177,15 @@ export default function ViewerView() {
   const [speakerMuted, setSpeakerMuted] = useState(false);
   const [audioOutDevices, setAudioOutDevices] = useState([]);
   const [selectedAudioOutId, setSelectedAudioOutId] = useState('');
+  const [uiResetToken, setUiResetToken] = useState(0);
 
   const managerRef = useRef(null);
   const configRef = useRef({});
   const selectedAudioOutIdRef = useRef('');
   const telemetryStateRef = useRef({});
   const adminHandlersRef = useRef({});
+  const quickRestartInFlightRef = useRef(false);
+  const quickRestartHandlerRef = useRef(null);
 
   const refreshAudioOutputs = useCallback(async (preferredId = null) => {
     try {
@@ -193,51 +217,118 @@ export default function ViewerView() {
     };
   }, [peers, status, error, speakerMuted, audioOutDevices, selectedAudioOutId]);
 
+  const releaseViewerRuntime = useCallback(({ status: nextStatus = 'connecting', updateState = true } = {}) => {
+    const manager = managerRef.current;
+    managerRef.current = null;
+    if (manager) {
+      manager.onPeerUpdated = null;
+      manager.onPeerRemoved = null;
+      manager.onConnectionChange = null;
+      manager.onRestartCommand = null;
+      manager.onAdminSetDevice = null;
+      manager.onAdminRefreshDevices = null;
+      manager.disconnect();
+    }
+    if (updateState) {
+      setPeers(new Map());
+      setStatus(nextStatus);
+    }
+  }, []);
+
+  const startViewerSession = useCallback(async () => {
+    const config = loadViewerConfig();
+    configRef.current = config;
+    selectedAudioOutIdRef.current = config.selectedAudioOutId || '';
+    setSelectedAudioOutId(config.selectedAudioOutId || '');
+
+    await refreshAudioOutputs(config.selectedAudioOutId || '');
+
+    const manager = new ViewerWebRTCManager();
+    managerRef.current = manager;
+
+    manager.onPeerUpdated = (socketId, peer) => {
+      setPeers(prev => {
+        const next = new Map(prev);
+        next.set(socketId, peer);
+        return next;
+      });
+    };
+    manager.onPeerRemoved = (socketId) => {
+      setPeers(prev => {
+        const next = new Map(prev);
+        next.delete(socketId);
+        return next;
+      });
+    };
+    manager.onConnectionChange = (ok) => setStatus(ok ? 'connected' : 'error');
+    manager.onRestartCommand = (payload) => quickRestartHandlerRef.current?.(payload);
+    manager.onAdminSetDevice = (payload) => {
+      if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
+      return adminHandlersRef.current.setDevice(payload);
+    };
+    manager.onAdminRefreshDevices = () => {
+      if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
+      return adminHandlersRef.current.refreshDevices();
+    };
+
+    const serverUrl = `http://${config.serverIp}:${config.serverPort || 3000}`;
+    const connectionState = await connectWithinStartupWindow(manager, serverUrl, config.viewerName);
+    setStatus(connectionState === 'connected' ? 'connected' : 'connecting');
+    setError(null);
+    return { manager, connectionState };
+  }, [refreshAudioOutputs]);
+
+  const performQuickRestart = useCallback(async (payload = {}) => {
+    if (quickRestartInFlightRef.current) return;
+    quickRestartInFlightRef.current = true;
+    const startedAt = Date.now();
+    const reason = payload?.reason || payload?.source || 'server-command';
+
+    try {
+      releaseViewerRuntime({ status: 'restarting' });
+      setError(null);
+      setUiResetToken(token => token + 1);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const { connectionState } = await startViewerSession();
+      window.electronAPI?.quickRestartResult?.({
+        ok: true,
+        reason,
+        connectionState,
+        elapsedMs: Date.now() - startedAt,
+      });
+    } catch (err) {
+      console.error('[ViewerQuickRestart] failed:', err);
+      setStatus('error');
+      setError(err.message);
+      window.electronAPI?.quickRestartResult?.({
+        ok: false,
+        reason,
+        error: err.message,
+        elapsedMs: Date.now() - startedAt,
+      });
+    } finally {
+      quickRestartInFlightRef.current = false;
+    }
+  }, [releaseViewerRuntime, startViewerSession]);
+
   useEffect(() => {
-    let manager = null;
+    quickRestartHandlerRef.current = performQuickRestart;
+  }, [performQuickRestart]);
 
+  useEffect(() => {
+    const unsubscribe = window.electronAPI?.onQuickRestartRequest?.((payload) => {
+      quickRestartHandlerRef.current?.(payload);
+    });
+    return () => unsubscribe?.();
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
     const init = async () => {
-      const config = loadViewerConfig();
-      configRef.current = config;
-      selectedAudioOutIdRef.current = config.selectedAudioOutId || '';
-      setSelectedAudioOutId(config.selectedAudioOutId || '');
-
-      await refreshAudioOutputs(config.selectedAudioOutId || '');
-
-      manager = new ViewerWebRTCManager();
-      managerRef.current = manager;
-
-      manager.onPeerUpdated = (socketId, peer) => {
-        setPeers(prev => {
-          const next = new Map(prev);
-          next.set(socketId, peer);
-          return next;
-        });
-      };
-      manager.onPeerRemoved = (socketId) => {
-        setPeers(prev => {
-          const next = new Map(prev);
-          next.delete(socketId);
-          return next;
-        });
-      };
-      manager.onConnectionChange = (ok) => setStatus(ok ? 'connected' : 'error');
-      manager.onRestartCommand = () => window.electronAPI?.restartApp?.();
-      manager.onAdminSetDevice = (payload) => {
-        if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
-        return adminHandlersRef.current.setDevice(payload);
-      };
-      manager.onAdminRefreshDevices = () => {
-        if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
-        return adminHandlersRef.current.refreshDevices();
-      };
-
       try {
-        const serverUrl = `http://${config.serverIp}:${config.serverPort || 3000}`;
-        await manager.connect(serverUrl, config.viewerName);
-        setStatus('connected');
-        setError(null);
+        await startViewerSession();
       } catch (err) {
+        if (disposed) return;
         console.error('[Viewer]', err);
         setStatus('error');
         setError(err.message);
@@ -248,8 +339,9 @@ export default function ViewerView() {
     navigator.mediaDevices?.addEventListener?.('devicechange', refreshAudioOutputs);
 
     return () => {
+      disposed = true;
       navigator.mediaDevices?.removeEventListener?.('devicechange', refreshAudioOutputs);
-      manager?.disconnect();
+      releaseViewerRuntime({ updateState: false });
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -353,13 +445,15 @@ export default function ViewerView() {
             <span
               className="status-dot"
               style={{
-                background:
-                  status === 'connected' ? '#4ade80' :
-                  status === 'error' ? '#ef4444' : '#facc15',
-              }}
-            />
-            {status === 'connected' ? `受信中 ${peerList.length}拠点` :
-             status === 'error' ? 'サーバー未接続' : '接続中...'}
+	                background:
+	                  status === 'connected' ? '#4ade80' :
+	                  status === 'error' ? '#ef4444' :
+	                  status === 'restarting' ? '#60a5fa' : '#facc15',
+	              }}
+	            />
+	            {status === 'connected' ? `受信中 ${peerList.length}拠点` :
+	             status === 'error' ? 'サーバー未接続' :
+	             status === 'restarting' ? '再構築中...' : '接続中...'}
           </div>
 
           <button
@@ -411,10 +505,10 @@ export default function ViewerView() {
             <div>受信できる拠点映像を待機中</div>
           </div>
         ) : (
-          peerList.map(([socketId, peer]) => (
-            <VideoCell
-              key={socketId}
-              label={peer.locationName}
+	          peerList.map(([socketId, peer]) => (
+	            <VideoCell
+	              key={`${uiResetToken}-${socketId}`}
+	              label={peer.locationName}
               stream={peer.stream}
               videoPaused={peer.videoPaused}
               audioPaused={peer.audioPaused}

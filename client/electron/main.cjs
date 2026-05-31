@@ -78,6 +78,16 @@ function restartApp() {
   app.exit(0);
 }
 
+function requestQuickRestart(source = 'main') {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  console.log(`[QuickRestart] forwarding to renderer source=${source}`);
+  mainWindow.webContents.send('quick-restart-request', {
+    source,
+    requestedAt: Date.now(),
+  });
+  return true;
+}
+
 function loadProductionApp() {
   const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
   productionIndexUrl = pathToFileURL(indexPath).toString();
@@ -234,8 +244,9 @@ function startControlServer() {
       }
 
       if (req.method === 'POST' && url.pathname === '/restart') {
-        sendJson(res, 202, { ok: true, restarting: true });
-        setTimeout(restartApp, 100);
+        const sent = requestQuickRestart('control-server');
+        if (!sent && mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+        sendJson(res, 202, { ok: true, quickRestarting: sent, rendererReloaded: !sent });
         return;
       }
 
@@ -363,4 +374,8 @@ app.on('before-quit', () => {
 
 ipcMain.on('restart-app', () => {
   restartApp();
+});
+
+ipcMain.on('quick-restart-result', (_event, result) => {
+  console.log(`[QuickRestart] renderer result ${JSON.stringify(result || {})}`);
 });

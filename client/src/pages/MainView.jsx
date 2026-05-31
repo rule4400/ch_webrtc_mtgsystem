@@ -373,6 +373,27 @@ const defaultClientConfig = {
   serverPort: '3000',
   locationName: '自拠点',
 };
+const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
+
+async function connectWithinStartupWindow(manager, serverUrl, locationName) {
+  let timedOut = false;
+  const connectPromise = manager.connect(serverUrl, locationName)
+    .then(() => 'connected')
+    .catch((err) => {
+      if (timedOut) {
+        console.warn('[QuickRestart] connection failed after startup window:', err.message);
+        return 'failed-late';
+      }
+      throw err;
+    });
+  const timeoutPromise = new Promise(resolve => {
+    setTimeout(() => {
+      timedOut = true;
+      resolve('pending');
+    }, QUICK_RESTART_CONNECT_WINDOW_MS);
+  });
+  return Promise.race([connectPromise, timeoutPromise]);
+}
 
 function sanitizeClientConfig(config) {
   const raw = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
@@ -429,6 +450,7 @@ export default function MainView() {
   const [camError,   setCamError]   = useState(null);
   const [viewerPresenceActive, setViewerPresenceActive] = useState(false);
   const [localSpeaking, setLocalSpeaking] = useState(false);
+  const [uiResetToken, setUiResetToken] = useState(0);
 
   // refs（クリーンアップ・デバイス変更用）
   const webrtcRef = useRef(null);
@@ -438,6 +460,8 @@ export default function MainView() {
   const telemetryStateRef = useRef({});
   const adminHandlersRef = useRef({});
   const audioMonitorRef = useRef({});
+  const softRestartInFlightRef = useRef(false);
+  const softRestartHandlerRef = useRef(null);
 
   const audiblePeerCount = useMemo(() => (
     Array.from(peers.values()).filter((peer) => {
@@ -620,7 +644,7 @@ export default function MainView() {
   }, [camEnabled, micEnabled, startLocalAudioMonitor]);
 
   const recoverLocalMedia = useCallback(async () => {
-    if (mediaRecoveryRef.current) return;
+    if (mediaRecoveryRef.current || softRestartInFlightRef.current) return;
     mediaRecoveryRef.current = true;
     try {
       const conf = configRef.current;
@@ -633,66 +657,139 @@ export default function MainView() {
     }
   }, [installLocalStream, selectedVideoId, selectedAudioInId]);
 
+  const releaseClientRuntime = useCallback(({ status = 'connecting', updateState = true } = {}) => {
+    const manager = webrtcRef.current;
+    webrtcRef.current = null;
+    if (manager) {
+      manager.onPeerUpdated = null;
+      manager.onPeerRemoved = null;
+      manager.onConnectionChange = null;
+      manager.onViewerPresenceChange = null;
+      manager.onRestartCommand = null;
+      manager.onAdminSetDevice = null;
+      manager.onAdminRefreshDevices = null;
+      manager.disconnect();
+    }
+
+    stopLocalAudioMonitor();
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
+    if (updateState) {
+      setLocalStream(null);
+      setPeers(new Map());
+      setViewerPresenceActive(false);
+      setSfuStatus(status);
+    }
+  }, [stopLocalAudioMonitor]);
+
+  const startClientSession = useCallback(async ({ stopPreviousStream = false } = {}) => {
+    const conf = loadClientConfig();
+    configRef.current = conf;
+    setSelfName(conf.locationName || '自拠点');
+
+    const devs = await refreshDevices();
+    const videoId = conf.selectedVideoId   || devs.video[0]?.deviceId    || '';
+    const audioId = conf.selectedAudioInId || devs.audioIn[0]?.deviceId  || '';
+    const outId   = conf.selectedAudioOutId|| devs.audioOut[0]?.deviceId || '';
+    configRef.current = { ...conf, selectedVideoId: videoId, selectedAudioInId: audioId, selectedAudioOutId: outId };
+    setSelectedVideoId(videoId);
+    setSelectedAudioInId(audioId);
+    setSelectedAudioOutId(outId);
+
+    const { stream, error } = await acquireMedia({ videoId, audioId });
+    await installLocalStream(stream, error, { stopPrevious: stopPreviousStream });
+
+    const rtcManager = new WebRTCManager();
+    webrtcRef.current = rtcManager;
+
+    rtcManager.onPeerUpdated = (socketId, peer) => {
+      setPeers(prev => { const m = new Map(prev); m.set(socketId, peer); return m; });
+    };
+    rtcManager.onPeerRemoved = (socketId) => {
+      setPeers(prev => { const m = new Map(prev); m.delete(socketId); return m; });
+    };
+    rtcManager.onConnectionChange = (ok) => {
+      setSfuStatus(ok ? 'connected' : 'error');
+      if (!ok) setViewerPresenceActive(false);
+    };
+    rtcManager.onViewerPresenceChange = setViewerPresenceActive;
+    rtcManager.onRestartCommand = (payload) => softRestartHandlerRef.current?.(payload);
+    rtcManager.onAdminSetDevice = (payload) => {
+      if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
+      return adminHandlersRef.current.setDevice(payload);
+    };
+    rtcManager.onAdminRefreshDevices = () => {
+      if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
+      return adminHandlersRef.current.refreshDevices();
+    };
+
+    const currentStream = streamRef.current;
+    rtcManager.camEnabled = camEnabled;
+    rtcManager.micEnabled = micEnabled;
+    rtcManager.setLocalTracks(
+      currentStream?.getVideoTracks()[0] || null,
+      currentStream?.getAudioTracks()[0] || null,
+    );
+
+    const serverUrl = `http://${conf.serverIp}:${conf.serverPort || 3000}`;
+    const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName);
+    setSfuStatus(connectionState === 'connected' ? 'connected' : 'connecting');
+    return { manager: rtcManager, connectionState };
+  }, [camEnabled, micEnabled, installLocalStream, refreshDevices]);
+
+  const performQuickRestart = useCallback(async (payload = {}) => {
+    if (softRestartInFlightRef.current) return;
+    softRestartInFlightRef.current = true;
+    const startedAt = Date.now();
+    const reason = payload?.reason || payload?.source || 'server-command';
+    console.log(`[QuickRestart] requested reason=${reason}`);
+
+    try {
+      releaseClientRuntime({ status: 'restarting' });
+      setCamError(null);
+      setUiResetToken(token => token + 1);
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const { connectionState } = await startClientSession({ stopPreviousStream: false });
+      window.electronAPI?.quickRestartResult?.({
+        ok: true,
+        reason,
+        connectionState,
+        elapsedMs: Date.now() - startedAt,
+      });
+    } catch (err) {
+      console.error('[QuickRestart] failed:', err);
+      setSfuStatus('error');
+      setCamError(err.message || 'クイック再起動に失敗しました。');
+      window.electronAPI?.quickRestartResult?.({
+        ok: false,
+        reason,
+        error: err.message,
+        elapsedMs: Date.now() - startedAt,
+      });
+    } finally {
+      softRestartInFlightRef.current = false;
+    }
+  }, [releaseClientRuntime, startClientSession]);
+
+  useEffect(() => {
+    softRestartHandlerRef.current = performQuickRestart;
+  }, [performQuickRestart]);
+
+  useEffect(() => {
+    const unsubscribe = window.electronAPI?.onQuickRestartRequest?.((payload) => {
+      softRestartHandlerRef.current?.(payload);
+    });
+    return () => unsubscribe?.();
+  }, []);
+
   // ─── 初期化 ──────────────────────────────────────────────
   useEffect(() => {
-    let rtcManager = null;
-
+    let disposed = false;
     const init = async () => {
-      // 設定読み込み
-      const conf = loadClientConfig();
-      configRef.current = conf;
-      setSelfName(conf.locationName || '自拠点');
-
-      // ── STEP 1: カメラ・マイク取得（SFU とは独立して必ず実行）──
-      // OS権限は Electron main 側で初回だけ確認する。ここでは実際に使うストリームだけ取得する。
-      const devs = await refreshDevices();
-
-      const videoId = conf.selectedVideoId   || devs.video[0]?.deviceId    || '';
-      const audioId = conf.selectedAudioInId || devs.audioIn[0]?.deviceId  || '';
-      const outId   = conf.selectedAudioOutId|| devs.audioOut[0]?.deviceId || '';
-      setSelectedVideoId(videoId);
-      setSelectedAudioInId(audioId);
-      setSelectedAudioOutId(outId);
-
-      const { stream, error } = await acquireMedia({ videoId, audioId });
-      await installLocalStream(stream, error, { stopPrevious: false }); // SFU 接続前に自拠点プレビューを表示
-
-      // ── STEP 2: SFU 接続 ──
       try {
-        rtcManager = new WebRTCManager();
-        webrtcRef.current = rtcManager;
-
-        rtcManager.onPeerUpdated = (socketId, peer) => {
-          setPeers(prev => { const m = new Map(prev); m.set(socketId, peer); return m; });
-        };
-        rtcManager.onPeerRemoved = (socketId) => {
-          setPeers(prev => { const m = new Map(prev); m.delete(socketId); return m; });
-        };
-        rtcManager.onConnectionChange = (ok) => {
-          setSfuStatus(ok ? 'connected' : 'error');
-          if (!ok) setViewerPresenceActive(false);
-        };
-        rtcManager.onViewerPresenceChange = setViewerPresenceActive;
-        rtcManager.onRestartCommand = () => window.electronAPI?.restartApp?.();
-        rtcManager.onAdminSetDevice = (payload) => {
-          if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
-          return adminHandlersRef.current.setDevice(payload);
-        };
-        rtcManager.onAdminRefreshDevices = () => {
-          if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
-          return adminHandlersRef.current.refreshDevices();
-        };
-
-        // 送信トラックを manager に登録（接続/再接続のたびに自動で produce される）
-        const s = streamRef.current;
-        rtcManager.camEnabled = true;
-        rtcManager.micEnabled = true;
-        rtcManager.setLocalTracks(s?.getVideoTracks()[0] || null, s?.getAudioTracks()[0] || null);
-
-        const serverUrl = `http://${conf.serverIp}:${conf.serverPort || 3000}`;
-        await rtcManager.connect(serverUrl, conf.locationName);
-        setSfuStatus('connected');
+        await startClientSession({ stopPreviousStream: false });
       } catch (err) {
+        if (disposed) return;
         console.error('[SFU]', err);
         setSfuStatus('error');
       }
@@ -702,10 +799,9 @@ export default function MainView() {
     navigator.mediaDevices.addEventListener('devicechange', refreshDevices);
 
     return () => {
+      disposed = true;
       navigator.mediaDevices.removeEventListener('devicechange', refreshDevices);
-      rtcManager?.disconnect();
-      stopLocalAudioMonitor();
-      streamRef.current?.getTracks().forEach(t => t.stop());
+      releaseClientRuntime({ updateState: false });
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -890,10 +986,12 @@ export default function MainView() {
             <span className="status-dot" style={{
               background:
                 sfuStatus === 'connected'  ? '#4ade80' :
-                sfuStatus === 'error'      ? '#ef4444' : '#facc15',
+                sfuStatus === 'error'      ? '#ef4444' :
+                sfuStatus === 'restarting' ? '#60a5fa' : '#facc15',
             }} />
             {sfuStatus === 'connected'  ? `接続中 ${peers.size + 1}拠点` :
-             sfuStatus === 'error'      ? 'サーバー未接続' : '接続中...'}
+             sfuStatus === 'error'      ? 'サーバー未接続' :
+             sfuStatus === 'restarting' ? '再構築中...' : '接続中...'}
           </div>
           <button
             className="ctrl-btn"
@@ -922,6 +1020,7 @@ export default function MainView() {
       >
         {/* 自拠点 */}
         <VideoCell
+          key={`self-${uiResetToken}`}
           label={selfName}
           stream={localStream}
           isSelf={true}
@@ -932,7 +1031,7 @@ export default function MainView() {
         {/* 他拠点 */}
         {Array.from(peers.entries()).map(([socketId, peer]) => (
           <VideoCell
-            key={socketId}
+            key={`${uiResetToken}-${socketId}`}
             label={peer.locationName}
             stream={peer.stream}
             isSelf={false}
