@@ -20,7 +20,7 @@
       "gatekeeperAssess": false
     },
     "win": {
-      "target": ["nsis", "portable"]
+      "target": ["nsis", "portable", "zip"]
     },
     "directories": {
       "output": "release"
