@@ -19,6 +19,7 @@
 
 const express = require('express');
 const http = require('http');
+const os = require('os');
 const { Server } = require('socket.io');
 const mediasoup = require('mediasoup');
 const cors = require('cors');
@@ -279,6 +280,13 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
   };
 }
 
+function localIpv4Addresses() {
+  return Object.values(os.networkInterfaces())
+    .flat()
+    .filter(item => item && item.family === 'IPv4' && !item.internal)
+    .map(item => item.address);
+}
+
 function getStatsSnapshot() {
   let totalProducers = 0;
   let totalConsumers = 0;
@@ -296,6 +304,8 @@ function getStatsSnapshot() {
     return acc;
   }, {});
 
+  const serverIps = localIpv4Addresses();
+
   return {
     status: recovering ? 'recovering' : 'ok',
     uptimeSec: Math.round(process.uptime()),
@@ -310,6 +320,8 @@ function getStatsSnapshot() {
     listenIp: config.listenIp,
     listenPort: config.listenPort,
     announcedIp: config.announcedIp,
+    serverIps,
+    currentIp: config.announcedIp || serverIps[0] || config.listenIp || '',
     rtcPortRange: config.rtcPortRange,
     iceServerCount: (config.iceServers || []).length,
   };
@@ -358,6 +370,14 @@ function emitTargetCommand(socketId, eventName, payload, label) {
     }
     sendAdminLog(`[Admin] ${label} ok socket=${socketId} elapsed=${elapsedMs}ms`);
   });
+}
+
+function normalizeMediaStateKind(kind) {
+  const value = shortString(kind, 32);
+  if (value === 'camera' || value === 'video') return 'camera';
+  if (value === 'mic' || value === 'microphone' || value === 'audioInput') return 'mic';
+  if (value === 'speaker' || value === 'audioOutput') return 'speaker';
+  return '';
 }
 
 function computeViewerPresence(now = Date.now()) {
@@ -744,6 +764,18 @@ if (process.send) {
         'adminSetDevice',
         { kind: shortString(msg.kind, 32), deviceId: shortString(msg.deviceId, 256) },
         `set-device kind=${msg.kind}`,
+      );
+    } else if (msg.type === 'set-client-media-state' && socketId) {
+      const kind = normalizeMediaStateKind(msg.kind);
+      if (!kind) {
+        sendAdminLog(`[Admin] set-media-state failed: unsupported kind=${msg.kind}`);
+        return;
+      }
+      emitTargetCommand(
+        socketId,
+        'adminSetMediaState',
+        { kind, enabled: !!msg.enabled },
+        `set-media-state kind=${kind} enabled=${!!msg.enabled}`,
       );
     } else if (msg.type === 'refresh-client-devices' && socketId) {
       emitTargetCommand(socketId, 'adminRefreshDevices', {}, 'refresh-devices');

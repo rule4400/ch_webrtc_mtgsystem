@@ -9,10 +9,9 @@
  */
 
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
 import {
   Mic, MicOff, Video, VideoOff,
-  Volume2, VolumeX, Settings, ChevronDown,
+  Volume2, VolumeX, Settings, ChevronDown, X,
 } from 'lucide-react';
 import { WebRTCManager } from '../services/webrtc';
 
@@ -173,10 +172,16 @@ async function acquireMedia({ videoId, audioId, wantVideo = true, wantAudio = tr
   const videoBase = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
   const audioBase = {
     echoCancellation: { ideal: true },
+    voiceIsolation: { ideal: true },
     noiseSuppression: { ideal: true },
     autoGainControl: { ideal: true },
     channelCount: { ideal: 1 },
     sampleRate: { ideal: 48000 },
+    sampleSize: { ideal: 16 },
+    googEchoCancellation: true,
+    googAutoGainControl: true,
+    googNoiseSuppression: true,
+    googHighpassFilter: true,
   };
 
   // 試行リスト: ①指定デバイス(exact) → ②指定デバイス(ideal) → ③デバイス無指定
@@ -425,10 +430,45 @@ function loadClientConfig() {
   }
 }
 
+function serverUrlFromConfig(config) {
+  const conf = sanitizeClientConfig(config);
+  return `http://${conf.serverIp}:${conf.serverPort || 3000}`;
+}
+
+async function probeServerReady(config, timeoutMs = 800) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const baseUrl = serverUrlFromConfig(config);
+
+  try {
+    const ready = await fetch(`${baseUrl}/ready`, {
+      signal: controller.signal,
+      cache: 'no-store',
+    });
+    if (ready.ok) return true;
+  } catch {
+    // 古いサーバーや起動直後は /ready が返らないことがあるので /health も見る。
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const fallbackController = new AbortController();
+  const fallbackTimer = setTimeout(() => fallbackController.abort(), timeoutMs);
+  try {
+    const health = await fetch(`${baseUrl}/health`, {
+      signal: fallbackController.signal,
+      cache: 'no-store',
+    });
+    return health.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(fallbackTimer);
+  }
+}
+
 // ─── メインビュー ─────────────────────────────────────────
 export default function MainView() {
-  const navigate = useNavigate();
-
   // ── 映像/音声状態 ──
   const [localStream,  setLocalStream]  = useState(null);
   const [micEnabled,   setMicEnabled]   = useState(true);
@@ -451,6 +491,8 @@ export default function MainView() {
   const [viewerPresenceActive, setViewerPresenceActive] = useState(false);
   const [localSpeaking, setLocalSpeaking] = useState(false);
   const [uiResetToken, setUiResetToken] = useState(0);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsDraft, setSettingsDraft] = useState(() => sanitizeClientConfig(loadClientConfig()));
 
   // refs（クリーンアップ・デバイス変更用）
   const webrtcRef = useRef(null);
@@ -462,6 +504,7 @@ export default function MainView() {
   const audioMonitorRef = useRef({});
   const softRestartInFlightRef = useRef(false);
   const softRestartHandlerRef = useRef(null);
+  const serverProbeInFlightRef = useRef(false);
 
   const audiblePeerCount = useMemo(() => (
     Array.from(peers.values()).filter((peer) => {
@@ -667,6 +710,7 @@ export default function MainView() {
       manager.onViewerPresenceChange = null;
       manager.onRestartCommand = null;
       manager.onAdminSetDevice = null;
+      manager.onAdminSetMediaState = null;
       manager.onAdminRefreshDevices = null;
       manager.disconnect();
     }
@@ -683,8 +727,9 @@ export default function MainView() {
   }, [stopLocalAudioMonitor]);
 
   const startClientSession = useCallback(async ({ stopPreviousStream = false } = {}) => {
-    const conf = loadClientConfig();
+    const conf = sanitizeClientConfig(loadClientConfig());
     configRef.current = conf;
+    setSettingsDraft(conf);
     setSelfName(conf.locationName || '自拠点');
 
     const devs = await refreshDevices();
@@ -718,6 +763,10 @@ export default function MainView() {
       if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
       return adminHandlersRef.current.setDevice(payload);
     };
+    rtcManager.onAdminSetMediaState = (payload) => {
+      if (!adminHandlersRef.current.setMediaState) throw new Error('media state control is not ready');
+      return adminHandlersRef.current.setMediaState(payload);
+    };
     rtcManager.onAdminRefreshDevices = () => {
       if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
       return adminHandlersRef.current.refreshDevices();
@@ -731,7 +780,7 @@ export default function MainView() {
       currentStream?.getAudioTracks()[0] || null,
     );
 
-    const serverUrl = `http://${conf.serverIp}:${conf.serverPort || 3000}`;
+    const serverUrl = serverUrlFromConfig(conf);
     const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName);
     setSfuStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     return { manager: rtcManager, connectionState };
@@ -813,6 +862,38 @@ export default function MainView() {
     return () => clearInterval(id);
   }, []);
 
+  // ─── サーバー到達確認: オフライン復帰を1秒周期で拾う ─────────────
+  useEffect(() => {
+    const id = setInterval(async () => {
+      if (softRestartInFlightRef.current || serverProbeInFlightRef.current) return;
+      const manager = webrtcRef.current;
+      if (manager?.isSocketConnected() && manager?.isInitialized()) return;
+
+      serverProbeInFlightRef.current = true;
+      try {
+        const conf = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+        const reachable = await probeServerReady(conf);
+        if (!reachable) {
+          setSfuStatus(prev => (prev === 'restarting' ? prev : 'error'));
+          return;
+        }
+
+        setSfuStatus(prev => (prev === 'connected' ? prev : 'connecting'));
+        if (manager) {
+          manager.requestReconnect();
+        } else {
+          await startClientSession({ stopPreviousStream: false });
+        }
+      } catch (err) {
+        console.warn('[serverProbe]', err.message);
+      } finally {
+        serverProbeInFlightRef.current = false;
+      }
+    }, 1000);
+
+    return () => clearInterval(id);
+  }, [startClientSession]);
+
   // ─── ローカルカメラ/マイク自己復旧 ───────────────────────
   useEffect(() => {
     const id = setInterval(() => {
@@ -856,6 +937,24 @@ export default function MainView() {
     localStorage.setItem('sfu_config', JSON.stringify(conf));
   }, []);
 
+  const setCameraEnabled = useCallback(async (enabled) => {
+    const next = !!enabled;
+    streamRef.current?.getVideoTracks().forEach(t => (t.enabled = next));
+    setCamEnabled(next);
+    await webrtcRef.current?.setCamEnabled(next);
+  }, []);
+
+  const setMicrophoneEnabled = useCallback(async (enabled) => {
+    const next = !!enabled;
+    streamRef.current?.getAudioTracks().forEach(t => (t.enabled = next));
+    setMicEnabled(next);
+    await webrtcRef.current?.setMicEnabled(next);
+  }, []);
+
+  const setSpeakerOutputEnabled = useCallback((enabled) => {
+    setSpeakerMuted(!enabled);
+  }, []);
+
   useEffect(() => {
     adminHandlersRef.current = {
       setDevice: async ({ kind, deviceId }) => {
@@ -874,6 +973,21 @@ export default function MainView() {
         }
         throw new Error(`unsupported device kind: ${kind}`);
       },
+      setMediaState: async ({ kind, enabled }) => {
+        if (kind === 'camera') {
+          await setCameraEnabled(enabled);
+          return { localMedia: { cameraEnabled: !!enabled } };
+        }
+        if (kind === 'mic') {
+          await setMicrophoneEnabled(enabled);
+          return { localMedia: { micEnabled: !!enabled } };
+        }
+        if (kind === 'speaker') {
+          setSpeakerOutputEnabled(!!enabled);
+          return { localMedia: { speakerMuted: !enabled } };
+        }
+        throw new Error(`unsupported media kind: ${kind}`);
+      },
       refreshDevices: async () => {
         const devices = await refreshDevices();
         return {
@@ -885,7 +999,7 @@ export default function MainView() {
         };
       },
     };
-  }, [changeMediaDevice, changeSpeaker, refreshDevices]);
+  }, [changeMediaDevice, changeSpeaker, refreshDevices, setCameraEnabled, setMicrophoneEnabled, setSpeakerOutputEnabled]);
 
   useEffect(() => {
     const sendTelemetry = () => {
@@ -957,19 +1071,42 @@ export default function MainView() {
 
   // ─── カメラ ON/OFF ────────────────────────────────────────
   const toggleCam = useCallback(async () => {
-    const next = !camEnabled;
-    streamRef.current?.getVideoTracks().forEach(t => (t.enabled = next));
-    setCamEnabled(next);
-    webrtcRef.current?.setCamEnabled(next).catch(() => {});
-  }, [camEnabled]);
+    setCameraEnabled(!camEnabled).catch(() => {});
+  }, [camEnabled, setCameraEnabled]);
 
   // ─── マイク ON/OFF ────────────────────────────────────────
   const toggleMic = useCallback(async () => {
-    const next = !micEnabled;
-    streamRef.current?.getAudioTracks().forEach(t => (t.enabled = next));
-    setMicEnabled(next);
-    webrtcRef.current?.setMicEnabled(next).catch(() => {});
-  }, [micEnabled]);
+    setMicrophoneEnabled(!micEnabled).catch(() => {});
+  }, [micEnabled, setMicrophoneEnabled]);
+
+  const openSettingsPanel = useCallback(() => {
+    const current = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+    setSettingsDraft(current);
+    setSettingsOpen(true);
+  }, []);
+
+  const updateSettingsDraft = useCallback((key, value) => {
+    setSettingsDraft(prev => ({ ...prev, [key]: value }));
+  }, []);
+
+  const saveSettingsDraft = useCallback(async () => {
+    const previous = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+    const next = sanitizeClientConfig({ ...configRef.current, ...settingsDraft });
+    const requiresReconnect =
+      previous.serverIp !== next.serverIp ||
+      previous.serverPort !== next.serverPort ||
+      previous.locationName !== next.locationName;
+
+    configRef.current = next;
+    localStorage.setItem('sfu_config', JSON.stringify(next));
+    setSelfName(next.locationName || '自拠点');
+    setSettingsDraft(next);
+    setSettingsOpen(false);
+
+    if (requiresReconnect) {
+      await performQuickRestart({ reason: 'settings-updated' });
+    }
+  }, [performQuickRestart, settingsDraft]);
 
   // ─── グリッド ────────────────────────────────────────────
   const totalCells = peers.size + 1;
@@ -978,30 +1115,16 @@ export default function MainView() {
   return (
     <div className="main-layout">
 
-      {/* ── ヘッダー ── */}
-      <div className="header-bar">
-        <div className="header-title">常時接続 会議システム</div>
-        <div className="header-right">
-          <div className="header-status">
-            <span className="status-dot" style={{
-              background:
-                sfuStatus === 'connected'  ? '#4ade80' :
-                sfuStatus === 'error'      ? '#ef4444' :
-                sfuStatus === 'restarting' ? '#60a5fa' : '#facc15',
-            }} />
-            {sfuStatus === 'connected'  ? `接続中 ${peers.size + 1}拠点` :
-             sfuStatus === 'error'      ? 'サーバー未接続' :
-             sfuStatus === 'restarting' ? '再構築中...' : '接続中...'}
-          </div>
-          <button
-            className="ctrl-btn"
-            style={{ width: 32, height: 32 }}
-            onClick={() => navigate('/settings')}
-            title="設定"
-          >
-            <Settings size={15} />
-          </button>
-        </div>
+      <div className="floating-status">
+        <span className="status-dot" style={{
+          background:
+            sfuStatus === 'connected'  ? '#4ade80' :
+            sfuStatus === 'error'      ? '#ef4444' :
+            sfuStatus === 'restarting' ? '#60a5fa' : '#facc15',
+        }} />
+        {sfuStatus === 'connected'  ? `接続中 ${peers.size + 1}拠点` :
+         sfuStatus === 'error'      ? 'サーバー未接続' :
+         sfuStatus === 'restarting' ? '再構築中...' : '接続中...'}
       </div>
 
       {/* ── カメラエラー表示 ── */}
@@ -1077,7 +1200,7 @@ export default function MainView() {
         {/* スピーカー */}
         <DeviceButton
           active={!speakerMuted}
-          onToggle={() => setSpeakerMuted(v => !v)}
+          onToggle={() => setSpeakerOutputEnabled(speakerMuted)}
           Icon={Volume2}
           IconOff={VolumeX}
           devices={audioOutDevices}
@@ -1086,6 +1209,73 @@ export default function MainView() {
           title="スピーカー"
         />
       </div>
+
+      <button
+        className="settings-fab"
+        onClick={openSettingsPanel}
+        title="設定"
+        aria-label="設定"
+      >
+        <Settings size={18} />
+      </button>
+
+      {settingsOpen && (
+        <div className="settings-overlay" role="dialog" aria-modal="true" aria-label="接続設定">
+          <div className="settings-panel">
+            <div className="settings-panel-head">
+              <div>
+                <h1>接続設定</h1>
+                <p>この画面を開いている間も通信は継続します</p>
+              </div>
+              <button className="icon-btn" onClick={() => setSettingsOpen(false)} aria-label="閉じる">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="settings-section">
+              <h2>基本設定</h2>
+              <div className="field">
+                <label>拠点名</label>
+                <input
+                  type="text"
+                  value={settingsDraft.locationName}
+                  onChange={e => updateSettingsDraft('locationName', e.target.value)}
+                  placeholder="例: 東京本社"
+                />
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <h2>SFUサーバー</h2>
+              <div className="server-row">
+                <div className="field">
+                  <label>IPアドレス</label>
+                  <input
+                    type="text"
+                    value={settingsDraft.serverIp}
+                    onChange={e => updateSettingsDraft('serverIp', e.target.value)}
+                    placeholder="例: 192.168.1.223"
+                  />
+                </div>
+                <div className="field">
+                  <label>ポート</label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={settingsDraft.serverPort}
+                    onChange={e => updateSettingsDraft('serverPort', e.target.value)}
+                    placeholder="3000"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <button className="btn-join" onClick={saveSettingsDraft}>
+              保存して反映
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

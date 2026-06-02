@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>SFU Server Admin Dashboard</title>
+  <title>SFUサーバー管理ダッシュボード</title>
   <style>
     :root {
       --bg: #101214;
@@ -238,12 +238,14 @@
 
     .client-grid {
       min-height: 0;
+      max-height: 100%;
       overflow: auto;
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
       align-content: start;
       gap: 12px;
       padding-right: 4px;
+      overscroll-behavior: contain;
     }
 
     .client-card {
@@ -252,6 +254,8 @@
       border-radius: 8px;
       min-width: 0;
       overflow: hidden;
+      content-visibility: auto;
+      contain-intrinsic-size: 420px;
     }
 
     .client-card.healthy { border-color: rgba(56,217,150,0.45); }
@@ -310,6 +314,8 @@
     }
     .mini-btn.danger { background: rgba(239,91,91,0.18); border-color: rgba(239,91,91,0.4); color: #ffb3b3; }
     .mini-btn.blue { background: rgba(90,176,255,0.15); border-color: rgba(90,176,255,0.38); color: #b8dcff; }
+    .mini-btn.ok { background: rgba(56,217,150,0.14); border-color: rgba(56,217,150,0.34); color: #b8f7dc; }
+    .mini-btn.warn { background: rgba(246,195,91,0.14); border-color: rgba(246,195,91,0.35); color: #ffe0a3; }
 
     .client-body {
       padding: 12px;
@@ -641,30 +647,31 @@
       <div class="top-actions">
         <div class="status-pill">
           <span id="statusDot" class="dot"></span>
-          <span id="statusText">Stopped</span>
+          <span id="statusText">停止中</span>
         </div>
-        <button id="startBtn" class="btn primary">Start</button>
-        <button id="stopBtn" class="btn danger">Stop</button>
+        <button id="startBtn" class="btn primary">起動</button>
+        <button id="stopBtn" class="btn danger">停止</button>
       </div>
     </header>
 
     <nav class="tabs" role="tablist" aria-label="Server dashboard sections">
-      <button type="button" class="tab active" data-target="dashboard" role="tab" aria-selected="true" aria-controls="dashboard">Dashboard</button>
-      <button type="button" class="tab" data-target="clients" role="tab" aria-selected="false" aria-controls="clients">Clients</button>
-      <button type="button" class="tab" data-target="registered" role="tab" aria-selected="false" aria-controls="registered">Registry</button>
-      <button type="button" class="tab" data-target="logs" role="tab" aria-selected="false" aria-controls="logs">Logs</button>
-      <button type="button" class="tab" data-target="settings" role="tab" aria-selected="false" aria-controls="settings">Settings</button>
+      <button type="button" class="tab active" data-target="dashboard" role="tab" aria-selected="true" aria-controls="dashboard">ダッシュボード</button>
+      <button type="button" class="tab" data-target="clients" role="tab" aria-selected="false" aria-controls="clients">接続端末</button>
+      <button type="button" class="tab" data-target="registered" role="tab" aria-selected="false" aria-controls="registered">事前登録</button>
+      <button type="button" class="tab" data-target="logs" role="tab" aria-selected="false" aria-controls="logs">ログ</button>
+      <button type="button" class="tab" data-target="settings" role="tab" aria-selected="false" aria-controls="settings">設定</button>
     </nav>
 
     <main class="content">
       <section id="dashboard" class="panel active dashboard-layout" role="tabpanel">
         <div class="metrics">
-          <div class="metric"><div class="metric-label">Connected</div><div class="metric-value" id="mPeers">0</div><div class="metric-note" id="mHealth">waiting</div></div>
-          <div class="metric"><div class="metric-label">Media Streams</div><div class="metric-value" id="mStreams">0 / 0</div><div class="metric-note">producers / consumers</div></div>
-          <div class="metric"><div class="metric-label">Receive OK</div><div class="metric-value" id="mReceive">0</div><div class="metric-note">client-side monitor</div></div>
-          <div class="metric"><div class="metric-label">Memory</div><div class="metric-value" id="mMemory">0 MB</div><div class="metric-note" id="mUptime">uptime 0s</div></div>
-          <div class="metric"><div class="metric-label">CPU</div><div class="metric-value" id="mCpu">0.0%</div><div class="metric-note" id="mAnnounced">ANNOUNCED_IP</div></div>
-          <div class="metric"><div class="metric-label">Actions</div><button id="restartAllBtn" class="btn danger" style="width:100%; margin-top:4px;">Restart All</button><div class="metric-note">all connected clients</div></div>
+          <div class="metric"><div class="metric-label">接続端末</div><div class="metric-value" id="mPeers">0</div><div class="metric-note" id="mHealth">待機中</div></div>
+          <div class="metric"><div class="metric-label">映像・音声配信</div><div class="metric-value" id="mStreams">0 / 0</div><div class="metric-note">送信 / 受信</div></div>
+          <div class="metric"><div class="metric-label">受信確認OK</div><div class="metric-value" id="mReceive">0</div><div class="metric-note">クライアント側監視</div></div>
+          <div class="metric"><div class="metric-label">サーバーIP</div><div class="metric-value" id="mCurrentIp">-</div><div class="metric-note" id="mAnnounced">ANNOUNCED_IP</div></div>
+          <div class="metric"><div class="metric-label">メモリ</div><div class="metric-value" id="mMemory">0 MB</div><div class="metric-note" id="mUptime">起動時間 0s</div></div>
+          <div class="metric"><div class="metric-label">CPU</div><div class="metric-value" id="mCpu">0.0%</div><div class="metric-note" id="mRtcPorts">RTP -</div></div>
+          <div class="metric"><div class="metric-label">一括操作</div><button id="restartAllBtn" class="btn danger" style="width:100%; margin-top:4px;">全端末を再構築</button><div class="metric-note">接続中の全クライアント</div></div>
         </div>
         <div id="clientCards" class="client-grid">
           <div class="empty">サーバー起動後、接続端末の状態がここに表示されます</div>
@@ -707,8 +714,8 @@
               <input id="regServerPort" value="3000">
             </div>
             <div class="registry-actions">
-              <button id="regAddBtn" class="btn primary">Register</button>
-              <button id="regReloadBtn" class="btn ghost">Reload</button>
+              <button id="regAddBtn" class="btn primary">登録</button>
+              <button id="regReloadBtn" class="btn ghost">再読み込み</button>
               <span id="regStatus" class="registry-status"></span>
             </div>
           </div>
@@ -719,19 +726,19 @@
       </section>
 
       <section id="logs" class="panel" role="tabpanel" hidden>
-        <div class="log-container" id="logOutput">=== SFU Server Logs ===</div>
+        <div class="log-container" id="logOutput">=== SFUサーバーログ ===</div>
       </section>
 
       <section id="settings" class="panel" role="tabpanel" hidden>
         <div class="settings-wrap">
           <div class="settings-row">
-            <label>Server Runtime</label>
+            <label>サーバー実行フォルダ</label>
             <div class="path-display" id="pathDisplay">内蔵サーバーを使用します</div>
             <button class="btn ghost" id="selectBtn">外部サーバーフォルダを選択</button>
             <button class="btn ghost" id="useBundledBtn">内蔵サーバーに戻す</button>
           </div>
           <div class="settings-row">
-            <label>Bundled Server .env</label>
+            <label>内蔵サーバー .env</label>
             <div class="path-display" id="envDisplay">Loading...</div>
           </div>
         </div>
@@ -841,7 +848,7 @@
     }
 
     function defaultRegistryServerIp() {
-      return latestStats?.announcedIp || '';
+      return latestStats?.currentIp || latestStats?.announcedIp || '';
     }
 
     function defaultRegistryServerPort() {
@@ -882,10 +889,10 @@
           </div>
           ${client.lastError ? `<div class="registered-meta" style="color:var(--red)">${escapeHtml(client.lastError)}</div>` : ''}
           <div class="registered-actions">
-            <button class="mini-btn blue" data-reg-action="probe" data-id="${escapeHtml(client.id)}">Probe</button>
-            <button class="mini-btn blue" data-reg-action="configure" data-id="${escapeHtml(client.id)}">Push Config</button>
-            <button class="mini-btn danger" data-reg-action="restart" data-id="${escapeHtml(client.id)}">Restart</button>
-            <button class="mini-btn" data-reg-action="remove" data-id="${escapeHtml(client.id)}">Remove</button>
+            <button class="mini-btn blue" data-reg-action="probe" data-id="${escapeHtml(client.id)}">疎通確認</button>
+            <button class="mini-btn blue" data-reg-action="configure" data-id="${escapeHtml(client.id)}">設定送信</button>
+            <button class="mini-btn danger" data-reg-action="restart" data-id="${escapeHtml(client.id)}">再構築</button>
+            <button class="mini-btn" data-reg-action="remove" data-id="${escapeHtml(client.id)}">削除</button>
           </div>
         </article>
       `).join('');
@@ -926,7 +933,7 @@
       }
       return devices.map(device => {
         const value = escapeHtml(device.deviceId);
-        const text = escapeHtml(device.label || device.kind || 'device');
+        const text = escapeHtml(device.label || device.kind || 'デバイス');
         const active = device.deviceId === selected ? 'selected' : '';
         return `<option value="${value}" ${active}>${text}</option>`;
       }).join('');
@@ -937,14 +944,30 @@
       return `<span class="chip ${cls}">${escapeHtml(label)}</span>`;
     }
 
+    function mediaToggleButton(socketId, kind, label, enabled, disabled = false) {
+      const nextEnabled = !enabled;
+      const tone = enabled ? 'warn' : 'ok';
+      const suffix = enabled ? 'OFF' : 'ON';
+      return `
+        <button
+          class="mini-btn ${tone}"
+          data-action="media-state"
+          data-socket="${escapeHtml(socketId)}"
+          data-kind="${escapeHtml(kind)}"
+          data-enabled="${String(nextEnabled)}"
+          ${disabled ? 'disabled' : ''}
+        >${escapeHtml(label)} ${suffix}</button>
+      `;
+    }
+
     function monitorRows(client) {
       const peers = client.remoteMonitor?.peers || [];
       if (!peers.length) return '<div class="empty">受信モニターなし</div>';
       return `<div class="monitor-list">${peers.map(peer => `
         <div class="monitor-row">
           <div class="monitor-name">${escapeHtml(peer.name || peer.socketId || 'unknown')}</div>
-          ${mediaChip('Video', !!peer.receivingVideo, !!peer.videoPaused)}
-          ${mediaChip('Audio', !!peer.receivingAudio, !!peer.audioPaused)}
+          ${mediaChip('映像', !!peer.receivingVideo, !!peer.videoPaused)}
+          ${mediaChip('音声', !!peer.receivingAudio, !!peer.audioPaused)}
         </div>
       `).join('')}</div>`;
     }
@@ -974,56 +997,65 @@
               <div class="client-meta">${escapeHtml(shortId(client.id))} / ${escapeHtml(client.remoteAddress || '-')}</div>
             </div>
             <div class="client-actions">
-              <button class="mini-btn blue" data-action="refresh" data-socket="${escapeHtml(client.id)}">Devices</button>
-              <button class="mini-btn danger" data-action="restart" data-socket="${escapeHtml(client.id)}">Restart</button>
-              <button class="mini-btn" data-action="kick" data-socket="${escapeHtml(client.id)}">Kick</button>
+              <button class="mini-btn blue" data-action="refresh" data-socket="${escapeHtml(client.id)}">デバイス更新</button>
+              <button class="mini-btn danger" data-action="restart" data-socket="${escapeHtml(client.id)}">再構築</button>
+              <button class="mini-btn" data-action="kick" data-socket="${escapeHtml(client.id)}">切断</button>
             </div>
           </div>
           <div class="client-body">
             <div class="kv-grid">
-              <div class="kv"><span>Health</span><strong>${escapeHtml(healthText[health] || health)}</strong></div>
-              <div class="kv"><span>Last seen</span><strong>${fmtMs(client.heartbeatAgeMs)}</strong></div>
+              <div class="kv"><span>状態</span><strong>${escapeHtml(healthText[health] || health)}</strong></div>
+              <div class="kv"><span>最終応答</span><strong>${fmtMs(client.heartbeatAgeMs)}</strong></div>
               <div class="kv"><span>RTT</span><strong>${fmtMs(client.rttMs)}</strong></div>
-              <div class="kv"><span>Recv OK</span><strong>${recvOk}</strong></div>
+              <div class="kv"><span>受信OK</span><strong>${recvOk}</strong></div>
             </div>
 
             <div>
-              <div class="section-title">Media State</div>
+              <div class="section-title">メディア状態</div>
               <div class="chip-row">
-                ${mediaChip('Camera', !!local.cameraEnabled && local.video?.readyState === 'live', !local.cameraEnabled)}
-                ${mediaChip('Mic', !!local.micEnabled && local.audio?.readyState === 'live', !local.micEnabled)}
-                ${mediaChip('Speaker', !local.speakerMuted, !!local.speakerMuted)}
-                <span class="chip blue">Send ${escapeHtml(transports.sendState || 'none')}</span>
-                <span class="chip blue">Recv ${escapeHtml(transports.recvState || 'none')}</span>
+                ${mediaChip('カメラ', !!local.cameraEnabled && local.video?.readyState === 'live', !local.cameraEnabled)}
+                ${mediaChip('マイク', !!local.micEnabled && local.audio?.readyState === 'live', !local.micEnabled)}
+                ${mediaChip('スピーカー', !local.speakerMuted, !!local.speakerMuted)}
+                <span class="chip blue">送信 ${escapeHtml(transports.sendState || 'none')}</span>
+                <span class="chip blue">受信 ${escapeHtml(transports.recvState || 'none')}</span>
               </div>
             </div>
 
             <div>
-              <div class="section-title">Device Control</div>
+              <div class="section-title">ON/OFF制御</div>
+              <div class="chip-row">
+                ${mediaToggleButton(client.id, 'camera', 'カメラ', !!local.cameraEnabled, isViewer)}
+                ${mediaToggleButton(client.id, 'mic', 'マイク', !!local.micEnabled, isViewer)}
+                ${mediaToggleButton(client.id, 'speaker', 'スピーカー', !local.speakerMuted)}
+              </div>
+            </div>
+
+            <div>
+              <div class="section-title">デバイス選択</div>
               <div class="device-grid">
                 <div class="device-control">
-                  <label>Camera</label>
+                  <label>カメラ</label>
                   <select data-action="device" data-socket="${escapeHtml(client.id)}" data-kind="video" ${videoDisabled ? 'disabled' : ''}>
-                    ${deviceOptions(devices.video, selected.video, 'Camera')}
+                    ${deviceOptions(devices.video, selected.video, 'カメラ')}
                   </select>
                 </div>
                 <div class="device-control">
-                  <label>Microphone</label>
+                  <label>マイク</label>
                   <select data-action="device" data-socket="${escapeHtml(client.id)}" data-kind="audioInput" ${micDisabled ? 'disabled' : ''}>
-                    ${deviceOptions(devices.audioInput, selected.audioInput, 'Mic')}
+                    ${deviceOptions(devices.audioInput, selected.audioInput, 'マイク')}
                   </select>
                 </div>
                 <div class="device-control">
-                  <label>Speaker</label>
+                  <label>スピーカー</label>
                   <select data-action="device" data-socket="${escapeHtml(client.id)}" data-kind="audioOutput" ${speakerDisabled ? 'disabled' : ''}>
-                    ${deviceOptions(devices.audioOutput, selected.audioOutput, 'Speaker')}
+                    ${deviceOptions(devices.audioOutput, selected.audioOutput, 'スピーカー')}
                   </select>
                 </div>
               </div>
             </div>
 
             <div>
-              <div class="section-title">Client Receive Monitor</div>
+              <div class="section-title">クライアント受信モニター</div>
               ${monitorRows(client)}
             </div>
           </div>
@@ -1072,10 +1104,12 @@
       document.getElementById('mHealth').innerText = `正常 ${health.healthy || 0} / 注意 ${(health.degraded || 0) + (health.warming || 0)} / 応答なし ${(health.stale || 0) + (health.offline || 0)}`;
       document.getElementById('mStreams').innerText = `${stats.totalProducers || 0} / ${stats.totalConsumers || 0}`;
       document.getElementById('mReceive').innerText = receiveOk;
+      document.getElementById('mCurrentIp').innerText = stats.currentIp || stats.announcedIp || '-';
       document.getElementById('mMemory').innerText = `${Math.round((stats.memory || 0) / 1024 / 1024)} MB`;
-      document.getElementById('mUptime').innerText = `uptime ${fmtUptime(stats.uptimeSec || 0)}`;
+      document.getElementById('mUptime').innerText = `起動時間 ${fmtUptime(stats.uptimeSec || 0)}`;
       document.getElementById('mCpu').innerText = `${stats.cpu || '0.0'}%`;
-      document.getElementById('mAnnounced').innerText = `${stats.announcedIp || '-'} / RTP ${stats.rtcPortRange?.min || '-'}-${stats.rtcPortRange?.max || '-'}`;
+      document.getElementById('mAnnounced').innerText = `公開IP ${stats.announcedIp || '-'} / 実IP ${(stats.serverIps || []).join(', ') || '-'}`;
+      document.getElementById('mRtcPorts').innerText = `RTP ${stats.rtcPortRange?.min || '-'}-${stats.rtcPortRange?.max || '-'}`;
       refreshRegistryDefaults();
 
       if (isDeviceSelectActive()) {
@@ -1121,6 +1155,11 @@
         }
         if (action === 'kick' && confirm(`クライアント ${socketId} を切断しますか？`)) {
           window.api.kickClient(socketId);
+        }
+        if (action === 'media-state') {
+          holdClientCardRender(1500);
+          window.api.setClientMediaState(socketId, button.dataset.kind, button.dataset.enabled === 'true');
+          setTimeout(flushDeferredCardStats, 1600);
         }
         if (action === 'refresh') {
           window.api.refreshClientDevices(socketId);
@@ -1245,16 +1284,16 @@
     restartAllBtn.addEventListener('click', () => {
       if (!confirm('全クライアントへ再起動指示を送信しますか？')) return;
       restartAllBtn.disabled = true;
-      restartAllBtn.innerText = 'Sending...';
+      restartAllBtn.innerText = '送信中...';
       window.api.restartAll();
       setTimeout(() => {
         restartAllBtn.disabled = false;
-        restartAllBtn.innerText = 'Restart All';
+        restartAllBtn.innerText = '全端末を再構築';
       }, 6000);
     });
 
     window.api.onServerStatus((status) => {
-      statusText.innerText = status;
+      statusText.innerText = status === 'Running' ? '稼働中' : '停止中';
       statusDot.classList.toggle('running', status === 'Running');
       if (status !== 'Running') resetStats();
     });

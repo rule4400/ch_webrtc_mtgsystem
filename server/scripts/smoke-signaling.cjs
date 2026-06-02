@@ -170,6 +170,15 @@ async function run() {
     await wait(250);
     if (!deviceCommandOk) throw new Error('adminSetDevice was not delivered');
 
+    let mediaStateCommandOk = false;
+    socket.on('adminSetMediaState', (payload, ack) => {
+      mediaStateCommandOk = payload.kind === 'mic' && payload.enabled === false;
+      ack({ ok: true });
+    });
+    child.send({ type: 'set-client-media-state', socketId: socket.id, kind: 'mic', enabled: false });
+    await wait(250);
+    if (!mediaStateCommandOk) throw new Error('adminSetMediaState was not delivered');
+
     let restartOk = false;
     socket.on('restartCommand', (_payload, ack) => {
       restartOk = true;

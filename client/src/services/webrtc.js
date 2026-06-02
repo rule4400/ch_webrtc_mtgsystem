@@ -44,12 +44,14 @@ export class WebRTCManager {
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
     this._connectGeneration = 0;
+    this._sessionRebuildTimer = null;
 
     // コールバック
     this.onPeerUpdated      = null;  // (socketId, peer) => void
     this.onPeerRemoved      = null;  // (socketId) => void
     this.onRestartCommand   = null;  // () => void
     this.onAdminSetDevice   = null;  // ({ kind, deviceId }) => Promise
+    this.onAdminSetMediaState = null; // ({ kind, enabled }) => Promise
     this.onAdminRefreshDevices = null; // () => Promise
     this.onConnectionChange = null;  // (connected: bool) => void
     this.onViewerPresenceChange = null; // (active: bool) => void
@@ -185,6 +187,31 @@ export class WebRTCManager {
     this._setupRetryTimer = null;
   }
 
+  _scheduleSessionRebuild(reason = 'transport-failure') {
+    if (this._manualDisconnect || !this.socket?.connected || this._sessionRebuildTimer) return;
+    this._sessionRebuildTimer = setTimeout(async () => {
+      this._sessionRebuildTimer = null;
+      if (this._manualDisconnect || !this.socket?.connected) return;
+      console.warn(`[WebRTC] rebuilding media session reason=${reason}`);
+      this._initialized = false;
+      this._resetMediaSession({ notifyPeers: true });
+      try {
+        await this._setupSession();
+        this._setupRetryDelay = 1000;
+      } catch (err) {
+        console.error('[WebRTC] session rebuild failed', err);
+        this.onConnectionChange?.(false);
+        this._scheduleSetupRetry();
+      }
+    }, 2500);
+  }
+
+  _clearSessionRebuild() {
+    if (!this._sessionRebuildTimer) return;
+    clearTimeout(this._sessionRebuildTimer);
+    this._sessionRebuildTimer = null;
+  }
+
   _resetMediaSession({ notifyPeers = false } = {}) {
     try { this.videoProducer?.close(); } catch { /* ignore close errors */ }
     try { this.audioProducer?.close(); } catch { /* ignore close errors */ }
@@ -256,6 +283,16 @@ export class WebRTCManager {
       try {
         if (!this.onAdminSetDevice) throw new Error('device control is not ready');
         const result = await this.onAdminSetDevice(payload || {});
+        ack?.({ ok: true, ...result });
+      } catch (err) {
+        ack?.({ error: err.message });
+      }
+    });
+
+    this.socket.on('adminSetMediaState', async (payload, ack) => {
+      try {
+        if (!this.onAdminSetMediaState) throw new Error('media state control is not ready');
+        const result = await this.onAdminSetMediaState(payload || {});
         ack?.({ ok: true, ...result });
       } catch (err) {
         ack?.({ error: err.message });
@@ -369,7 +406,10 @@ export class WebRTCManager {
 
     const timer = setTimeout(() => {
       this._iceRestartTimers.delete(transport.id);
-      this._restartTransportIce(transport).catch(err => console.warn(`[${label} restartIce]`, err.message));
+      this._restartTransportIce(transport).catch(err => {
+        console.warn(`[${label} restartIce]`, err.message);
+        this._scheduleSessionRebuild(`${label}-ice-restart-failed`);
+      });
     }, 1500);
     this._iceRestartTimers.set(transport.id, timer);
   }
@@ -410,6 +450,13 @@ export class WebRTCManager {
         { rid: 'r2', maxBitrate: 1_200_000 },
       ];
       params.codecOptions = { videoGoogleStartBitrate: 1000 };
+    } else if (kind === 'audio') {
+      params.codecOptions = {
+        opusStereo: false,
+        opusDtx: true,
+        opusFec: true,
+        opusMaxPlaybackRate: 48000,
+      };
     }
     const producer = await this.sendTransport.produce(params);
     producer.on('transportclose', () => {
@@ -645,10 +692,28 @@ export class WebRTCManager {
     });
   }
 
+  isSocketConnected() {
+    return !!this.socket?.connected;
+  }
+
+  isInitialized() {
+    return !!this._initialized;
+  }
+
+  requestReconnect() {
+    if (this._manualDisconnect || !this.socket) return;
+    if (!this.socket.connected) {
+      this.socket.connect();
+      return;
+    }
+    if (!this._initialized) this._scheduleSetupRetry();
+  }
+
   disconnect() {
     this._manualDisconnect = true;
     this._initialized = false;
     this._clearSetupRetry();
+    this._clearSessionRebuild();
     this._resetMediaSession({ notifyPeers: true });
     this.socket?.disconnect();
   }

@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('api', {
   restartAll: () => ipcRenderer.send('restart-all'),
   restartClient: (socketId) => ipcRenderer.send('restart-client', socketId),
   setClientDevice: (socketId, kind, deviceId) => ipcRenderer.send('set-client-device', { socketId, kind, deviceId }),
+  setClientMediaState: (socketId, kind, enabled) => ipcRenderer.send('set-client-media-state', { socketId, kind, enabled }),
   refreshClientDevices: (socketId) => ipcRenderer.send('refresh-client-devices', socketId),
   listRegisteredClients: () => ipcRenderer.invoke('list-registered-clients'),
   saveRegisteredClient: (client) => ipcRenderer.invoke('save-registered-client', client),

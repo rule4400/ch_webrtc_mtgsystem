@@ -392,7 +392,7 @@ function migrateGeneratedEnv(envPath) {
   if (!looksGenerated) return;
 
   fs.writeFileSync(envPath, env.replace('ANNOUNCED_IP=10.0.0.10', 'ANNOUNCED_IP='));
-  safeSend('server-log', `WARN: 旧バージョンのサンプル ANNOUNCED_IP=10.0.0.10 を無効化しました。必要に応じて Settings の .env を実際のVPN内IPに変更してください: ${envPath}`);
+  safeSend('server-log', `WARN: 旧バージョンのサンプル ANNOUNCED_IP=10.0.0.10 を無効化しました。必要に応じて設定タブの .env を実際のVPN内IPに変更してください: ${envPath}`);
 }
 
 function getNodePathEnv() {
@@ -526,6 +526,15 @@ ipcMain.on('set-client-device', (_event, payload = {}) => {
   if (serverProcess) {
     safeSend('server-log', `[Admin] デバイス切替を送信: ${socketId} ${kind}`);
     sendToServer({ type: 'set-client-device', socketId, kind, deviceId });
+  }
+});
+
+ipcMain.on('set-client-media-state', (_event, payload = {}) => {
+  const { socketId, kind, enabled } = payload;
+  if (serverProcess) {
+    const stateText = enabled ? 'ON' : 'OFF';
+    safeSend('server-log', `[Admin] メディア状態変更を送信: ${socketId} ${kind}=${stateText}`);
+    sendToServer({ type: 'set-client-media-state', socketId, kind, enabled: !!enabled });
   }
 });
 
