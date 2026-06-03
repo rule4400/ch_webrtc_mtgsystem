@@ -710,9 +710,9 @@ io.on('connection', async socket => {
     }
   });
 
-  // ── Admin: クライアントキック ──
+  // ── Legacy client-originated restart request: disabled for stability/safety ──
   socket.on('forceRestart', () => {
-    emitRestartCommand(socket.broadcast, Math.max(io.sockets.sockets.size - 1, 0), `socket:${socket.id}`);
+    sendAdminLog(`[Admin] ignored client-originated forceRestart socket=${socket.id}`);
   });
 
   // ── 切断 ──

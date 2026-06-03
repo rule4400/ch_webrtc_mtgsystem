@@ -22,11 +22,13 @@ export class ViewerWebRTCManager {
     this._setupRetryDelay = 1000;
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
+    this._sessionRebuildTimer = null;
 
     this.onPeerUpdated = null;
     this.onPeerRemoved = null;
     this.onRestartCommand = null;
     this.onAdminSetDevice = null;
+    this.onAdminSetMediaState = null;
     this.onAdminRefreshDevices = null;
     this.onConnectionChange = null;
   }
@@ -141,6 +143,50 @@ export class ViewerWebRTCManager {
     this._setupRetryTimer = null;
   }
 
+  _resetMediaSession({ notifyPeers = false } = {}) {
+    this.consumers.forEach(consumer => {
+      try { consumer.close(); } catch { /* ignore close errors */ }
+    });
+    try { this.recvTransport?.close(); } catch { /* ignore close errors */ }
+
+    for (const timer of this._iceRestartTimers.values()) clearTimeout(timer);
+    this._iceRestartTimers.clear();
+    this._consumeInFlight.clear();
+    this._pendingQueue = [];
+    this.recvTransport = null;
+    this.consumers.clear();
+
+    if (notifyPeers) {
+      for (const socketId of this.peers.keys()) this.onPeerRemoved?.(socketId);
+    }
+    this.peers.clear();
+  }
+
+  _scheduleSessionRebuild(reason = 'transport-failure') {
+    if (this._manualDisconnect || !this.socket?.connected || this._sessionRebuildTimer) return;
+    this._sessionRebuildTimer = setTimeout(async () => {
+      this._sessionRebuildTimer = null;
+      if (this._manualDisconnect || !this.socket?.connected) return;
+      console.warn(`[ViewerWebRTC] rebuilding media session reason=${reason}`);
+      this._initialized = false;
+      this._resetMediaSession({ notifyPeers: true });
+      try {
+        await this._setupSession();
+        this._setupRetryDelay = 1000;
+      } catch (err) {
+        console.error('[ViewerWebRTC] session rebuild failed', err);
+        this.onConnectionChange?.(false);
+        this._scheduleSetupRetry();
+      }
+    }, 2500);
+  }
+
+  _clearSessionRebuild() {
+    if (!this._sessionRebuildTimer) return;
+    clearTimeout(this._sessionRebuildTimer);
+    this._sessionRebuildTimer = null;
+  }
+
   _bindServerEvents() {
     this.socket.on('newProducer', async ({ producerId, socketId, locationName, kind, paused }) => {
       if (!this._initialized) {
@@ -183,6 +229,16 @@ export class ViewerWebRTCManager {
       try {
         if (!this.onAdminSetDevice) throw new Error('device control is not ready');
         const result = await this.onAdminSetDevice(payload || {});
+        ack?.({ ok: true, ...result });
+      } catch (err) {
+        ack?.({ error: err.message });
+      }
+    });
+
+    this.socket.on('adminSetMediaState', async (payload, ack) => {
+      try {
+        if (!this.onAdminSetMediaState) throw new Error('media state control is not ready');
+        const result = await this.onAdminSetMediaState(payload || {});
         ack?.({ ok: true, ...result });
       } catch (err) {
         ack?.({ error: err.message });
@@ -269,7 +325,10 @@ export class ViewerWebRTCManager {
 
     const timer = setTimeout(() => {
       this._iceRestartTimers.delete(transport.id);
-      this._restartTransportIce(transport).catch(err => console.warn(`[${label} restartIce]`, err.message));
+      this._restartTransportIce(transport).catch(err => {
+        console.warn(`[${label} restartIce]`, err.message);
+        this._scheduleSessionRebuild(`${label}-ice-restart-failed`);
+      });
     }, 1500);
     this._iceRestartTimers.set(transport.id, timer);
   }
@@ -475,18 +534,29 @@ export class ViewerWebRTCManager {
     }));
   }
 
+  isSocketConnected() {
+    return !!this.socket?.connected;
+  }
+
+  isInitialized() {
+    return !!this._initialized;
+  }
+
+  requestReconnect() {
+    if (this._manualDisconnect || !this.socket) return;
+    if (!this.socket.connected) {
+      this.socket.connect();
+      return;
+    }
+    if (!this._initialized) this._scheduleSetupRetry();
+  }
+
   disconnect() {
     this._manualDisconnect = true;
     this._initialized = false;
-    this.consumers.forEach(consumer => {
-      try { consumer.close(); } catch { /* ignore close errors */ }
-    });
-    try { this.recvTransport?.close(); } catch { /* ignore close errors */ }
-    for (const timer of this._iceRestartTimers.values()) clearTimeout(timer);
-    this._iceRestartTimers.clear();
     this._clearSetupRetry();
+    this._clearSessionRebuild();
+    this._resetMediaSession({ notifyPeers: true });
     this.socket?.disconnect();
-    this.peers.clear();
-    this.consumers.clear();
   }
 }

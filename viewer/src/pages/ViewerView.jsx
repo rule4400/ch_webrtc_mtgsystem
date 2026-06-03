@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import { MicOff, MonitorPlay, Settings, Volume2, VolumeX, VideoOff } from 'lucide-react';
 import { ViewerWebRTCManager } from '../services/viewer-webrtc';
 
@@ -87,6 +86,36 @@ function loadViewerConfig() {
   }
 }
 
+function serverUrlFromViewerConfig(config) {
+  const clean = sanitizeViewerConfig(config);
+  return `http://${clean.serverIp}:${clean.serverPort || 3000}`;
+}
+
+async function probeServerReady(config, timeoutMs = 800) {
+  const baseUrl = serverUrlFromViewerConfig(config);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const ready = await fetch(`${baseUrl}/ready`, { signal: controller.signal, cache: 'no-store' });
+    if (ready.ok) return true;
+  } catch {
+    // /ready がない古いサーバーもあるため /health を見る。
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const fallbackController = new AbortController();
+  const fallbackTimer = setTimeout(() => fallbackController.abort(), timeoutMs);
+  try {
+    const health = await fetch(`${baseUrl}/health`, { signal: fallbackController.signal, cache: 'no-store' });
+    return health.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(fallbackTimer);
+  }
+}
+
 const VideoCell = React.memo(function VideoCell({
   label, stream, videoPaused, audioPaused, speakerDeviceId, speakerMuted,
 }) {
@@ -170,7 +199,6 @@ const VideoCell = React.memo(function VideoCell({
 });
 
 export default function ViewerView() {
-  const navigate = useNavigate();
   const [peers, setPeers] = useState(new Map());
   const [status, setStatus] = useState('connecting');
   const [error, setError] = useState(null);
@@ -178,6 +206,8 @@ export default function ViewerView() {
   const [audioOutDevices, setAudioOutDevices] = useState([]);
   const [selectedAudioOutId, setSelectedAudioOutId] = useState('');
   const [uiResetToken, setUiResetToken] = useState(0);
+  const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem('sfu_viewer_config'));
+  const [settingsDraft, setSettingsDraft] = useState(() => sanitizeViewerConfig(loadViewerConfig()));
 
   const managerRef = useRef(null);
   const configRef = useRef({});
@@ -186,6 +216,7 @@ export default function ViewerView() {
   const adminHandlersRef = useRef({});
   const quickRestartInFlightRef = useRef(false);
   const quickRestartHandlerRef = useRef(null);
+  const serverProbeInFlightRef = useRef(false);
 
   const refreshAudioOutputs = useCallback(async (preferredId = null) => {
     try {
@@ -226,6 +257,7 @@ export default function ViewerView() {
       manager.onConnectionChange = null;
       manager.onRestartCommand = null;
       manager.onAdminSetDevice = null;
+      manager.onAdminSetMediaState = null;
       manager.onAdminRefreshDevices = null;
       manager.disconnect();
     }
@@ -266,12 +298,16 @@ export default function ViewerView() {
       if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
       return adminHandlersRef.current.setDevice(payload);
     };
+    manager.onAdminSetMediaState = (payload) => {
+      if (!adminHandlersRef.current.setMediaState) throw new Error('media state control is not ready');
+      return adminHandlersRef.current.setMediaState(payload);
+    };
     manager.onAdminRefreshDevices = () => {
       if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
       return adminHandlersRef.current.refreshDevices();
     };
 
-    const serverUrl = `http://${config.serverIp}:${config.serverPort || 3000}`;
+    const serverUrl = serverUrlFromViewerConfig(config);
     const connectionState = await connectWithinStartupWindow(manager, serverUrl, config.viewerName);
     setStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     setError(null);
@@ -350,6 +386,37 @@ export default function ViewerView() {
     return () => clearInterval(id);
   }, []);
 
+  useEffect(() => {
+    const id = setInterval(async () => {
+      if (quickRestartInFlightRef.current || serverProbeInFlightRef.current) return;
+      const manager = managerRef.current;
+      if (manager?.isSocketConnected() && manager?.isInitialized()) return;
+
+      serverProbeInFlightRef.current = true;
+      try {
+        const config = sanitizeViewerConfig(configRef.current.serverIp ? configRef.current : loadViewerConfig());
+        const reachable = await probeServerReady(config);
+        if (!reachable) {
+          setStatus(prev => (prev === 'restarting' ? prev : 'error'));
+          return;
+        }
+
+        setStatus(prev => (prev === 'connected' ? prev : 'connecting'));
+        if (manager) {
+          manager.requestReconnect();
+        } else {
+          await startViewerSession();
+        }
+      } catch (err) {
+        console.warn('[ViewerServerProbe]', err.message);
+      } finally {
+        serverProbeInFlightRef.current = false;
+      }
+    }, 1000);
+
+    return () => clearInterval(id);
+  }, [startViewerSession]);
+
   const changeSpeaker = useCallback((deviceId) => {
     selectedAudioOutIdRef.current = deviceId;
     setSelectedAudioOutId(deviceId);
@@ -358,12 +425,50 @@ export default function ViewerView() {
     localStorage.setItem('sfu_viewer_config', JSON.stringify(config));
   }, []);
 
+  const openSettings = useCallback(() => {
+    const config = sanitizeViewerConfig(configRef.current.serverIp ? configRef.current : loadViewerConfig());
+    setSettingsDraft(config);
+    setSettingsOpen(true);
+  }, []);
+
+  const updateSettingsDraft = useCallback((key, value) => {
+    setSettingsDraft(prev => ({ ...prev, [key]: value }));
+  }, []);
+
+  const saveViewerSettings = useCallback(() => {
+    const previous = sanitizeViewerConfig(configRef.current.serverIp ? configRef.current : loadViewerConfig());
+    const next = sanitizeViewerConfig(settingsDraft);
+    const merged = {
+      ...previous,
+      ...next,
+      selectedAudioOutId: selectedAudioOutIdRef.current || previous.selectedAudioOutId || '',
+    };
+    const requiresReconnect =
+      previous.serverIp !== merged.serverIp ||
+      previous.serverPort !== merged.serverPort ||
+      previous.viewerName !== merged.viewerName;
+
+    configRef.current = merged;
+    localStorage.setItem('sfu_viewer_config', JSON.stringify(merged));
+    setSettingsDraft(merged);
+    setSettingsOpen(false);
+
+    if (requiresReconnect) {
+      quickRestartHandlerRef.current?.({ reason: 'viewer-settings-saved' });
+    }
+  }, [settingsDraft]);
+
   useEffect(() => {
     adminHandlersRef.current = {
       setDevice: async ({ kind, deviceId }) => {
         if (kind !== 'audioOutput') throw new Error(`unsupported device kind: ${kind}`);
         changeSpeaker(deviceId);
         return { selectedDevices: { audioOutput: deviceId } };
+      },
+      setMediaState: async ({ kind, enabled }) => {
+        if (kind !== 'speaker') throw new Error(`unsupported media kind: ${kind}`);
+        setSpeakerMuted(!enabled);
+        return { localMedia: { speakerMuted: !enabled } };
       },
       refreshDevices: async () => {
         const outputs = await refreshAudioOutputs();
@@ -483,7 +588,7 @@ export default function ViewerView() {
           <button
             className="ctrl-btn"
             style={{ width: 32, height: 32 }}
-            onClick={() => navigate('/settings')}
+            onClick={openSettings}
             title="設定"
           >
             <Settings size={15} />
@@ -493,6 +598,61 @@ export default function ViewerView() {
 
       {error && (
         <div className="cam-error-bar">接続エラー: {error}</div>
+      )}
+
+      {settingsOpen && (
+        <div className="settings-overlay" role="dialog" aria-modal="true">
+          <div className="settings-panel">
+            <div className="settings-panel-head">
+              <div>
+                <h2>閲覧端末設定</h2>
+                <p>設定を開いている間も受信は継続します</p>
+              </div>
+              <button className="mini-btn" onClick={() => setSettingsOpen(false)}>閉じる</button>
+            </div>
+
+            <div className="settings-section">
+              <h2>表示設定</h2>
+              <div className="field">
+                <label>閲覧端末名</label>
+                <input
+                  type="text"
+                  value={settingsDraft.viewerName}
+                  onChange={event => updateSettingsDraft('viewerName', event.target.value)}
+                  placeholder="例: 管理室モニター"
+                />
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <h2>SFUサーバー</h2>
+              <div className="server-row">
+                <div className="field">
+                  <label>IPアドレス</label>
+                  <input
+                    type="text"
+                    value={settingsDraft.serverIp}
+                    onChange={event => updateSettingsDraft('serverIp', event.target.value)}
+                    placeholder="例: 192.168.1.223"
+                  />
+                </div>
+                <div className="field">
+                  <label>ポート</label>
+                  <input
+                    type="text"
+                    value={settingsDraft.serverPort}
+                    onChange={event => updateSettingsDraft('serverPort', event.target.value)}
+                    placeholder="3000"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <button className="btn-join" onClick={saveViewerSettings}>
+              保存
+            </button>
+          </div>
+        </div>
       )}
 
       <div

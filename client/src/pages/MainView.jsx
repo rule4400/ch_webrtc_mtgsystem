@@ -491,7 +491,7 @@ export default function MainView() {
   const [viewerPresenceActive, setViewerPresenceActive] = useState(false);
   const [localSpeaking, setLocalSpeaking] = useState(false);
   const [uiResetToken, setUiResetToken] = useState(0);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem('sfu_config'));
   const [settingsDraft, setSettingsDraft] = useState(() => sanitizeClientConfig(loadClientConfig()));
 
   // refs（クリーンアップ・デバイス変更用）
@@ -829,6 +829,34 @@ export default function MainView() {
       softRestartHandlerRef.current?.(payload);
     });
     return () => unsubscribe?.();
+  }, []);
+
+  useEffect(() => {
+    const handleRemoteConfig = (event) => {
+      try {
+        const previous = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+        const next = sanitizeClientConfig({ ...previous, ...(event.detail || {}) });
+        const requiresReconnect =
+          previous.serverIp !== next.serverIp ||
+          previous.serverPort !== next.serverPort ||
+          previous.locationName !== next.locationName;
+
+        configRef.current = next;
+        localStorage.setItem('sfu_config', JSON.stringify(next));
+        setSelfName(next.locationName || '自拠点');
+        setSettingsDraft(next);
+        setSettingsOpen(false);
+
+        if (requiresReconnect) {
+          softRestartHandlerRef.current?.({ reason: 'remote-config-applied' });
+        }
+      } catch (err) {
+        console.warn('[RemoteConfig]', err.message);
+      }
+    };
+
+    window.addEventListener('sfu-remote-config-applied', handleRemoteConfig);
+    return () => window.removeEventListener('sfu-remote-config-applied', handleRemoteConfig);
   }, []);
 
   // ─── 初期化 ──────────────────────────────────────────────

@@ -127,7 +127,7 @@ function sanitizeClientConfig(input = {}) {
   };
 }
 
-async function applyClientConfig(config, { reload = true } = {}) {
+async function applyClientConfig(config, { reload = false } = {}) {
   const clean = sanitizeClientConfig(config);
   saveRemoteConfig(clean);
   pendingRemoteConfig = clean;
@@ -136,11 +136,18 @@ async function applyClientConfig(config, { reload = true } = {}) {
 
   const script = `
     (() => {
-      const config = ${JSON.stringify(clean)};
+      const incoming = ${JSON.stringify(clean)};
+      let current = {};
+      try {
+        current = JSON.parse(localStorage.getItem('sfu_config') || '{}') || {};
+      } catch {
+        current = {};
+      }
+      const config = { ...current, ...incoming };
       localStorage.setItem('sfu_config', JSON.stringify(config));
+      location.hash = '#/main';
       window.dispatchEvent(new CustomEvent('sfu-remote-config-applied', { detail: config }));
       if (${reload ? 'true' : 'false'}) {
-        location.hash = '#/main';
         location.reload();
       }
       return true;
@@ -234,7 +241,7 @@ function startControlServer() {
 
       if (req.method === 'POST' && url.pathname === '/configure') {
         const body = await readJsonBody(req);
-        const config = await applyClientConfig(body, { reload: body.reload !== false });
+        const config = await applyClientConfig(body, { reload: body.reload === true });
         return sendJson(res, 200, { ok: true, config });
       }
 
