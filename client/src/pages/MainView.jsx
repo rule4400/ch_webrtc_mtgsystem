@@ -11,9 +11,23 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import {
   Mic, MicOff, Video, VideoOff,
-  Volume2, VolumeX, Settings, ChevronDown, X,
+  Volume2, VolumeX, Settings, ChevronDown, X, Download,
+  Plus, Pencil, PanelLeftClose, PanelLeftOpen, Maximize2, Minimize2,
+  Volume1, Bell, BellRing, Trash2, Check, MonitorUp, Pause, Play, SwitchCamera, Square,
 } from 'lucide-react';
 import { WebRTCManager } from '../services/webrtc';
+import ScreenShareModal from '../components/ScreenShareModal';
+
+const APP_VERSION = '0.2.0';
+const APP_TYPE = 'client';
+const CALL_RING_TIMEOUT_MS = 30000;
+const CALL_RING_INTERVAL_MS = 1500;
+const DEFAULT_SYSTEM_STATE = {
+  brand: 'CHECKHOUSE Meeting System',
+  channels: [{ id: 'general', name: '一般' }],
+  latestVersions: { [APP_TYPE]: APP_VERSION },
+  updatePackages: {},
+};
 
 // ─── デバイス選択ドロップダウンボタン ────────────────────
 
@@ -65,9 +79,43 @@ function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, on
 // ─── ビデオセル ───────────────────────────────────────────
 
 const VideoCell = React.memo(function VideoCell({
-  label, stream, isSelf, videoPaused, audioPaused, speakerDeviceId, speakerMuted, volume = 1,
+  label,
+  stream,
+  isSelf,
+  isScreen = false,
+  videoPaused,
+  audioPaused,
+  speakerDeviceId,
+  speakerMuted,
+  volume = 1,
+  tileId = '',
+  focused = false,
+  compact = false,
+  dimmed = false,
+  canFocus = true,
+  canControlVolume = false,
+  volumeValue = 1,
+  onFocus,
+  onVolumeChange,
+  onCall = null,
 }) {
   const videoRef = useRef(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (event) => {
+      if (menuRef.current?.contains(event.target)) return;
+      setMenuOpen(false);
+    };
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', close);
+    return () => {
+      document.removeEventListener('mousedown', close);
+      document.removeEventListener('keydown', close);
+    };
+  }, [menuOpen]);
 
   // stream が変わったら srcObject を更新して再生
   // 重要: muted は React 属性だと DOM プロパティに反映されない既知問題があり、
@@ -76,8 +124,8 @@ const VideoCell = React.memo(function VideoCell({
     const video = videoRef.current;
     if (!video) return;
     // 自拠点プレビューは常にミュート（ハウリング防止）。他拠点は speakerMuted に従う。
-    video.muted = isSelf ? true : !!speakerMuted;
-    video.volume = isSelf || speakerMuted ? 0 : volume;
+    video.muted = isSelf ? true : !!(speakerMuted || audioPaused);
+    video.volume = isSelf || speakerMuted || audioPaused ? 0 : clampNumber(volume, 0, 1);
     if (video.srcObject !== stream) {
       video.srcObject = stream || null;
     }
@@ -100,7 +148,7 @@ const VideoCell = React.memo(function VideoCell({
       }
     };
     tryPlay();
-  }, [stream, isSelf, speakerMuted, volume]);
+  }, [stream, isSelf, speakerMuted, audioPaused, volume]);
 
   // スピーカーデバイス変更
   useEffect(() => {
@@ -115,8 +163,14 @@ const VideoCell = React.memo(function VideoCell({
 
   return (
     <div
-      className="video-cell"
+      className={`video-cell ${focused ? 'focused' : ''} ${compact ? 'compact' : ''} ${dimmed ? 'dimmed' : ''}`}
       style={{ outline: isSelf ? '2px solid #4ade80' : '2px solid rgba(255,255,255,0.08)' }}
+      onDoubleClick={() => canFocus && onFocus?.(tileId)}
+      onContextMenu={(event) => {
+        if (!canControlVolume) return;
+        event.preventDefault();
+        setMenuOpen(true);
+      }}
     >
       {/* 常に video 要素を置く（display で可視性を制御） */}
       <video
@@ -127,7 +181,8 @@ const VideoCell = React.memo(function VideoCell({
         style={{
           width: '100%', height: '100%',
           objectFit: 'contain',
-          transform: isSelf ? 'scaleX(-1)' : 'none',
+          // 画面共有は左右反転しない（自拠点カメラのみミラー表示）
+          transform: isSelf && !isScreen ? 'scaleX(-1)' : 'none',
           background: '#000',
           display: cameraOff ? 'none' : 'block',
         }}
@@ -151,10 +206,90 @@ const VideoCell = React.memo(function VideoCell({
         {isSelf && <span style={{ opacity: 0.5, marginLeft: 3, flexShrink: 0 }}>（自拠点）</span>}
       </div>
 
+      {/* ── ホバー操作バー ──
+          普段は映像を邪魔せず、マウスオーバー時のみ半透明バーを表示する。
+          フォーカス・個別ミュート・個別音量・呼び出しをここから操作できる。 */}
+      <div className="tile-actions" onDoubleClick={event => event.stopPropagation()}>
+        {canFocus && (
+          <button
+            type="button"
+            className={`tile-btn ${focused ? 'active' : ''}`}
+            onClick={() => onFocus?.(tileId)}
+            title={focused ? 'フォーカス解除' : '大きく表示'}
+            aria-label={focused ? 'フォーカス解除' : '大きく表示'}
+          >
+            {focused ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+          </button>
+        )}
+
+        {canControlVolume && (
+          <button
+            type="button"
+            className={`tile-btn ${volumeValue <= 0 ? 'danger-active' : ''}`}
+            onClick={() => onVolumeChange?.(tileId, volumeValue > 0 ? 0 : 1)}
+            title={volumeValue > 0 ? 'この拠点をスピーカーミュート' : 'スピーカーミュート解除'}
+          >
+            {volumeValue > 0 ? <Volume2 size={15} /> : <VolumeX size={15} />}
+          </button>
+        )}
+
+        {canControlVolume && (
+          <button
+            type="button"
+            className={`tile-btn ${menuOpen ? 'active' : ''}`}
+            onClick={(event) => { event.stopPropagation(); setMenuOpen(open => !open); }}
+            onMouseDown={(event) => event.stopPropagation()}
+            title="個別音量調整"
+          >
+            <span className="tile-vol-text">{Math.round(volumeValue * 100)}%</span>
+          </button>
+        )}
+
+        {onCall && (
+          <button
+            type="button"
+            className="tile-btn call"
+            onClick={onCall}
+            title="この拠点を呼び出す"
+          >
+            <BellRing size={15} />
+          </button>
+        )}
+      </div>
+
+      {/* 個別ミュート中バッジ */}
+      {canControlVolume && volumeValue <= 0 && (
+        <div className="tile-muted-badge" title="この拠点の音声をミュート中">
+          <VolumeX size={12} color="white" />
+        </div>
+      )}
+
       {/* マイクOFF バッジ */}
       {audioPaused && (
         <div className="mute-badge">
           <MicOff size={12} color="white" />
+        </div>
+      )}
+
+      {menuOpen && canControlVolume && (
+        <div className="tile-volume-menu" ref={menuRef}>
+          <div className="tile-volume-head">
+            <Volume1 size={15} />
+            <span>個別音量</span>
+            <strong>{Math.round(volumeValue * 100)}%</strong>
+          </div>
+          <input
+            type="range"
+            min="0"
+            max="1.5"
+            step="0.05"
+            value={volumeValue}
+            onChange={event => onVolumeChange?.(tileId, Number(event.target.value))}
+          />
+          <div className="tile-volume-actions">
+            <button type="button" onClick={() => onVolumeChange?.(tileId, 0)}>ミュート</button>
+            <button type="button" onClick={() => onVolumeChange?.(tileId, 1)}>標準</button>
+          </div>
         </div>
       )}
     </div>
@@ -377,12 +512,13 @@ const defaultClientConfig = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
   locationName: '自拠点',
+  channelId: 'general',
 };
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
 
-async function connectWithinStartupWindow(manager, serverUrl, locationName) {
+async function connectWithinStartupWindow(manager, serverUrl, locationName, options = {}) {
   let timedOut = false;
-  const connectPromise = manager.connect(serverUrl, locationName)
+  const connectPromise = manager.connect(serverUrl, locationName, options)
     .then(() => 'connected')
     .catch((err) => {
       if (timedOut) {
@@ -408,12 +544,14 @@ function sanitizeClientConfig(config) {
     ? rawPort
     : defaultClientConfig.serverPort;
   const locationName = String(raw.locationName || defaultClientConfig.locationName).trim() || defaultClientConfig.locationName;
+  const channelId = String(raw.channelId || defaultClientConfig.channelId).trim() || defaultClientConfig.channelId;
 
   return {
     ...raw,
     serverIp,
     serverPort,
     locationName,
+    channelId,
   };
 }
 
@@ -433,6 +571,28 @@ function loadClientConfig() {
 function serverUrlFromConfig(config) {
   const conf = sanitizeClientConfig(config);
   return `http://${conf.serverIp}:${conf.serverPort || 3000}`;
+}
+
+function clampNumber(value, min, max) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return min;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function loadSidebarWidth() {
+  try {
+    const saved = localStorage.getItem('client_sidebar_width');
+    return saved == null ? 236 : clampNumber(saved, 196, 360);
+  } catch {
+    return 236;
+  }
+}
+
+function memberInitials(name) {
+  const text = String(name || '').trim();
+  if (!text) return '拠';
+  const compact = text.replace(/\s+/g, '');
+  return compact.slice(0, 2).toUpperCase();
 }
 
 async function probeServerReady(config, timeoutMs = 800) {
@@ -493,6 +653,22 @@ export default function MainView() {
   const [uiResetToken, setUiResetToken] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem('sfu_config'));
   const [settingsDraft, setSettingsDraft] = useState(() => sanitizeClientConfig(loadClientConfig()));
+  const [systemState, setSystemState] = useState(DEFAULT_SYSTEM_STATE);
+  const [channelId, setChannelId] = useState(() => sanitizeClientConfig(loadClientConfig()).channelId);
+  const [updateNotice, setUpdateNotice] = useState(null);
+  const [focusedTileId, setFocusedTileId] = useState('');
+  const [peerVolumes, setPeerVolumes] = useState({});
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
+  const [channelEditorOpen, setChannelEditorOpen] = useState(false);
+  const [newChannelName, setNewChannelName] = useState('');
+  const [channelDrafts, setChannelDrafts] = useState({});
+  const [memberMenu, setMemberMenu] = useState(null);
+  const [incomingCall, setIncomingCall] = useState(null);
+  const [outgoingCall, setOutgoingCall] = useState(null);   // { callId, targetSocketId, targetName }
+  const [callNotice, setCallNotice] = useState(null);       // 呼び出し結果の一時表示
+  const [screenShare, setScreenShare] = useState(null);     // { sourceId, sourceName, hasAudio, audioEnabled, paused, stream }
+  const [shareModalMode, setShareModalMode] = useState(null); // null | 'start' | 'change'
 
   // refs（クリーンアップ・デバイス変更用）
   const webrtcRef = useRef(null);
@@ -505,19 +681,245 @@ export default function MainView() {
   const softRestartInFlightRef = useRef(false);
   const softRestartHandlerRef = useRef(null);
   const serverProbeInFlightRef = useRef(false);
+  const speakerMutedRef = useRef(false);
+  const joinAudioRef = useRef(null);
+  const callAudioRef = useRef(null);
+  const incomingCallTimerRef = useRef(null);
+  const incomingCallRingIntervalRef = useRef(null);
+  const activeIncomingCallIdRef = useRef('');
+  const outgoingCallRef = useRef(null);
+  const outgoingCallTimerRef = useRef(null);
+  const callNoticeTimerRef = useRef(null);
+  const screenShareRef = useRef(null);
+
+  useEffect(() => { outgoingCallRef.current = outgoingCall; }, [outgoingCall]);
+  useEffect(() => { screenShareRef.current = screenShare; }, [screenShare]);
+
+  const channels = useMemo(() => {
+    const items = Array.isArray(systemState.channels) && systemState.channels.length
+      ? systemState.channels
+      : DEFAULT_SYSTEM_STATE.channels;
+    return items;
+  }, [systemState]);
+
+  const activeChannel = useMemo(() => (
+    channels.find(channel => channel.id === channelId) || channels[0] || DEFAULT_SYSTEM_STATE.channels[0]
+  ), [channels, channelId]);
+  const activeChannelId = activeChannel?.id || channelId || 'general';
+
+  const updatePackage = systemState.updatePackages?.[APP_TYPE] || null;
+  const latestVersion = systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
+  const updateAvailable = latestVersion && latestVersion !== APP_VERSION;
+  const peerEntries = useMemo(() => Array.from(peers.entries()), [peers]);
 
   const audiblePeerCount = useMemo(() => (
-    Array.from(peers.values()).filter((peer) => {
+    peerEntries.filter(([, peer]) => {
       const audio = peer.stream?.getAudioTracks()[0] || null;
-      return !!audio && audio.readyState === 'live' && !peer.audioPaused;
+      const sameChannel = (peer.channelId || 'general') === activeChannelId;
+      return !!audio && audio.readyState === 'live' && !peer.audioPaused && sameChannel;
     }).length
-  ), [peers]);
+  ), [peerEntries, activeChannelId]);
 
   const remoteAudioVolume = useMemo(() => calculateRemoteAudioVolume({
     audiblePeerCount,
     localSpeaking,
     speakerMuted,
   }), [audiblePeerCount, localSpeaking, speakerMuted]);
+
+  useEffect(() => {
+    speakerMutedRef.current = speakerMuted;
+  }, [speakerMuted]);
+
+  const channelMembers = useMemo(() => {
+    const knownChannels = new Set(channels.map(channel => channel.id));
+    const fallbackId = activeChannelId || channels[0]?.id || 'general';
+    const membersByChannel = new Map(channels.map(channel => [channel.id, []]));
+    const addMember = (member) => {
+      const targetId = knownChannels.has(member.channelId) ? member.channelId : fallbackId;
+      if (!membersByChannel.has(targetId)) membersByChannel.set(targetId, []);
+      membersByChannel.get(targetId).push(member);
+    };
+
+    addMember({
+      id: 'self',
+      socketId: '',
+      name: selfName,
+      channelId: activeChannelId,
+      isSelf: true,
+      muted: !micEnabled,
+    });
+
+    for (const [socketId, peer] of peerEntries) {
+      if (peer.appType === 'screen-share') continue;
+      addMember({
+        id: socketId,
+        socketId,
+        name: peer.locationName || '不明',
+        channelId: peer.channelId || fallbackId,
+        isSelf: false,
+        muted: !!peer.audioPaused,
+      });
+    }
+
+    for (const members of membersByChannel.values()) {
+      members.sort((a, b) => Number(b.isSelf) - Number(a.isSelf) || a.name.localeCompare(b.name, 'ja'));
+    }
+    return membersByChannel;
+  }, [activeChannelId, channels, micEnabled, peerEntries, selfName]);
+
+  const playJoinTone = useCallback(() => {
+    if (speakerMutedRef.current) return;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+
+    try {
+      const context = joinAudioRef.current && joinAudioRef.current.state !== 'closed'
+        ? joinAudioRef.current
+        : new AudioContextClass();
+      joinAudioRef.current = context;
+      context.resume?.().catch(() => {});
+
+      const now = context.currentTime;
+      const gain = context.createGain();
+      const oscillator = context.createOscillator();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(660, now);
+      oscillator.frequency.exponentialRampToValueAtTime(880, now + 0.12);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.11, now + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
+      oscillator.connect(gain);
+      gain.connect(context.destination);
+      oscillator.start(now);
+      oscillator.stop(now + 0.28);
+    } catch (err) {
+      console.warn('[joinTone]', err.message);
+    }
+  }, []);
+
+  const playCallTone = useCallback(() => {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return;
+
+    try {
+      const context = callAudioRef.current && callAudioRef.current.state !== 'closed'
+        ? callAudioRef.current
+        : new AudioContextClass();
+      callAudioRef.current = context;
+      context.resume?.().catch(() => {});
+
+      const now = context.currentTime;
+      const master = context.createGain();
+      master.gain.setValueAtTime(0.32, now);
+      master.connect(context.destination);
+
+      for (let index = 0; index < 6; index += 1) {
+        const start = now + index * 0.22;
+        const gain = context.createGain();
+        const oscillator = context.createOscillator();
+        oscillator.type = 'square';
+        oscillator.frequency.setValueAtTime(index % 2 === 0 ? 1040 : 780, start);
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(0.85, start + 0.018);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.17);
+        oscillator.connect(gain);
+        gain.connect(master);
+        oscillator.start(start);
+        oscillator.stop(start + 0.19);
+      }
+    } catch (err) {
+      console.warn('[callTone]', err.message);
+    }
+  }, []);
+
+  // ── 呼び出し結果の一時通知（画面下部に数秒表示）──
+  const showCallNotice = useCallback((text, tone = 'info') => {
+    if (callNoticeTimerRef.current) clearTimeout(callNoticeTimerRef.current);
+    setCallNotice({ text, tone });
+    callNoticeTimerRef.current = setTimeout(() => setCallNotice(null), 4500);
+  }, []);
+
+  // ── 発信中状態の終了（応答/拒否/タイムアウト/キャンセル/切断）──
+  const stopOutgoingCall = useCallback((expectedCallId = '') => {
+    const current = outgoingCallRef.current;
+    if (expectedCallId && current && current.callId !== expectedCallId) return;
+    if (outgoingCallTimerRef.current) {
+      clearTimeout(outgoingCallTimerRef.current);
+      outgoingCallTimerRef.current = null;
+    }
+    outgoingCallRef.current = null;
+    setOutgoingCall(null);
+  }, []);
+
+  const stopIncomingCall = useCallback((expectedCallId = '') => {
+    if (expectedCallId && activeIncomingCallIdRef.current && activeIncomingCallIdRef.current !== expectedCallId) return;
+    if (incomingCallTimerRef.current) {
+      clearTimeout(incomingCallTimerRef.current);
+      incomingCallTimerRef.current = null;
+    }
+    if (incomingCallRingIntervalRef.current) {
+      clearInterval(incomingCallRingIntervalRef.current);
+      incomingCallRingIntervalRef.current = null;
+    }
+    activeIncomingCallIdRef.current = '';
+    setIncomingCall(null);
+  }, []);
+
+  const showIncomingCall = useCallback((payload = {}) => {
+    const callerName = payload.fromName || '別拠点';
+    const callId = payload.callId || `call-${Date.now()}`;
+    const expiresAt = Date.now() + CALL_RING_TIMEOUT_MS;
+    // 既に別の着信が鳴動中なら、前の発信元へ「応答なし」を返してから置き換える
+    const previousCallId = activeIncomingCallIdRef.current;
+    if (previousCallId && previousCallId !== callId) {
+      webrtcRef.current?.ackCall(previousCallId, 'dismissed').catch(() => {});
+    }
+    stopIncomingCall();
+    setIncomingCall({
+      callId,
+      callerName,
+      fromSocketId: payload.fromSocketId || '',
+      fromChannelId: payload.fromChannelId || '',
+      fromChannelName: payload.fromChannelName || '',
+      receivedAt: Date.now(),
+      expiresAt,
+    });
+    activeIncomingCallIdRef.current = callId;
+    playCallTone();
+    incomingCallRingIntervalRef.current = setInterval(() => {
+      if (Date.now() >= expiresAt) {
+        stopIncomingCall(callId);
+        return;
+      }
+      playCallTone();
+    }, CALL_RING_INTERVAL_MS);
+    incomingCallTimerRef.current = setTimeout(() => {
+      stopIncomingCall(callId);
+    }, CALL_RING_TIMEOUT_MS);
+  }, [playCallTone, stopIncomingCall]);
+
+  useEffect(() => () => {
+    if (incomingCallTimerRef.current) clearTimeout(incomingCallTimerRef.current);
+    if (incomingCallRingIntervalRef.current) clearInterval(incomingCallRingIntervalRef.current);
+    if (outgoingCallTimerRef.current) clearTimeout(outgoingCallTimerRef.current);
+    if (callNoticeTimerRef.current) clearTimeout(callNoticeTimerRef.current);
+    try { joinAudioRef.current?.close?.(); } catch { /* ignore */ }
+    try { callAudioRef.current?.close?.(); } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    if (!memberMenu) return undefined;
+    const close = () => setMemberMenu(null);
+    const onKey = (event) => {
+      if (event.key === 'Escape') close();
+    };
+    window.addEventListener('click', close);
+    window.addEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [memberMenu]);
 
   const stopLocalAudioMonitor = useCallback(() => {
     const monitor = audioMonitorRef.current;
@@ -621,6 +1023,9 @@ export default function MainView() {
       localSpeaking,
       audiblePeerCount,
       remoteAudioVolume,
+      channelId,
+      systemState,
+      updateNotice,
     };
   }, [
     videoDevices,
@@ -639,6 +1044,9 @@ export default function MainView() {
     localSpeaking,
     audiblePeerCount,
     remoteAudioVolume,
+    channelId,
+    systemState,
+    updateNotice,
   ]);
 
   // ─── デバイス一覧を取得 ──────────────────────────────────
@@ -712,16 +1120,39 @@ export default function MainView() {
       manager.onAdminSetDevice = null;
       manager.onAdminSetMediaState = null;
       manager.onAdminRefreshDevices = null;
+      manager.onSystemStateUpdated = null;
+      manager.onPeerChannelChanged = null;
+      manager.onUpdateCommand = null;
+      manager.onPeerJoined = null;
+      manager.onIncomingCall = null;
+      manager.onCallResult = null;
+      manager.onCallCancelled = null;
+      manager.onScreenShareEnded = null;
       manager.disconnect();
     }
 
     stopLocalAudioMonitor();
     streamRef.current?.getTracks().forEach(track => track.stop());
     streamRef.current = null;
+
+    // セッション再構築時は画面共有・呼び出し状態もリセット（manager側のトラックは disconnect で閉じる）
+    const share = screenShareRef.current;
+    if (share) {
+      share.stream?.getTracks().forEach(track => track.stop());
+      screenShareRef.current = null;
+    }
+    if (outgoingCallTimerRef.current) {
+      clearTimeout(outgoingCallTimerRef.current);
+      outgoingCallTimerRef.current = null;
+    }
+    outgoingCallRef.current = null;
+
     if (updateState) {
       setLocalStream(null);
       setPeers(new Map());
       setViewerPresenceActive(false);
+      setScreenShare(null);
+      setOutgoingCall(null);
       setSfuStatus(status);
     }
   }, [stopLocalAudioMonitor]);
@@ -731,6 +1162,7 @@ export default function MainView() {
     configRef.current = conf;
     setSettingsDraft(conf);
     setSelfName(conf.locationName || '自拠点');
+    setChannelId(conf.channelId || 'general');
 
     const devs = await refreshDevices();
     const videoId = conf.selectedVideoId   || devs.video[0]?.deviceId    || '';
@@ -758,6 +1190,64 @@ export default function MainView() {
       if (!ok) setViewerPresenceActive(false);
     };
     rtcManager.onViewerPresenceChange = setViewerPresenceActive;
+    rtcManager.onSystemStateUpdated = (state = {}) => {
+      setSystemState({ ...DEFAULT_SYSTEM_STATE, ...state });
+      const remoteChannels = Array.isArray(state.channels) && state.channels.length ? state.channels : DEFAULT_SYSTEM_STATE.channels;
+      const current = configRef.current.channelId || conf.channelId || 'general';
+      const selfChannelId = state.self?.channelId || '';
+      if (selfChannelId && remoteChannels.some(channel => channel.id === selfChannelId) && selfChannelId !== current) {
+        const nextConfig = { ...sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig()), channelId: selfChannelId };
+        configRef.current = nextConfig;
+        localStorage.setItem('sfu_config', JSON.stringify(nextConfig));
+        setSettingsDraft(nextConfig);
+        setChannelId(selfChannelId);
+      } else if (!remoteChannels.some(channel => channel.id === current)) {
+        const fallback = remoteChannels[0]?.id || 'general';
+        configRef.current = { ...configRef.current, channelId: fallback };
+        localStorage.setItem('sfu_config', JSON.stringify(configRef.current));
+        setSettingsDraft(configRef.current);
+        setChannelId(fallback);
+      }
+    };
+    rtcManager.onUpdateCommand = (payload) => {
+      if (payload?.appType && payload.appType !== APP_TYPE && payload.appType !== 'all') return;
+      setUpdateNotice(payload);
+    };
+    rtcManager.onPeerJoined = (payload = {}) => {
+      if (!payload.socketId || payload.socketId === rtcManager.socket?.id) return;
+      if (payload.appType === 'viewer') return;
+      playJoinTone();
+    };
+    rtcManager.onIncomingCall = showIncomingCall;
+
+    // 発信した呼び出しの結果（応答/拒否/タイムアウト/切断）→ 鳴動表示を止めて結果を通知
+    rtcManager.onCallResult = (payload = {}) => {
+      const current = outgoingCallRef.current;
+      if (!current || current.callId !== payload.callId) return;
+      const name = current.targetName || '相手拠点';
+      stopOutgoingCall(payload.callId);
+      if (payload.action === 'answered') showCallNotice(`${name} が応答しました`);
+      else if (payload.action === 'dismissed') showCallNotice(`${name} は応答できませんでした`, 'warn');
+      else if (payload.action === 'timeout') showCallNotice(`${name} の応答がありませんでした`, 'warn');
+      else if (payload.action === 'disconnected') showCallNotice(`${name} が切断されました`, 'warn');
+    };
+
+    // 発信側がキャンセルした → 着信側の鳴動を止める
+    rtcManager.onCallCancelled = (payload = {}) => {
+      stopIncomingCall(payload.callId || '');
+    };
+
+    // 共有元ウィンドウが閉じられた等でトラックが終了した → UIを共有停止状態へ
+    rtcManager.onScreenShareEnded = () => {
+      const share = screenShareRef.current;
+      if (share) {
+        share.stream?.getTracks().forEach(track => track.stop());
+        screenShareRef.current = null;
+      }
+      setScreenShare(null);
+      setShareModalMode(null);
+    };
+
     rtcManager.onRestartCommand = (payload) => softRestartHandlerRef.current?.(payload);
     rtcManager.onAdminSetDevice = (payload) => {
       if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
@@ -781,10 +1271,13 @@ export default function MainView() {
     );
 
     const serverUrl = serverUrlFromConfig(conf);
-    const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName);
+    const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName, {
+      channelId: conf.channelId,
+      appVersion: APP_VERSION,
+    });
     setSfuStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     return { manager: rtcManager, connectionState };
-  }, [camEnabled, micEnabled, installLocalStream, refreshDevices]);
+  }, [camEnabled, micEnabled, installLocalStream, playJoinTone, refreshDevices, showIncomingCall, showCallNotice, stopIncomingCall, stopOutgoingCall]);
 
   const performQuickRestart = useCallback(async (payload = {}) => {
     if (softRestartInFlightRef.current) return;
@@ -844,6 +1337,7 @@ export default function MainView() {
         configRef.current = next;
         localStorage.setItem('sfu_config', JSON.stringify(next));
         setSelfName(next.locationName || '自拠点');
+        setChannelId(next.channelId || 'general');
         setSettingsDraft(next);
         setSettingsOpen(false);
 
@@ -1040,20 +1534,33 @@ export default function MainView() {
       const remotePeers = Array.from((state.peers || new Map()).entries()).map(([socketId, peer]) => {
         const video = peer.stream?.getVideoTracks()[0] || null;
         const audio = peer.stream?.getAudioTracks()[0] || null;
+        const screen = peer.screenStream?.getVideoTracks()[0] || null;
+        const screenAudio = peer.screenStream?.getAudioTracks()[0] || null;
+        const sameChannel = (peer.channelId || 'general') === (state.channelId || 'general');
         return {
           socketId,
           name: peer.locationName,
+          channelId: peer.channelId || '',
+          appType: peer.appType || 'client',
           videoPaused: !!peer.videoPaused,
           audioPaused: !!peer.audioPaused,
+          screenPaused: !!peer.screenPaused,
+          screenAudioPaused: !!peer.screenAudioPaused,
           video: trackReport(video),
           audio: trackReport(audio),
+          screen: trackReport(screen),
+          screenAudio: trackReport(screenAudio),
           receivingVideo: !!video && video.readyState === 'live' && !peer.videoPaused,
-          receivingAudio: !!audio && audio.readyState === 'live' && !peer.audioPaused,
+          receivingAudio: !!audio && audio.readyState === 'live' && !peer.audioPaused && sameChannel,
+          receivingScreen: !!screen && screen.readyState === 'live' && !peer.screenPaused,
+          receivingScreenAudio: !!screenAudio && screenAudio.readyState === 'live' && !peer.screenAudioPaused,
         };
       });
 
       manager.sendTelemetry({
         appType: 'client',
+        appVersion: APP_VERSION,
+        channelId: state.channelId,
         locationName: state.selfName,
         status: state.sfuStatus,
         devices: {
@@ -1082,7 +1589,7 @@ export default function MainView() {
         },
         remoteMonitor: {
           peerCount: remotePeers.length,
-          receivingVideoCount: remotePeers.filter(peer => peer.receivingVideo).length,
+          receivingVideoCount: remotePeers.filter(peer => peer.receivingVideo || peer.receivingScreen).length,
           receivingAudioCount: remotePeers.filter(peer => peer.receivingAudio).length,
           peers: remotePeers,
         },
@@ -1124,24 +1631,722 @@ export default function MainView() {
       previous.serverIp !== next.serverIp ||
       previous.serverPort !== next.serverPort ||
       previous.locationName !== next.locationName;
+    const channelChanged = previous.channelId !== next.channelId;
 
     configRef.current = next;
     localStorage.setItem('sfu_config', JSON.stringify(next));
     setSelfName(next.locationName || '自拠点');
+    setChannelId(next.channelId || 'general');
     setSettingsDraft(next);
     setSettingsOpen(false);
 
     if (requiresReconnect) {
       await performQuickRestart({ reason: 'settings-updated' });
+    } else if (channelChanged) {
+      await webrtcRef.current?.setChannel(next.channelId);
     }
   }, [performQuickRestart, settingsDraft]);
 
+  const changeChannel = useCallback(async (nextChannelId) => {
+    const nextId = nextChannelId || channels[0]?.id || 'general';
+    const nextConfig = { ...sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig()), channelId: nextId };
+    configRef.current = nextConfig;
+    localStorage.setItem('sfu_config', JSON.stringify(nextConfig));
+    setSettingsDraft(nextConfig);
+    setChannelId(nextId);
+    try {
+      await webrtcRef.current?.setChannel(nextId);
+    } catch (err) {
+      console.warn('[setChannel]', err.message);
+    }
+  }, [channels]);
+
+  const answerIncomingCall = useCallback(async (call) => {
+    const targetChannelId = call?.fromChannelId || '';
+    stopIncomingCall(call?.callId || '');
+    // 発信側の鳴動表示を止める（失敗しても応答処理は続行）
+    webrtcRef.current?.ackCall(call?.callId, 'answered').catch(() => {});
+    if (!targetChannelId || targetChannelId === activeChannelId) return;
+    if (!channels.some(channel => channel.id === targetChannelId)) return;
+    await changeChannel(targetChannelId);
+  }, [activeChannelId, changeChannel, channels, stopIncomingCall]);
+
+  const dismissIncomingCall = useCallback((call) => {
+    stopIncomingCall(call?.callId || '');
+    // 発信側へ「応答なし」を通知して鳴動表示を止める
+    webrtcRef.current?.ackCall(call?.callId, 'dismissed').catch(() => {});
+  }, [stopIncomingCall]);
+
+  const createChannel = useCallback(async (event) => {
+    event?.preventDefault?.();
+    const name = newChannelName.trim();
+    if (!name) return;
+
+    try {
+      const result = await webrtcRef.current?.createChannel(name);
+      if (result?.systemState) setSystemState({ ...DEFAULT_SYSTEM_STATE, ...result.systemState });
+      setNewChannelName('');
+      setChannelEditorOpen(false);
+      if (result?.channel?.id) await changeChannel(result.channel.id);
+    } catch (err) {
+      console.warn('[createChannel]', err.message);
+      setCamError(`チャンネル作成に失敗しました: ${err.message}`);
+    }
+  }, [changeChannel, newChannelName]);
+
+  const updateChannelDraft = useCallback((channelId, value) => {
+    setChannelDrafts(prev => ({ ...prev, [channelId]: value }));
+  }, []);
+
+  const renameChannel = useCallback(async (targetChannelId) => {
+    const currentChannel = channels.find(channel => channel.id === targetChannelId);
+    const name = String(channelDrafts[targetChannelId] ?? currentChannel?.name ?? '').trim();
+    if (!targetChannelId || !name) return;
+
+    try {
+      const result = await webrtcRef.current?.updateChannel(targetChannelId, name);
+      if (result?.systemState) setSystemState({ ...DEFAULT_SYSTEM_STATE, ...result.systemState });
+      setChannelDrafts(prev => ({ ...prev, [targetChannelId]: name }));
+    } catch (err) {
+      console.warn('[updateChannel]', err.message);
+      setCamError(`チャンネル名の変更に失敗しました: ${err.message}`);
+    }
+  }, [channelDrafts, channels]);
+
+  const deleteChannel = useCallback(async (targetChannelId) => {
+    if (!targetChannelId || channels.length <= 1) return;
+    const target = channels.find(channel => channel.id === targetChannelId);
+    const confirmed = window.confirm(`「${target?.name || targetChannelId}」を削除しますか？`);
+    if (!confirmed) return;
+
+    try {
+      const result = await webrtcRef.current?.deleteChannel(targetChannelId);
+      if (result?.systemState) setSystemState({ ...DEFAULT_SYSTEM_STATE, ...result.systemState });
+      if (targetChannelId === channelId) {
+        await changeChannel(result?.fallbackChannelId || result?.systemState?.channels?.[0]?.id || 'general');
+      }
+    } catch (err) {
+      console.warn('[deleteChannel]', err.message);
+      setCamError(`チャンネル削除に失敗しました: ${err.message}`);
+    }
+  }, [changeChannel, channelId, channels]);
+
+  const handleTileFocus = useCallback((tileId) => {
+    if (!tileId) return;
+    setFocusedTileId(prev => (prev === tileId ? '' : tileId));
+  }, []);
+
+  const getTileVolume = useCallback((tileId) => {
+    const value = peerVolumes[tileId];
+    return Number.isFinite(value) ? value : 1;
+  }, [peerVolumes]);
+
+  const handleTileVolumeChange = useCallback((tileId, value) => {
+    const nextValue = clampNumber(value, 0, 1.5);
+    setPeerVolumes(prev => ({ ...prev, [tileId]: nextValue }));
+  }, []);
+
+  const openMemberMenu = useCallback((event, member, channel) => {
+    if (member.isSelf || !member.socketId) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setMemberMenu({
+      socketId: member.socketId,
+      memberName: member.name,
+      channelId: member.channelId || channel.id,
+      x: Math.min(event.clientX, Math.max(16, window.innerWidth - 286)),
+      y: Math.min(event.clientY, Math.max(16, window.innerHeight - 320)),
+    });
+  }, []);
+
+  const cancelOutgoingCall = useCallback(async () => {
+    const current = outgoingCallRef.current;
+    if (!current) return;
+    stopOutgoingCall();
+    showCallNotice('呼び出しをキャンセルしました');
+    try {
+      await webrtcRef.current?.cancelCall(current.callId);
+    } catch {
+      // 相手が既に応答/切断していた場合は何もしない
+    }
+  }, [showCallNotice, stopOutgoingCall]);
+
+  const callMember = useCallback(async (socketId) => {
+    if (!socketId) return;
+    setMemberMenu(null);
+
+    // 同じ相手をもう一度押したらキャンセル、別の相手なら先にキャンセルしてから発信
+    const current = outgoingCallRef.current;
+    if (current) {
+      const sameTarget = current.targetSocketId === socketId;
+      stopOutgoingCall();
+      try { await webrtcRef.current?.cancelCall(current.callId); } catch { /* 既に終了 */ }
+      if (sameTarget) {
+        showCallNotice('呼び出しをキャンセルしました');
+        return;
+      }
+    }
+
+    const targetName = peers.get(socketId)?.locationName || '相手拠点';
+    try {
+      const result = await webrtcRef.current?.callPeer(socketId);
+      const callId = result?.callId || '';
+      if (!callId) throw new Error('呼び出しIDを取得できませんでした');
+
+      const call = { callId, targetSocketId: socketId, targetName, startedAt: Date.now() };
+      outgoingCallRef.current = call;
+      setOutgoingCall(call);
+
+      // サーバー通知が届かない場合のフォールバック（サーバー側タイムアウトと同じ30秒）
+      if (outgoingCallTimerRef.current) clearTimeout(outgoingCallTimerRef.current);
+      outgoingCallTimerRef.current = setTimeout(() => {
+        if (outgoingCallRef.current?.callId !== callId) return;
+        stopOutgoingCall(callId);
+        showCallNotice(`${targetName} の応答がありませんでした`, 'warn');
+      }, CALL_RING_TIMEOUT_MS + 2000);
+    } catch (err) {
+      console.warn('[callPeer]', err.message);
+      setCamError(`呼び出しに失敗しました: ${err.message}`);
+    }
+  }, [peers, showCallNotice, stopOutgoingCall]);
+
+  const moveMemberToChannel = useCallback(async (socketId, nextChannelId) => {
+    if (!socketId || !nextChannelId) return;
+    try {
+      const result = await webrtcRef.current?.movePeerToChannel(socketId, nextChannelId);
+      if (result?.systemState) setSystemState({ ...DEFAULT_SYSTEM_STATE, ...result.systemState });
+      setPeers(prev => {
+        const next = new Map(prev);
+        const peer = next.get(socketId);
+        if (peer) next.set(socketId, { ...peer, channelId: result?.channelId || nextChannelId });
+        return next;
+      });
+      setMemberMenu(prev => (prev ? { ...prev, channelId: result?.channelId || nextChannelId } : prev));
+    } catch (err) {
+      console.warn('[movePeerToChannel]', err.message);
+      setCamError(`チャンネル移動に失敗しました: ${err.message}`);
+    }
+  }, []);
+
+  const toggleMemberSpeakerMute = useCallback((socketId) => {
+    if (!socketId) return;
+    const tileId = `peer:${socketId}`;
+    setPeerVolumes(prev => {
+      const current = Number.isFinite(prev[tileId]) ? prev[tileId] : 1;
+      return { ...prev, [tileId]: current > 0 ? 0 : 1 };
+    });
+  }, []);
+
+  const startSidebarResize = useCallback((event) => {
+    if (sidebarCollapsed) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidebarWidth;
+
+    const onMove = (moveEvent) => {
+      const nextWidth = clampNumber(startWidth + moveEvent.clientX - startX, 196, 360);
+      setSidebarWidth(nextWidth);
+      try {
+        localStorage.setItem('client_sidebar_width', String(nextWidth));
+      } catch {
+        // 保存できない環境では当該セッションだけ反映する。
+      }
+    };
+    const onUp = () => {
+      document.body.classList.remove('resizing-sidebar');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+
+    document.body.classList.add('resizing-sidebar');
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp, { once: true });
+  }, [sidebarCollapsed, sidebarWidth]);
+
+  const openUpdate = useCallback(() => {
+    const url = updateNotice?.packageInfo?.url || updatePackage?.url;
+    if (!url) return;
+    window.electronAPI?.openExternal?.(url);
+  }, [updateNotice, updatePackage]);
+
+  // ─── 画面共有（Client内蔵）──────────────────────────────
+  const stopScreenShare = useCallback(async () => {
+    const share = screenShareRef.current;
+    screenShareRef.current = null;
+    setScreenShare(null);
+    try {
+      await webrtcRef.current?.stopScreenShare();
+    } catch (err) {
+      console.warn('[stopScreenShare]', err.message);
+    }
+    // manager 側でも止めるが、開始直後の失敗などに備えてUI側でも確実に止める
+    share?.stream?.getTracks().forEach(track => { try { track.stop(); } catch { /* ignore */ } });
+  }, []);
+
+  const startScreenShareFromSource = useCallback(async (source, withAudio) => {
+    setShareModalMode(null);
+    if (!source?.id) return;
+
+    try {
+      // Electron では chromeMediaSourceId 指定の getUserMedia で画面をキャプチャする。
+      // 音声ループバックは Windows のみ対応（macはOS制約）。
+      const constraints = {
+        audio: withAudio && window.electronAPI?.platform === 'win32'
+          ? { mandatory: { chromeMediaSource: 'desktop' } }
+          : false,
+        video: {
+          mandatory: {
+            chromeMediaSource: 'desktop',
+            chromeMediaSourceId: source.id,
+            maxWidth: 1920,
+            maxHeight: 1080,
+            maxFrameRate: 15,
+          },
+        },
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      const videoTrack = stream.getVideoTracks()[0] || null;
+      const audioTrack = stream.getAudioTracks()[0] || null;
+      if (!videoTrack) {
+        stream.getTracks().forEach(track => track.stop());
+        throw new Error('共有映像を取得できませんでした');
+      }
+
+      const previous = screenShareRef.current;
+      await webrtcRef.current?.startScreenShare(videoTrack, source.name, audioTrack);
+
+      // 共有元変更時は旧ストリームを止める（manager は producer のみ閉じる）
+      previous?.stream?.getTracks().forEach(track => { try { track.stop(); } catch { /* ignore */ } });
+
+      const next = {
+        sourceId: source.id,
+        sourceName: source.name || '画面共有',
+        hasAudio: !!audioTrack,
+        audioEnabled: !!audioTrack,
+        paused: false,
+        stream,
+      };
+      screenShareRef.current = next;
+      setScreenShare(next);
+      setCamError(null);
+    } catch (err) {
+      console.error('[ScreenShare]', err);
+      setCamError(`画面共有を開始できませんでした: ${err.message}`);
+    }
+  }, []);
+
+  const toggleSharePause = useCallback(async () => {
+    const share = screenShareRef.current;
+    if (!share) return;
+    const paused = !share.paused;
+    const next = { ...share, paused };
+    screenShareRef.current = next;
+    setScreenShare(next);
+    try {
+      await webrtcRef.current?.setScreenSharePaused(paused);
+    } catch (err) {
+      console.warn('[toggleSharePause]', err.message);
+    }
+  }, []);
+
+  const toggleShareAudio = useCallback(async () => {
+    const share = screenShareRef.current;
+    if (!share?.hasAudio) return;
+    const audioEnabled = !share.audioEnabled;
+    share.stream?.getAudioTracks().forEach(track => { track.enabled = audioEnabled; });
+    const next = { ...share, audioEnabled };
+    screenShareRef.current = next;
+    setScreenShare(next);
+    try {
+      await webrtcRef.current?.setScreenAudioEnabled(audioEnabled);
+    } catch (err) {
+      console.warn('[toggleShareAudio]', err.message);
+    }
+  }, []);
+
   // ─── グリッド ────────────────────────────────────────────
-  const totalCells = peers.size + 1;
-  const { gridRef, layout: gridLayout } = useFittedVideoGrid(totalCells);
+  const videoTiles = useMemo(() => {
+    const tiles = [{
+      id: 'self',
+      key: `self-${uiResetToken}`,
+      label: selfName,
+      stream: localStream,
+      isSelf: true,
+      videoPaused: !camEnabled,
+      audioPaused: !micEnabled,
+      speakerMuted: false,
+      sameChannel: true,
+      canControlVolume: false,
+      baseVolume: 0,
+      sortRank: 0,
+    }];
+
+    // 自分の共有映像は受信映像として戻ってこない（自ソケットはconsumeしない）ため、
+    // ローカルプレビューとしてタイル表示する。
+    if (screenShare?.stream) {
+      tiles.push({
+        id: 'self-screen',
+        key: `self-screen-${uiResetToken}`,
+        label: `${selfName} / ${screenShare.sourceName}`,
+        stream: screenShare.stream,
+        isSelf: true,
+        isScreen: true,
+        videoPaused: !!screenShare.paused,
+        audioPaused: !screenShare.hasAudio || !screenShare.audioEnabled,
+        speakerMuted: true,
+        sameChannel: true,
+        canControlVolume: false,
+        baseVolume: 0,
+        sortRank: 2,
+      });
+    }
+
+    for (const [socketId, peer] of peerEntries) {
+      const peerChannelId = peer.channelId || 'general';
+      const sameChannel = peerChannelId === activeChannelId;
+      const isScreenShareApp = peer.appType === 'screen-share';
+
+      if (!isScreenShareApp) {
+        tiles.push({
+          id: `peer:${socketId}`,
+          key: `${uiResetToken}-${socketId}`,
+          label: peer.locationName || '不明',
+          stream: peer.stream,
+          isSelf: false,
+          videoPaused: !!peer.videoPaused,
+          audioPaused: !!peer.audioPaused || !sameChannel,
+          speakerDeviceId: selectedAudioOutId,
+          speakerMuted: speakerMuted || !sameChannel,
+          sameChannel,
+          canControlVolume: true,
+          baseVolume: remoteAudioVolume,
+          sortRank: sameChannel ? 1 : 3,
+        });
+      }
+
+      if (peer.screenProducerId && peer.screenStream?.getVideoTracks().length && !peer.screenPaused) {
+        tiles.push({
+          id: `screen:${socketId}`,
+          key: `${uiResetToken}-${socketId}-screen`,
+          label: `${peer.locationName || '不明'} / ${peer.screenLabel || '画面共有'}`,
+          stream: peer.screenStream,
+          isSelf: false,
+          isScreen: true,
+          videoPaused: !!peer.screenPaused,
+          audioPaused: !!peer.screenAudioPaused,
+          speakerDeviceId: selectedAudioOutId,
+          speakerMuted,
+          sameChannel: true,
+          canControlVolume: true,
+          baseVolume: remoteAudioVolume,
+          sortRank: 2,
+        });
+      }
+    }
+
+    return tiles.sort((a, b) => (
+      Number(b.sameChannel) - Number(a.sameChannel) ||
+      a.sortRank - b.sortRank ||
+      a.label.localeCompare(b.label, 'ja')
+    ));
+  }, [
+    activeChannelId,
+    camEnabled,
+    localStream,
+    micEnabled,
+    peerEntries,
+    remoteAudioVolume,
+    screenShare,
+    selectedAudioOutId,
+    selfName,
+    speakerMuted,
+    uiResetToken,
+  ]);
+
+  const visibleFocusedTileId = videoTiles.some(tile => tile.id === focusedTileId) ? focusedTileId : '';
+  const focusedTile = videoTiles.find(tile => tile.id === visibleFocusedTileId) || null;
+  const secondaryTiles = focusedTile ? videoTiles.filter(tile => tile.id !== focusedTile.id) : videoTiles;
+  const { gridRef, layout: gridLayout } = useFittedVideoGrid(focusedTile ? secondaryTiles.length : videoTiles.length);
+
+  const renderVideoTile = useCallback((tile, options = {}) => {
+    const volumeValue = getTileVolume(tile.id);
+    // カメラタイル（peer:xxx）のみ呼び出しボタンを表示する
+    const callTargetSocketId = tile.id.startsWith('peer:') ? tile.id.slice(5) : '';
+    return (
+      <VideoCell
+        key={`${tile.key}-${options.focused ? 'focus' : options.compact ? 'compact' : 'grid'}`}
+        tileId={tile.id}
+        label={tile.label}
+        stream={tile.stream}
+        isSelf={tile.isSelf}
+        isScreen={!!tile.isScreen}
+        videoPaused={tile.videoPaused}
+        audioPaused={tile.audioPaused}
+        speakerDeviceId={tile.speakerDeviceId}
+        speakerMuted={tile.speakerMuted}
+        volume={tile.baseVolume * volumeValue}
+        focused={!!options.focused}
+        compact={!!options.compact}
+        dimmed={!!options.dimmed || !tile.sameChannel}
+        canFocus={true}
+        canControlVolume={tile.canControlVolume}
+        volumeValue={volumeValue}
+        onFocus={handleTileFocus}
+        onVolumeChange={handleTileVolumeChange}
+        onCall={callTargetSocketId ? () => callMember(callTargetSocketId) : null}
+      />
+    );
+  }, [callMember, getTileVolume, handleTileFocus, handleTileVolumeChange]);
+
+  const memberMenuVolume = memberMenu ? getTileVolume(`peer:${memberMenu.socketId}`) : 1;
+  const incomingCallChannelName = incomingCall?.fromChannelId
+    ? (incomingCall.fromChannelName || channels.find(channel => channel.id === incomingCall.fromChannelId)?.name || incomingCall.fromChannelId)
+    : '';
 
   return (
-    <div className="main-layout">
+    <div
+      className={`main-layout with-sidebar ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}
+      style={{ '--sidebar-w': `${sidebarCollapsed ? 54 : sidebarWidth}px` }}
+    >
+      <aside className="channel-sidebar">
+        <button
+          type="button"
+          className="sidebar-toggle"
+          onClick={() => setSidebarCollapsed(value => !value)}
+          title={sidebarCollapsed ? 'メニューを開く' : 'メニューを閉じる'}
+          aria-label={sidebarCollapsed ? 'メニューを開く' : 'メニューを閉じる'}
+        >
+          {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+        </button>
+
+        {!sidebarCollapsed && (
+          <>
+            <div className="sidebar-brand">
+              <div className="sidebar-mark">CH</div>
+              <div>
+                <div className="sidebar-title">CHECKHOUSE</div>
+                <div className="sidebar-subtitle">Meeting System</div>
+              </div>
+            </div>
+
+            <div className="active-channel-card">
+              <Volume2 size={22} />
+              <span>{activeChannel?.name || 'チャンネル'}</span>
+              <button type="button" onClick={openSettingsPanel} title="設定" aria-label="設定">
+                <Settings size={15} />
+              </button>
+            </div>
+
+            <div className="channel-section-row voice">
+              <button type="button" className="section-title">
+                <span>ボイスチャンネル</span>
+                <ChevronDown size={14} />
+              </button>
+              <button
+                type="button"
+                className="section-action"
+                onClick={() => setChannelEditorOpen(value => !value)}
+                title="チャンネルを編集"
+                aria-label="チャンネルを編集"
+              >
+                <Pencil size={16} />
+              </button>
+            </div>
+
+            {channelEditorOpen && (
+              <div className="channel-editor-panel">
+                <form className="channel-create-form" onSubmit={createChannel}>
+                  <input
+                    type="text"
+                    value={newChannelName}
+                    onChange={event => setNewChannelName(event.target.value)}
+                    placeholder="新しいチャンネル名"
+                    maxLength={48}
+                    autoFocus
+                  />
+                  <button type="submit" title="追加" aria-label="追加" disabled={!newChannelName.trim()}>
+                    <Plus size={15} />
+                  </button>
+                </form>
+                <div className="channel-edit-list">
+                  {channels.map(channel => {
+                    const draft = channelDrafts[channel.id] ?? channel.name;
+                    return (
+                      <div className="channel-edit-row" key={channel.id}>
+                        <input
+                          type="text"
+                          value={draft}
+                          onChange={event => updateChannelDraft(channel.id, event.target.value)}
+                          maxLength={48}
+                        />
+                        <button
+                          type="button"
+                          title="保存"
+                          aria-label="保存"
+                          disabled={!String(draft).trim() || String(draft).trim() === channel.name}
+                          onClick={() => renameChannel(channel.id)}
+                        >
+                          <Check size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          title="削除"
+                          aria-label="削除"
+                          disabled={channels.length <= 1}
+                          onClick={() => deleteChannel(channel.id)}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            <div className="channel-tree" aria-label="ボイスチャンネル">
+              {channels.map(channel => {
+                const members = channelMembers.get(channel.id) || [];
+                const active = channel.id === activeChannelId;
+                return (
+                  <div key={channel.id} className={`voice-channel-node ${active ? 'active' : ''}`}>
+                    <button
+                      type="button"
+                      className="voice-channel-row"
+                      onClick={() => changeChannel(channel.id)}
+                      title={channel.name}
+                    >
+                      <Volume2 size={18} />
+                      <span>{channel.name}</span>
+                      <strong>{members.length}</strong>
+                    </button>
+                    <div className="voice-member-list">
+                      {members.map(member => (
+                        <div
+                          key={member.id}
+                          className={`voice-member ${member.isSelf ? 'self' : ''}`}
+                          onContextMenu={event => openMemberMenu(event, member, channel)}
+                          title={member.isSelf ? member.name : `${member.name}を右クリックで操作`}
+                        >
+                          <span className="member-avatar">{memberInitials(member.name)}</span>
+                          <span className="member-name">{member.name}{member.isSelf ? '（自拠点）' : ''}</span>
+                          {/* 発信中の相手にはベルを鳴動アニメーションで表示し、クリックでキャンセルできる */}
+                          {!member.isSelf && (
+                            <button
+                              type="button"
+                              className={`member-call-btn ${outgoingCall?.targetSocketId === member.socketId ? 'ringing' : ''}`}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                if (outgoingCall?.targetSocketId === member.socketId) cancelOutgoingCall();
+                                else callMember(member.socketId);
+                              }}
+                              title={outgoingCall?.targetSocketId === member.socketId ? '呼び出し中（クリックでキャンセル）' : '呼び出し'}
+                              aria-label={outgoingCall?.targetSocketId === member.socketId ? `${member.name}を呼び出し中` : `${member.name}を呼び出し`}
+                            >
+                              {outgoingCall?.targetSocketId === member.socketId ? <BellRing size={13} /> : <Bell size={13} />}
+                            </button>
+                          )}
+                          {member.muted && <MicOff size={15} />}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
+
+        {sidebarCollapsed && (
+          <div className="collapsed-channel-stack">
+            {channels.map(channel => (
+              <button
+                key={channel.id}
+                type="button"
+                className={channel.id === activeChannelId ? 'active' : ''}
+                onClick={() => changeChannel(channel.id)}
+                title={channel.name}
+              >
+                <Volume2 size={17} />
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="sidebar-footer">
+          {updateAvailable && !sidebarCollapsed && (
+            <button
+              type="button"
+              className="update-mini"
+              onClick={openUpdate}
+              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url}
+              title="アップデート"
+            >
+              <Download size={14} />
+              <span>v{latestVersion}</span>
+            </button>
+          )}
+          <div className="version-line">{sidebarCollapsed ? `v${APP_VERSION}` : `Client v${APP_VERSION}`}</div>
+        </div>
+
+        {!sidebarCollapsed && (
+          <div
+            className="sidebar-resize-handle"
+            onMouseDown={startSidebarResize}
+            role="separator"
+            aria-orientation="vertical"
+            title="メニュー幅を変更"
+          />
+        )}
+      </aside>
+
+      {memberMenu && (
+        <div
+          className="member-context-menu"
+          style={{ left: `${memberMenu.x}px`, top: `${memberMenu.y}px` }}
+          onClick={event => event.stopPropagation()}
+        >
+          <div className="member-context-title">{memberMenu.memberName}</div>
+          <button
+            type="button"
+            onClick={() => {
+              if (outgoingCall?.targetSocketId === memberMenu.socketId) cancelOutgoingCall();
+              else callMember(memberMenu.socketId);
+            }}
+          >
+            <BellRing size={15} className={outgoingCall?.targetSocketId === memberMenu.socketId ? 'bell-ringing' : ''} />
+            <span>{outgoingCall?.targetSocketId === memberMenu.socketId ? '呼び出しをキャンセル' : '呼び出し'}</span>
+          </button>
+          <button type="button" onClick={() => toggleMemberSpeakerMute(memberMenu.socketId)}>
+            {memberMenuVolume > 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
+            <span>{memberMenuVolume > 0 ? 'スピーカーミュート' : 'ミュート解除'}</span>
+          </button>
+          <label className="member-volume-control">
+            <span>個別音量 {Math.round(memberMenuVolume * 100)}%</span>
+            <input
+              type="range"
+              min="0"
+              max="1.5"
+              step="0.05"
+              value={memberMenuVolume}
+              onChange={event => handleTileVolumeChange(`peer:${memberMenu.socketId}`, Number(event.target.value))}
+            />
+          </label>
+          <label className="member-channel-move">
+            <span>チャンネル移動</span>
+            <select
+              value={memberMenu.channelId}
+              onChange={event => moveMemberToChannel(memberMenu.socketId, event.target.value)}
+            >
+              {channels.map(channel => (
+                <option key={channel.id} value={channel.id}>{channel.name}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+      )}
+
+      <div className="meeting-stage">
 
       <div className="floating-status">
         <span className="status-dot" style={{
@@ -1160,43 +2365,105 @@ export default function MainView() {
         <div className="cam-error-bar">⚠ {camError}</div>
       )}
 
+      {incomingCall && (
+        <div className="incoming-call-screen" role="alertdialog" aria-modal="true" aria-labelledby="incoming-call-title">
+          <div className="incoming-call-frame" aria-hidden="true" />
+          <div className="incoming-call-panel">
+            <div className="incoming-call-icon">
+              <BellRing size={34} />
+            </div>
+            <div>
+              <div id="incoming-call-title" className="incoming-call-title">呼び出し中</div>
+              <div className="incoming-call-name">{incomingCall.callerName} から呼び出されています</div>
+              <div className="incoming-call-note">応答するまで最大30秒鳴動します</div>
+              {incomingCallChannelName && (
+                <div className="incoming-call-channel">応答すると「{incomingCallChannelName}」へ移動します</div>
+              )}
+            </div>
+            <div className="incoming-call-actions">
+              <button type="button" className="incoming-call-answer" onClick={() => answerIncomingCall(incomingCall)}>
+                応答
+              </button>
+              <button type="button" className="incoming-call-dismiss" onClick={() => dismissIncomingCall(incomingCall)} aria-label="呼び出し通知を停止">
+                <X size={18} />
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── ビデオグリッド ── */}
-      <div
-        ref={gridRef}
-        className="video-grid"
-        style={{
-          gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, ${gridLayout.cellWidth || 1}px))`,
-          gridTemplateRows: `repeat(${gridLayout.rows}, minmax(0, ${gridLayout.cellHeight || 1}px))`,
-        }}
-      >
-        {/* 自拠点 */}
-        <VideoCell
-          key={`self-${uiResetToken}`}
-          label={selfName}
-          stream={localStream}
-          isSelf={true}
-          videoPaused={!camEnabled}
-          audioPaused={!micEnabled}
-          speakerMuted={false}
-        />
-        {/* 他拠点 */}
-        {Array.from(peers.entries()).map(([socketId, peer]) => (
-          <VideoCell
-            key={`${uiResetToken}-${socketId}`}
-            label={peer.locationName}
-            stream={peer.stream}
-            isSelf={false}
-            videoPaused={peer.videoPaused}
-            audioPaused={peer.audioPaused}
-            speakerDeviceId={selectedAudioOutId}
-            speakerMuted={speakerMuted}
-            volume={remoteAudioVolume}
-          />
-        ))}
-      </div>
+      {focusedTile ? (
+        <div className="focus-video-layout">
+          <div className="focus-main-tile">
+            {renderVideoTile(focusedTile, { focused: true })}
+          </div>
+          {secondaryTiles.length > 0 && (
+            <div className="focus-side-rail">
+              {secondaryTiles.map(tile => renderVideoTile(tile, { compact: true }))}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div
+          ref={gridRef}
+          className="video-grid"
+          style={{
+            gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, ${gridLayout.cellWidth || 1}px))`,
+            gridTemplateRows: `repeat(${gridLayout.rows}, minmax(0, ${gridLayout.cellHeight || 1}px))`,
+          }}
+        >
+          {videoTiles.map(tile => renderVideoTile(tile))}
+        </div>
+      )}
 
       {viewerPresenceActive && (
         <div className="viewer-presence-dot" aria-hidden="true" />
+      )}
+
+      {/* ── 画面共有中バー ── */}
+      {screenShare && (
+        <div className="share-bar">
+          <span className={`share-bar-dot ${screenShare.paused ? 'paused' : ''}`} />
+          <MonitorUp size={14} />
+          <span className="share-bar-name">
+            {screenShare.paused ? '共有を一時停止中' : `「${screenShare.sourceName}」を共有中`}
+          </span>
+          <button type="button" className="share-bar-btn" onClick={toggleSharePause} title={screenShare.paused ? '共有を再開' : '共有を一時停止'}>
+            {screenShare.paused ? <Play size={14} /> : <Pause size={14} />}
+          </button>
+          <button type="button" className="share-bar-btn" onClick={() => setShareModalMode('change')} title="共有元を変更">
+            <SwitchCamera size={14} />
+          </button>
+          {screenShare.hasAudio && (
+            <button
+              type="button"
+              className={`share-bar-btn ${screenShare.audioEnabled ? '' : 'muted'}`}
+              onClick={toggleShareAudio}
+              title={screenShare.audioEnabled ? '共有音声をOFF' : '共有音声をON'}
+            >
+              {screenShare.audioEnabled ? <Volume2 size={14} /> : <VolumeX size={14} />}
+            </button>
+          )}
+          <button type="button" className="share-bar-btn stop" onClick={stopScreenShare} title="共有を停止">
+            <Square size={12} /> 停止
+          </button>
+        </div>
+      )}
+
+      {/* ── 発信中バー / 呼び出し結果通知 ── */}
+      {outgoingCall && (
+        <div className="outgoing-call-bar">
+          <BellRing size={14} className="bell-ringing" />
+          <span>{outgoingCall.targetName} を呼び出し中…</span>
+          <button type="button" onClick={cancelOutgoingCall}>キャンセル</button>
+        </div>
+      )}
+      {!outgoingCall && callNotice && (
+        <div className={`outgoing-call-bar notice ${callNotice.tone || 'info'}`}>
+          <Bell size={13} />
+          <span>{callNotice.text}</span>
+        </div>
       )}
 
       {/* ── コントロールバー ── */}
@@ -1236,6 +2503,19 @@ export default function MainView() {
           onDeviceChange={changeSpeaker}
           title="スピーカー"
         />
+
+        {/* 画面共有 */}
+        <button
+          className={`ctrl-btn ${screenShare ? 'sharing' : ''}`}
+          onClick={() => {
+            if (screenShare) stopScreenShare();
+            else setShareModalMode('start');
+          }}
+          title={screenShare ? '画面共有を停止' : '画面共有'}
+          aria-label={screenShare ? '画面共有を停止' : '画面共有'}
+        >
+          <MonitorUp size={20} />
+        </button>
       </div>
 
       <button
@@ -1271,6 +2551,17 @@ export default function MainView() {
                   placeholder="例: 東京本社"
                 />
               </div>
+              <div className="field">
+                <label>音声チャンネル</label>
+                <select
+                  value={settingsDraft.channelId}
+                  onChange={e => updateSettingsDraft('channelId', e.target.value)}
+                >
+                  {channels.map(channel => (
+                    <option key={channel.id} value={channel.id}>{channel.name}</option>
+                  ))}
+                </select>
+              </div>
             </div>
 
             <div className="settings-section">
@@ -1304,6 +2595,15 @@ export default function MainView() {
           </div>
         </div>
       )}
+
+      {/* ── 画面共有: 共有元選択モーダル ── */}
+      <ScreenShareModal
+        open={!!shareModalMode}
+        isChanging={shareModalMode === 'change'}
+        onClose={() => setShareModalMode(null)}
+        onSelect={startScreenShareFromSource}
+      />
+      </div>
     </div>
   );
 }

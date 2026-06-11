@@ -1,7 +1,7 @@
 {
-  "name": "sfu-server-gui",
+  "name": "checkhouse-meeting-server-gui",
   "version": "1.0.0",
-  "description": "GUI Wrapper for WebRTC SFU Server",
+  "description": "CHECKHOUSE Meeting System server controller",
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
@@ -12,14 +12,16 @@
     "package:win:arm64": "echo \"Windows arm64 is not packaged because mediasoup-worker win32-arm64 prebuild is unavailable for this mediasoup version.\" && exit 1"
   },
   "build": {
-    "appId": "com.webrtc.servergui",
-    "productName": "SFU Server GUI",
+    "appId": "com.checkhouse.meeting.server",
+    "productName": "CHECKHOUSE Meeting Server",
     "mac": {
+      "icon": "build/icon.icns",
       "target": ["dmg", "dir"],
       "hardenedRuntime": true,
       "gatekeeperAssess": false
     },
     "win": {
+      "icon": "build/icon.ico",
       "target": ["nsis", "portable", "zip"]
     },
     "directories": {

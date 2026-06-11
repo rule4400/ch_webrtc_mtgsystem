@@ -1,7 +1,7 @@
 {
-  "name": "viewer",
+  "name": "checkhouse-meeting-viewer",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -16,17 +16,19 @@
     "package:win": "npm run build && electron-builder build --win --x64"
   },
   "build": {
-    "appId": "com.webrtc.meetingviewer",
-    "productName": "MeetingViewer",
+    "appId": "com.checkhouse.meeting.viewer",
+    "productName": "CHECKHOUSE Meeting Viewer",
     "directories": {
       "output": "release"
     },
     "mac": {
+      "icon": "build/icon.icns",
       "target": ["dmg", "dir"],
       "hardenedRuntime": true,
       "gatekeeperAssess": false
     },
     "win": {
+      "icon": "build/icon.ico",
       "target": ["nsis", "portable"]
     },
     "files": [

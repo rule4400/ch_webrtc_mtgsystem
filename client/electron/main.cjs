@@ -1,10 +1,11 @@
-const { app, BrowserWindow, ipcMain, session, systemPreferences } = require('electron');
+const { app, BrowserWindow, desktopCapturer, ipcMain, session, systemPreferences, shell } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
 const { pathToFileURL } = require('url');
+const { readWindowState, trackWindowState, applyWindowState } = require('./window-state.cjs');
 
 let mainWindow;
 let restartInProgress = false;
@@ -281,9 +282,13 @@ function stopControlServer() {
 }
 
 function createWindow() {
+  const windowState = readWindowState({ width: 1280, height: 800 });
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 800,
+    width: windowState.width,
+    height: windowState.height,
+    ...(Number.isFinite(windowState.x) && Number.isFinite(windowState.y)
+      ? { x: windowState.x, y: windowState.y }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -294,6 +299,11 @@ function createWindow() {
       autoplayPolicy: 'no-user-gesture-required',
     },
   });
+
+  // 終了時の状態（最大化・全画面・位置サイズ）を復元し、以後の変化を保存する。
+  // 遠隔再起動・アップデート後も同じ見た目で立ち上がる。
+  applyWindowState(mainWindow, windowState);
+  trackWindowState(mainWindow);
 
   const isDev = process.env.NODE_ENV === 'development';
 
@@ -383,6 +393,77 @@ ipcMain.on('restart-app', () => {
   restartApp();
 });
 
+ipcMain.handle('open-external', async (_event, url) => {
+  const target = String(url || '').trim();
+  if (!/^https?:\/\//i.test(target)) throw new Error('invalid update url');
+  await shell.openExternal(target);
+  return true;
+});
+
 ipcMain.on('quick-restart-result', (_event, result) => {
   console.log(`[QuickRestart] renderer result ${JSON.stringify(result || {})}`);
+});
+
+// ── 画面共有（Client内蔵）────────────────────────────────
+// screen-share 専用アプリと同じ仕組み: desktopCapturer で一覧を取得し、
+// レンダラーは chromeMediaSourceId 指定の getUserMedia でキャプチャする。
+
+function getScreenCaptureStatus() {
+  if (process.platform !== 'darwin') return 'granted';
+  try {
+    return systemPreferences.getMediaAccessStatus('screen');
+  } catch {
+    return 'unknown';
+  }
+}
+
+function normalizeDesktopSource(source) {
+  return {
+    id: source.id,
+    name: source.name,
+    kind: source.id.startsWith('window:') ? 'window' : 'screen',
+    thumbnail: source.thumbnail && !source.thumbnail.isEmpty() ? source.thumbnail.toDataURL() : null,
+    appIcon: source.appIcon && !source.appIcon.isEmpty() ? source.appIcon.toDataURL() : null,
+    displayId: source.display_id || null,
+  };
+}
+
+ipcMain.handle('get-screen-capture-status', async () => ({
+  platform: process.platform,
+  permissionStatus: getScreenCaptureStatus(),
+}));
+
+ipcMain.handle('list-desktop-sources', async (_event, options = {}) => {
+  const mode = options.mode === 'window' ? 'window' : 'screen';
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: [mode],
+      thumbnailSize: { width: 420, height: 260 },
+      fetchWindowIcons: true,
+    });
+    return {
+      ok: true,
+      mode,
+      permissionStatus: getScreenCaptureStatus(),
+      sources: sources.map(normalizeDesktopSource),
+    };
+  } catch (err) {
+    console.error('[DesktopSources]', err);
+    return {
+      ok: false,
+      mode,
+      permissionStatus: getScreenCaptureStatus(),
+      error: err.message || 'desktopCapturer failed',
+      sources: [],
+    };
+  }
+});
+
+// macOSの画面収録権限: 繰り返しダイアログを出さず、設定画面への案内で対応する
+ipcMain.handle('open-screen-capture-settings', async () => {
+  if (process.platform === 'darwin') {
+    await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+    return true;
+  }
+  return false;
 });

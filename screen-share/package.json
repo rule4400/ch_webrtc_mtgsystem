@@ -1,7 +1,7 @@
 {
-  "name": "checkhouse-meeting-client",
+  "name": "checkhouse-meeting-screen-share",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.1.0",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -9,16 +9,15 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "electron:start": "cross-env NODE_ENV=development wait-on http://localhost:5173 && electron .",
-    "electron:dev": "concurrently -k \"npm run dev\" \"npm run electron:start\"",
+    "electron:start": "cross-env NODE_ENV=development wait-on http://localhost:5174 && electron .",
+    "electron:dev": "concurrently -k \"npm run dev -- --port 5174\" \"npm run electron:start\"",
     "package": "npm run build && electron-builder build --mac --arm64 && electron-builder build --win --x64",
     "package:mac": "npm run build && electron-builder build --mac --arm64",
-    "package:win": "npm run build && electron-builder build --win --x64",
-    "package:win:arm64": "npm run build && electron-builder build --win --arm64"
+    "package:win": "npm run build && electron-builder build --win --x64"
   },
   "build": {
-    "appId": "com.checkhouse.meeting.client",
-    "productName": "CHECKHOUSE Meeting Client",
+    "appId": "com.checkhouse.meeting.screenshare",
+    "productName": "CHECKHOUSE Meeting Screen Share",
     "directories": {
       "output": "release"
     },
@@ -27,11 +26,14 @@
       "target": ["dmg", "dir"],
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
+      "identity": "-",
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
       "extendInfo": {
-        "NSCameraUsageDescription": "ビデオ通話のためにカメラへのアクセスが必要です。",
-        "NSMicrophoneUsageDescription": "音声通話のためにマイクへのアクセスが必要です。"
+        "NSCameraUsageDescription": "画面共有の送信確認にカメラ権限が要求される場合があります。",
+        "NSAudioCaptureUsageDescription": "画面共有中にアプリまたはシステム音声を共有するために音声収録へのアクセスが必要です。",
+        "NSMicrophoneUsageDescription": "画面共有中の音声送信にマイク権限が要求される場合があります.",
+        "NSScreenCaptureDescription": "画面共有のために画面収録へのアクセスが必要です。"
       }
     },
     "win": {
@@ -49,7 +51,6 @@
     "mediasoup-client": "^3.20.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
-    "react-router-dom": "^7.15.1",
     "socket.io-client": "^4.8.3"
   },
   "devDependencies": {

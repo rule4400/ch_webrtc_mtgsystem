@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="meeting-server">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10233B"/>
+      <stop offset="1" stop-color="#101419"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="214" fill="url(#bg)"/>
+  <circle cx="820" cy="210" r="230" fill="#5AB0FF" opacity=".18"/>
+
+  <rect x="220" y="278" width="584" height="104" rx="34" fill="#5AB0FF"/>
+  <rect x="220" y="426" width="584" height="104" rx="34" fill="#38D996"/>
+  <rect x="220" y="574" width="584" height="104" rx="34" fill="#5AB0FF"/>
+  <path d="M512 678v76M512 754 330 800M512 754l182 46" fill="none" stroke="#38D996" stroke-width="30" stroke-linecap="round"/>
+  <circle cx="330" cy="800" r="42" fill="#38D996"/><circle cx="512" cy="800" r="42" fill="#38D996"/><circle cx="694" cy="800" r="42" fill="#38D996"/>
+
+</svg>

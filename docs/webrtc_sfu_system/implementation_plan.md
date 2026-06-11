@@ -1,69 +1,39 @@
-# クライアント機能拡張およびサーバーGUI管理者向け高機能化 計画
+# CHECKHOUSE Meeting System 拡張計画
 
-ご要望に基づき、クライアントアプリでのデバイス選択機能の追加と、サーバーGUIの本格的な管理者ダッシュボード化を実施します。
+## 目的
 
-## 1. クライアント：デバイス（カメラ・マイク・スピーカー）選択機能
+既存の WebRTC SFU 構成を、クライアント・サーバー・閲覧用・画面共有専用ソフトの 4 アプリ構成へ拡張する。
 
-クライアントの待機画面（SettingsView）にて、使用する入力・出力デバイスを選択できるように改修します。
+## アプリ構成
 
-*   **デバイスの取得**: `navigator.mediaDevices.enumerateDevices()` を用いて、接続されているカメラ(`videoinput`)、マイク(`audioinput`)、スピーカー(`audiooutput`)のリストを取得します。
-*   **UIの追加**: 待機画面にデバイス選択用のプルダウン（`<select>`）を追加します。
-*   **設定の適用**:
-    *   選択されたカメラ/マイクの `deviceId` を `getUserMedia` の制約パラメータ（`constraints`）に適用し、特定のデバイスでプレビューおよび本会議への送信を行います。
-    *   選択されたスピーカーについては、HTML5の `setSinkId()` API を使用して、受信した音声の出力先デバイスを明示的に切り替えます。
-*   **設定の記憶**: 選択したデバイスのIDを `localStorage` に保存し、次回起動時にも復元されるようにします。
+- `CHECKHOUSE Meeting Client`: 各拠点のカメラ/マイク送受信、チャンネル選択、画面共有閲覧。
+- `CHECKHOUSE Meeting Viewer`: 閲覧専用。全拠点映像と画面共有を監視する。
+- `CHECKHOUSE Meeting Server`: SFU サーバー管理 GUI。チャンネル、端末、版数、更新指示を管理する。
+- `CHECKHOUSE Meeting Screen Share`: 新規。画面共有送信専用で、他拠点の映像・音声は受信しない。
 
-## 2. サーバーGUI：管理者ダッシュボード化
+## 実装済み基盤
 
-現状の「起動/停止とログ表示」のみのシンプルなGUIから、SFUサーバーの運用に必要な情報を網羅した**高度な管理者ダッシュボード**へとアーキテクチャを拡張します。
+- サーバー signaling に `channelId`, `appType`, `appVersion`, producer `source` を追加。
+- `source=screen` の video producer を通常カメラと分離して受信。
+- client/viewer は画面共有をチャンネルに関係なく表示。
+- client は音声のみ同一チャンネルの peer から再生。
+- サーバー GUI でチャンネル一覧、最新版、更新 URL を保存し、サーバー経由で各端末へ配信。
+- サーバー GUI から端末ごとのチャンネル変更とアプリ種別ごとの強制更新指示を送信。
+- 各アプリ下部/サイドバーにバージョン表示。
+- 新規 `screen-share` アプリを追加し、画面全体/アプリケーション選択から画面共有 producer を送信。
 
-### バックエンド（server/index.js）の改修
-*   **IPC通信の導入**: サーバープロセスとGUIプロセス間でリアルタイムにデータをやり取りするため、プロセス間通信（IPC）チャネルを確立します。
-*   **統計情報の送信**: 定期的にCPU使用率、メモリ使用量、現在の接続ピア数、アクティブなプロデューサー/コンシューマー数をGUIへ送信します。
-*   **リモート制御用API**: GUIからの命令（特定ユーザーのキック、全クライアントの一斉再起動など）を受け取るリスナーを追加します。
+## 次段階
 
-### フロントエンド（server-gui/index.html & main.cjs）の改修
-GUI画面をタブ構成に変更し、以下の機能を兼ね備えたプロフェッショナルなUIへと刷新します。
+1. 署名済みインストーラ/DMG/NSIS の配布先を確定する。
+2. 更新 URL のダウンロード、署名検証、OS 別インストール実行を実装する。
+3. サーバー GUI の更新登録 UI に SHA-256 と必須更新フラグを追加する。
+4. チャンネル設定を JSON import/export できるようにする。
+5. Windows/macOS の packaged build で screen-share の画面収録権限と desktopCapturer 動作を確認する。
 
-1.  **ダッシュボード (Dashboard) タブ**
-    *   サーバーの稼働状態（Uptime）
-    *   CPU・メモリ使用量のリアルタイムモニター
-    *   総接続数、映像/音声ストリーム数の統計表示
-2.  **接続管理 (Clients) タブ**
-    *   現在接続している各拠点のリスト一覧（Socket ID, IPアドレス等）
-    *   **Kick（強制切断）ボタン**: 特定の拠点を強制的に切断する機能
-    *   **Force Restart All ボタン**: 全クライアントへ再起動コマンド（`restartCommand`）を一斉送信する機能
-3.  **ログ (Logs) タブ**
-    *   従来のログ表示機能を強化。エラーログと通常ログの色分け、自動スクロール機能などを搭載。
-4.  **設定 (Settings) タブ**
-    *   サーバーディレクトリの選択や、ポート番号などの表示。
+## 検証計画
 
-## Proposed Changes
-
-### クライアント側の変更
-#### [MODIFY] [client/src/pages/SettingsView.jsx](file:///Users/kiroku_keizo/開発/webRTC会議室システム/client/src/pages/SettingsView.jsx)
-デバイス一覧の取得ロジックとプルダウンUIを追加。
-
-#### [MODIFY] [client/src/pages/MainView.jsx](file:///Users/kiroku_keizo/開発/webRTC会議室システム/client/src/pages/MainView.jsx)
-`SettingsView` から渡された `deviceId` を基に `getUserMedia` を実行し、また `setSinkId` で出力スピーカーを設定する処理を追加。
-
-### サーバー側の変更
-#### [MODIFY] [server/index.js](file:///Users/kiroku_keizo/開発/webRTC会議室システム/server/index.js)
-`process.send()` を利用したステータス送信と、`process.on('message')` による強制切断等のコマンド受信ロジックを追加。
-
-#### [MODIFY] [server-gui/main.cjs](file:///Users/kiroku_keizo/開発/webRTC会議室システム/server-gui/main.cjs)
-`spawn` 時の `stdio` に `['pipe', 'pipe', 'pipe', 'ipc']` を追加し、バックエンドサーバーからの統計情報をUIへ中継。
-
-#### [MODIFY] [server-gui/index.html](file:///Users/kiroku_keizo/開発/webRTC会議室システム/server-gui/index.html)
-タブナビゲーションと、各管理者向けウィジェット（モニター、ユーザー表、ログ、コントロール）を備えた高度なUIへ書き換え。
-
-## User Review Required
-> [!IMPORTANT]
-> 1. スピーカー（音声出力）のデバイス変更は、Webの仕様上 `setSinkId` を用いますが、OSや環境によっては制限がかかる場合があります（通常Electron環境では動作します）。
-> 2. 管理者機能について、「特定のクライアントをキック（切断）する」「全クライアントを強制再起動する」などの強い権限を持つボタンを配置しますが、誤操作防止の確認ダイアログなどを設ける設計でよろしいでしょうか？
-> 3. これらの改修後、再度パッケージビルド（コンパイル）を行います。
-
-## Verification Plan
-1. クライアント待機画面で、プルダウンからUSBカメラやマイクを選択し、正しくプレビューに反映されるか確認。
-2. サーバーGUIを起動し、タブの切り替えやダッシュボードの数値がリアルタイムで変動するか確認。
-3. サーバーGUIの「接続管理」タブから再起動コマンドを発行し、クライアントが正しく再起動されるかテスト。
+1. `server` smoke test で signaling、telemetry、systemState、admin command を確認。
+2. `client`, `viewer`, `screen-share` の Vite build を実行。
+3. server-gui からチャンネルを変更し、client の音声 gating と左メニュー反映を確認。
+4. screen-share から画面全体/アプリケーションを共有し、client/viewer に共有画面が表示されることを確認。
+5. macOS arm64 / Windows x64 のパッケージを作成して成果物を検証。

@@ -42,9 +42,28 @@ let isQuitting = false;
 
 const SERVER_RUNTIME_DIR = 'server-runtime';
 const CLIENT_REGISTRY_FILE = 'registered-clients.json';
+const SYSTEM_SETTINGS_FILE = 'system-settings.json';
+const DEFAULT_SYSTEM_SETTINGS = {
+  channels: [
+    { id: 'general', name: '一般' },
+    { id: 'support', name: 'サポート' },
+  ],
+  latestVersions: {
+    client: '0.1.0',
+    viewer: '0.1.0',
+    'screen-share': '0.1.0',
+    server: '1.0.0',
+    'server-gui': '1.0.0',
+  },
+  updatePackages: {},
+};
 
 function clientRegistryPath() {
   return path.join(app.getPath('userData'), CLIENT_REGISTRY_FILE);
+}
+
+function systemSettingsPath() {
+  return path.join(app.getPath('userData'), SYSTEM_SETTINGS_FILE);
 }
 
 function readClientRegistry() {
@@ -59,6 +78,71 @@ function readClientRegistry() {
 function writeClientRegistry(items) {
   fs.mkdirSync(path.dirname(clientRegistryPath()), { recursive: true });
   fs.writeFileSync(clientRegistryPath(), JSON.stringify(items, null, 2));
+}
+
+function stableId(value, fallback = 'general') {
+  const raw = shortText(value, 64).toLowerCase();
+  const normalized = raw
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  return normalized || fallback;
+}
+
+function sanitizeChannels(channels) {
+  if (!Array.isArray(channels)) return DEFAULT_SYSTEM_SETTINGS.channels;
+  const seen = new Set();
+  const items = [];
+  for (const entry of channels.slice(0, 32)) {
+    const id = stableId(entry?.id || entry?.name, '');
+    const name = shortText(entry?.name || id, 48);
+    if (!id || !name || seen.has(id)) continue;
+    seen.add(id);
+    items.push({ id, name });
+  }
+  return items.length ? items : DEFAULT_SYSTEM_SETTINGS.channels;
+}
+
+function sanitizeSystemSettings(input = {}) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const latestVersions = {
+    ...DEFAULT_SYSTEM_SETTINGS.latestVersions,
+    ...(raw.latestVersions && typeof raw.latestVersions === 'object' ? raw.latestVersions : {}),
+  };
+  const updatePackages = raw.updatePackages && typeof raw.updatePackages === 'object'
+    ? raw.updatePackages
+    : {};
+
+  return {
+    channels: sanitizeChannels(raw.channels),
+    latestVersions: Object.fromEntries(Object.entries(latestVersions).map(([key, value]) => [key, shortText(value, 48)])),
+    updatePackages: Object.fromEntries(Object.entries(updatePackages).map(([key, value]) => {
+      const pkg = value && typeof value === 'object' ? value : {};
+      return [key, {
+        version: shortText(pkg.version || latestVersions[key] || '', 48),
+        url: shortText(pkg.url, 1024),
+        notes: shortText(pkg.notes, 1000),
+        sha256: shortText(pkg.sha256, 128),
+        required: !!pkg.required,
+        registeredAt: Number.isFinite(pkg.registeredAt) ? pkg.registeredAt : Date.now(),
+      }];
+    })),
+  };
+}
+
+function readSystemSettings() {
+  try {
+    return sanitizeSystemSettings(JSON.parse(fs.readFileSync(systemSettingsPath(), 'utf8')));
+  } catch {
+    return sanitizeSystemSettings(DEFAULT_SYSTEM_SETTINGS);
+  }
+}
+
+function writeSystemSettings(settings) {
+  const clean = sanitizeSystemSettings(settings);
+  fs.mkdirSync(path.dirname(systemSettingsPath()), { recursive: true });
+  fs.writeFileSync(systemSettingsPath(), JSON.stringify(clean, null, 2));
+  return clean;
 }
 
 function shortText(value, max = 256) {
@@ -149,6 +233,11 @@ function sendToServer(message) {
     safeSend('server-log', `ERROR: サーバープロセスIPC送信失敗: ${err.message}`);
     return false;
   }
+}
+
+function sendSystemSettingsToServer() {
+  const state = readSystemSettings();
+  return sendToServer({ type: 'set-system-state', state });
 }
 
 function killServerTree(pid) {
@@ -256,7 +345,18 @@ ipcMain.handle('get-server-info', () => {
   return {
     bundledServerDir: bundled,
     defaultEnvPath: path.join(bundled, '.env'),
+    systemSettingsPath: systemSettingsPath(),
   };
+});
+
+ipcMain.handle('get-system-settings', () => {
+  return readSystemSettings();
+});
+
+ipcMain.handle('save-system-settings', (_event, rawSettings) => {
+  const settings = writeSystemSettings(rawSettings);
+  if (serverProcess) sendSystemSettingsToServer();
+  return settings;
 });
 
 ipcMain.handle('list-registered-clients', () => {
@@ -497,6 +597,9 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
   });
 
   safeSend('server-status', 'Running');
+  setTimeout(() => {
+    if (serverProcess) sendSystemSettingsToServer();
+  }, 500);
 }
 
 ipcMain.on('start-server', (event, selectedPath) => {
@@ -512,6 +615,13 @@ ipcMain.on('stop-server', () => {
 // Admin commands
 ipcMain.on('kick-client', (event, socketId) => {
   sendToServer({ type: 'kick', socketId });
+});
+
+ipcMain.on('call-client', (_event, socketId) => {
+  if (serverProcess) {
+    safeSend('server-log', `[Admin] 呼び出しを送信: ${socketId}`);
+    sendToServer({ type: 'call-client', socketId });
+  }
 });
 
 ipcMain.on('restart-client', (_event, socketId) => {
@@ -540,6 +650,24 @@ ipcMain.on('set-client-media-state', (_event, payload = {}) => {
 
 ipcMain.on('refresh-client-devices', (_event, socketId) => {
   sendToServer({ type: 'refresh-client-devices', socketId });
+});
+
+ipcMain.on('set-client-channel', (_event, payload = {}) => {
+  const { socketId, channelId } = payload;
+  if (serverProcess) {
+    safeSend('server-log', `[Admin] チャンネル変更を送信: ${socketId} -> ${channelId}`);
+    sendToServer({ type: 'set-client-channel', socketId, channelId });
+  }
+});
+
+ipcMain.on('force-update', (_event, payload = {}) => {
+  const appType = shortText(payload.appType || 'all', 24);
+  if (serverProcess) {
+    safeSend('server-log', `[Admin] 強制アップデート指示を送信: ${appType}`);
+    sendToServer({ type: 'force-update', appType });
+  } else {
+    safeSend('server-log', 'WARN: サーバー未起動のため、強制アップデート指示を送信できません');
+  }
 });
 
 ipcMain.on('restart-all', () => {

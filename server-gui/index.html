@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>SFUサーバー管理ダッシュボード</title>
+  <title>CHECKHOUSE Meeting System Server</title>
   <style>
     :root {
       --bg: #101214;
@@ -187,9 +187,14 @@
       height: 100%;
       min-height: 0;
       padding: 16px;
+      overflow: auto;
+      overscroll-behavior: contain;
     }
     .panel.active { display: flex; flex-direction: column; }
-    .panel.active.dashboard-layout { display: grid; }
+    .panel.active.dashboard-layout {
+      display: grid;
+      overflow: hidden;
+    }
 
     .dashboard-layout {
       grid-template-rows: auto 1fr;
@@ -255,12 +260,21 @@
       min-width: 0;
       overflow: hidden;
       content-visibility: auto;
-      contain-intrinsic-size: 420px;
+      contain-intrinsic-size: 96px;
     }
 
     .client-card.healthy { border-color: rgba(56,217,150,0.45); }
     .client-card.degraded, .client-card.warming { border-color: rgba(246,195,91,0.5); }
     .client-card.stale, .client-card.offline { border-color: rgba(239,91,91,0.5); }
+
+    .client-card > summary {
+      list-style: none;
+      cursor: pointer;
+    }
+
+    .client-card > summary::-webkit-details-marker {
+      display: none;
+    }
 
     .client-head {
       display: grid;
@@ -269,6 +283,14 @@
       padding: 12px;
       border-bottom: 1px solid var(--border);
       background: rgba(255,255,255,0.025);
+    }
+
+    .client-card:not([open]) .client-head {
+      border-bottom: 0;
+    }
+
+    .client-card[open] .client-head {
+      background: rgba(255,255,255,0.045);
     }
 
     .client-title {
@@ -574,8 +596,10 @@
 
     .settings-wrap {
       max-width: 860px;
+      width: 100%;
       display: grid;
       gap: 14px;
+      padding-bottom: 26px;
     }
 
     .settings-row {
@@ -601,6 +625,62 @@
       word-break: break-all;
       margin-bottom: 10px;
       font-size: 0.82rem;
+    }
+
+    .settings-textarea {
+      width: 100%;
+      min-height: 118px;
+      resize: vertical;
+      color: var(--text);
+      background: #080a0d;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      outline: none;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.78rem;
+      line-height: 1.45;
+    }
+
+    .settings-help {
+      color: var(--muted);
+      font-size: 0.72rem;
+      margin-top: 7px;
+    }
+
+    .update-grid {
+      display: grid;
+      gap: 8px;
+    }
+
+    .update-row {
+      display: grid;
+      grid-template-columns: 110px minmax(80px, 120px) minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+    }
+
+    .update-row span {
+      color: var(--muted);
+      font-size: 0.76rem;
+    }
+
+    .update-row input {
+      min-width: 0;
+      min-height: 34px;
+      color: var(--text);
+      background: #11151a;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0 9px;
+      outline: none;
+    }
+
+    .settings-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 12px;
     }
 
     @media (max-width: 760px) {
@@ -638,10 +718,10 @@
   <div class="shell">
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark">SFU</div>
+        <div class="brand-mark">CH</div>
         <div>
-          <div class="brand-title">WebRTC 常時接続 管理ダッシュボード</div>
-          <div class="brand-sub">端末状態、受信監視、デバイス制御</div>
+          <div class="brand-title">CHECKHOUSE Meeting System</div>
+          <div class="brand-sub">サーバー、端末、チャンネル、アップデート管理</div>
         </div>
       </div>
       <div class="top-actions">
@@ -741,6 +821,41 @@
             <label>内蔵サーバー .env</label>
             <div class="path-display" id="envDisplay">Loading...</div>
           </div>
+          <div class="settings-row">
+            <label>システム設定ファイル</label>
+            <div class="path-display" id="systemSettingsPath">Loading...</div>
+          </div>
+          <div class="settings-row">
+            <label>チャンネル設定</label>
+            <textarea id="channelsText" class="settings-textarea" spellcheck="false"></textarea>
+            <div class="settings-help">1行につき「id,表示名」。例: general,一般</div>
+          </div>
+          <div class="settings-row">
+            <label>最新版 / 更新URL</label>
+            <div class="update-grid">
+              <div class="update-row">
+                <span>クライアント</span>
+                <input id="verClient" placeholder="0.1.0">
+                <input id="urlClient" placeholder="https://...">
+              </div>
+              <div class="update-row">
+                <span>閲覧用</span>
+                <input id="verViewer" placeholder="0.1.0">
+                <input id="urlViewer" placeholder="https://...">
+              </div>
+              <div class="update-row">
+                <span>画面共有用</span>
+                <input id="verScreenShare" placeholder="0.1.0">
+                <input id="urlScreenShare" placeholder="https://...">
+              </div>
+            </div>
+            <div class="settings-actions">
+              <button class="btn primary" id="saveSystemSettingsBtn">設定を保存して配信</button>
+              <button class="btn danger" id="forceUpdateClientsBtn">クライアント更新指示</button>
+              <button class="btn danger" id="forceUpdateViewersBtn">閲覧用更新指示</button>
+              <button class="btn danger" id="forceUpdateScreenShareBtn">画面共有更新指示</button>
+            </div>
+          </div>
         </div>
       </section>
     </main>
@@ -757,6 +872,18 @@
     const logOutput = document.getElementById('logOutput');
     const pathDisplay = document.getElementById('pathDisplay');
     const envDisplay = document.getElementById('envDisplay');
+    const systemSettingsPath = document.getElementById('systemSettingsPath');
+    const channelsText = document.getElementById('channelsText');
+    const verClient = document.getElementById('verClient');
+    const verViewer = document.getElementById('verViewer');
+    const verScreenShare = document.getElementById('verScreenShare');
+    const urlClient = document.getElementById('urlClient');
+    const urlViewer = document.getElementById('urlViewer');
+    const urlScreenShare = document.getElementById('urlScreenShare');
+    const saveSystemSettingsBtn = document.getElementById('saveSystemSettingsBtn');
+    const forceUpdateClientsBtn = document.getElementById('forceUpdateClientsBtn');
+    const forceUpdateViewersBtn = document.getElementById('forceUpdateViewersBtn');
+    const forceUpdateScreenShareBtn = document.getElementById('forceUpdateScreenShareBtn');
     const clientCards = document.getElementById('clientCards');
     const clientCardsFull = document.getElementById('clientCardsFull');
     const registeredClientsEl = document.getElementById('registeredClients');
@@ -777,6 +904,12 @@
     let lastCardsHtml = '';
     let deviceSelectHoldUntil = 0;
     let registeredClients = [];
+    const expandedClientIds = new Set();
+    let systemSettings = {
+      channels: [{ id: 'general', name: '一般' }],
+      latestVersions: { client: '0.1.0', viewer: '0.1.0', 'screen-share': '0.1.0' },
+      updatePackages: {},
+    };
     pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
 
     const healthText = {
@@ -858,6 +991,69 @@
     function refreshRegistryDefaults() {
       if (!regServerIp.value && defaultRegistryServerIp()) regServerIp.value = defaultRegistryServerIp();
       if (!regServerPort.value) regServerPort.value = defaultRegistryServerPort();
+    }
+
+    function channelsToText(channels) {
+      const items = Array.isArray(channels) && channels.length ? channels : [{ id: 'general', name: '一般' }];
+      return items.map(channel => `${channel.id},${channel.name}`).join('\n');
+    }
+
+    function textToChannels(text) {
+      const channels = String(text || '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean)
+        .map(line => {
+          const [id, ...nameParts] = line.split(',');
+          return {
+            id: String(id || '').trim(),
+            name: String(nameParts.join(',') || id || '').trim(),
+          };
+        });
+      return channels.length ? channels : [{ id: 'general', name: '一般' }];
+    }
+
+    function renderSystemSettings(settings) {
+      systemSettings = {
+        ...systemSettings,
+        ...(settings || {}),
+        latestVersions: { ...(systemSettings.latestVersions || {}), ...((settings || {}).latestVersions || {}) },
+        updatePackages: { ...(systemSettings.updatePackages || {}), ...((settings || {}).updatePackages || {}) },
+      };
+      channelsText.value = channelsToText(systemSettings.channels);
+      verClient.value = systemSettings.latestVersions?.client || '';
+      verViewer.value = systemSettings.latestVersions?.viewer || '';
+      verScreenShare.value = systemSettings.latestVersions?.['screen-share'] || '';
+      urlClient.value = systemSettings.updatePackages?.client?.url || '';
+      urlViewer.value = systemSettings.updatePackages?.viewer?.url || '';
+      urlScreenShare.value = systemSettings.updatePackages?.['screen-share']?.url || '';
+    }
+
+    function collectSystemSettings() {
+      return {
+        channels: textToChannels(channelsText.value),
+        latestVersions: {
+          ...(systemSettings.latestVersions || {}),
+          client: verClient.value.trim() || '0.1.0',
+          viewer: verViewer.value.trim() || '0.1.0',
+          'screen-share': verScreenShare.value.trim() || '0.1.0',
+        },
+        updatePackages: {
+          ...(systemSettings.updatePackages || {}),
+          client: { ...(systemSettings.updatePackages?.client || {}), version: verClient.value.trim(), url: urlClient.value.trim() },
+          viewer: { ...(systemSettings.updatePackages?.viewer || {}), version: verViewer.value.trim(), url: urlViewer.value.trim() },
+          'screen-share': { ...(systemSettings.updatePackages?.['screen-share'] || {}), version: verScreenShare.value.trim(), url: urlScreenShare.value.trim() },
+        },
+      };
+    }
+
+    function channelOptions(selected) {
+      const channels = Array.isArray(systemSettings.channels) && systemSettings.channels.length
+        ? systemSettings.channels
+        : [{ id: 'general', name: '一般' }];
+      return channels.map(channel => `
+        <option value="${escapeHtml(channel.id)}" ${channel.id === selected ? 'selected' : ''}>${escapeHtml(channel.name)}</option>
+      `).join('');
     }
 
     function registeredStatusChip(client) {
@@ -980,34 +1176,39 @@
       const transports = client.transports || {};
       const isViewer = client.appType === 'viewer';
       const health = client.health || 'warming';
+      const channelId = client.channelId || 'general';
       const videoDisabled = isViewer || !(devices.video || []).length;
       const micDisabled = isViewer || !(devices.audioInput || []).length;
       const speakerDisabled = !(devices.audioOutput || []).length;
       const recvOk = (remote.receivingVideoCount || 0) + (remote.receivingAudioCount || 0);
+      const open = expandedClientIds.has(client.id) || health === 'stale' || health === 'offline';
 
       return `
-        <article class="client-card ${escapeHtml(health)}">
-          <div class="client-head">
+        <details class="client-card ${escapeHtml(health)}" data-socket="${escapeHtml(client.id)}" ${open ? 'open' : ''}>
+          <summary class="client-head">
             <div>
               <div class="client-title">
                 <span class="dot ${escapeHtml(health)}"></span>
                 <span class="client-name">${escapeHtml(client.name || '不明')}</span>
                 <span class="chip blue">${escapeHtml(client.appType || 'client')}</span>
+                <span class="chip">${escapeHtml(client.appVersion || '-')}</span>
               </div>
               <div class="client-meta">${escapeHtml(shortId(client.id))} / ${escapeHtml(client.remoteAddress || '-')}</div>
             </div>
             <div class="client-actions">
+              <button class="mini-btn ok" data-action="call" data-socket="${escapeHtml(client.id)}">呼び出し</button>
               <button class="mini-btn blue" data-action="refresh" data-socket="${escapeHtml(client.id)}">デバイス更新</button>
               <button class="mini-btn danger" data-action="restart" data-socket="${escapeHtml(client.id)}">再構築</button>
               <button class="mini-btn" data-action="kick" data-socket="${escapeHtml(client.id)}">切断</button>
             </div>
-          </div>
+          </summary>
           <div class="client-body">
             <div class="kv-grid">
               <div class="kv"><span>状態</span><strong>${escapeHtml(healthText[health] || health)}</strong></div>
               <div class="kv"><span>最終応答</span><strong>${fmtMs(client.heartbeatAgeMs)}</strong></div>
               <div class="kv"><span>RTT</span><strong>${fmtMs(client.rttMs)}</strong></div>
               <div class="kv"><span>受信OK</span><strong>${recvOk}</strong></div>
+              <div class="kv"><span>チャンネル</span><strong>${escapeHtml(channelId)}</strong></div>
             </div>
 
             <div>
@@ -1034,6 +1235,12 @@
               <div class="section-title">デバイス選択</div>
               <div class="device-grid">
                 <div class="device-control">
+                  <label>チャンネル</label>
+                  <select data-action="channel" data-socket="${escapeHtml(client.id)}" ${isViewer ? 'disabled' : ''}>
+                    ${channelOptions(channelId)}
+                  </select>
+                </div>
+                <div class="device-control">
                   <label>カメラ</label>
                   <select data-action="device" data-socket="${escapeHtml(client.id)}" data-kind="video" ${videoDisabled ? 'disabled' : ''}>
                     ${deviceOptions(devices.video, selected.video, 'カメラ')}
@@ -1059,7 +1266,7 @@
               ${monitorRows(client)}
             </div>
           </div>
-        </article>
+        </details>
       `;
     }
 
@@ -1093,6 +1300,11 @@
 
     function renderStats(stats) {
       latestStats = stats;
+      if (stats.systemState && !document.activeElement?.closest?.('#settings')) {
+        renderSystemSettings(stats.systemState);
+      } else if (stats.systemState) {
+        systemSettings = { ...systemSettings, ...stats.systemState };
+      }
       const clients = stats.clients || [];
       const health = stats.healthCounts || {};
       const receiveOk = clients.reduce((sum, client) => {
@@ -1148,8 +1360,13 @@
       container.addEventListener('click', event => {
         const button = event.target.closest('button[data-action]');
         if (!button) return;
+        event.preventDefault();
+        event.stopPropagation();
         const socketId = button.dataset.socket;
         const action = button.dataset.action;
+        if (action === 'call') {
+          window.api.callClient(socketId);
+        }
         if (action === 'restart' && confirm(`クライアント ${socketId} を再起動しますか？`)) {
           window.api.restartClient(socketId);
         }
@@ -1168,9 +1385,15 @@
 
       container.addEventListener('change', event => {
         const select = event.target.closest('select[data-action="device"]');
-        if (!select) return;
+        const channelSelect = event.target.closest('select[data-action="channel"]');
+        if (!select && !channelSelect) return;
         holdClientCardRender(1200);
-        window.api.setClientDevice(select.dataset.socket, select.dataset.kind, select.value);
+        if (select) {
+          window.api.setClientDevice(select.dataset.socket, select.dataset.kind, select.value);
+        }
+        if (channelSelect) {
+          window.api.setClientChannel(channelSelect.dataset.socket, channelSelect.value);
+        }
         setTimeout(flushDeferredCardStats, 1300);
       });
 
@@ -1187,6 +1410,13 @@
         deviceSelectHoldUntil = Math.max(deviceSelectHoldUntil, Date.now() + 250);
         setTimeout(flushDeferredCardStats, 300);
       });
+
+      container.addEventListener('toggle', event => {
+        const card = event.target.closest?.('.client-card[data-socket]');
+        if (!card) return;
+        if (card.open) expandedClientIds.add(card.dataset.socket);
+        else expandedClientIds.delete(card.dataset.socket);
+      }, true);
     }
 
     wireClientActions(clientCards);
@@ -1259,8 +1489,38 @@
 
     window.api.getServerInfo().then(info => {
       envDisplay.innerText = info.defaultEnvPath || 'Unknown';
+      systemSettingsPath.innerText = info.systemSettingsPath || 'Unknown';
     }).catch(() => {
       envDisplay.innerText = 'Unknown';
+      systemSettingsPath.innerText = 'Unknown';
+    });
+
+    window.api.getSystemSettings().then(renderSystemSettings).catch(err => {
+      appendLog(`WARN: システム設定を読み込めません: ${err.message}`);
+      renderSystemSettings(systemSettings);
+    });
+
+    saveSystemSettingsBtn.addEventListener('click', async () => {
+      saveSystemSettingsBtn.disabled = true;
+      try {
+        const saved = await window.api.saveSystemSettings(collectSystemSettings());
+        renderSystemSettings(saved);
+        appendLog('[Admin] システム設定を保存して配信しました');
+      } catch (err) {
+        appendLog(`ERROR: システム設定の保存に失敗: ${err.message}`);
+      } finally {
+        saveSystemSettingsBtn.disabled = false;
+      }
+    });
+
+    forceUpdateClientsBtn.addEventListener('click', () => {
+      if (confirm('クライアントへアップデート指示を送信しますか？')) window.api.forceUpdate('client');
+    });
+    forceUpdateViewersBtn.addEventListener('click', () => {
+      if (confirm('閲覧用アプリへアップデート指示を送信しますか？')) window.api.forceUpdate('viewer');
+    });
+    forceUpdateScreenShareBtn.addEventListener('click', () => {
+      if (confirm('画面共有用アプリへアップデート指示を送信しますか？')) window.api.forceUpdate('screen-share');
     });
 
     selectBtn.addEventListener('click', async () => {

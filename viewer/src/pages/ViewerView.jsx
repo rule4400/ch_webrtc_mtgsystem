@@ -1,6 +1,15 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { MicOff, MonitorPlay, Settings, Volume2, VolumeX, VideoOff } from 'lucide-react';
+import { Download, Hash, MicOff, MonitorPlay, Settings, Volume2, VolumeX, VideoOff } from 'lucide-react';
 import { ViewerWebRTCManager } from '../services/viewer-webrtc';
+
+const APP_VERSION = '0.1.0';
+const APP_TYPE = 'viewer';
+const DEFAULT_SYSTEM_STATE = {
+  brand: 'CHECKHOUSE Meeting System',
+  channels: [{ id: 'general', name: '一般' }],
+  latestVersions: { [APP_TYPE]: APP_VERSION },
+  updatePackages: {},
+};
 
 function getGridCols(n) {
   if (n <= 1) return 1;
@@ -36,9 +45,9 @@ const defaultViewerConfig = {
 };
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
 
-async function connectWithinStartupWindow(manager, serverUrl, viewerName) {
+async function connectWithinStartupWindow(manager, serverUrl, viewerName, options = {}) {
   let timedOut = false;
-  const connectPromise = manager.connect(serverUrl, viewerName)
+  const connectPromise = manager.connect(serverUrl, viewerName, options)
     .then(() => 'connected')
     .catch((err) => {
       if (timedOut) {
@@ -125,7 +134,7 @@ const VideoCell = React.memo(function VideoCell({
     const video = videoRef.current;
     if (!video) return;
 
-    video.muted = !!speakerMuted;
+    video.muted = !!(speakerMuted || audioPaused);
     if (video.srcObject !== stream) video.srcObject = stream || null;
     if (!stream) return;
 
@@ -148,7 +157,7 @@ const VideoCell = React.memo(function VideoCell({
     };
 
     play();
-  }, [stream, speakerMuted]);
+  }, [stream, speakerMuted, audioPaused]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -208,6 +217,8 @@ export default function ViewerView() {
   const [uiResetToken, setUiResetToken] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem('sfu_viewer_config'));
   const [settingsDraft, setSettingsDraft] = useState(() => sanitizeViewerConfig(loadViewerConfig()));
+  const [systemState, setSystemState] = useState(DEFAULT_SYSTEM_STATE);
+  const [updateNotice, setUpdateNotice] = useState(null);
 
   const managerRef = useRef(null);
   const configRef = useRef({});
@@ -217,6 +228,13 @@ export default function ViewerView() {
   const quickRestartInFlightRef = useRef(false);
   const quickRestartHandlerRef = useRef(null);
   const serverProbeInFlightRef = useRef(false);
+
+  const channels = Array.isArray(systemState.channels) && systemState.channels.length
+    ? systemState.channels
+    : DEFAULT_SYSTEM_STATE.channels;
+  const updatePackage = systemState.updatePackages?.[APP_TYPE] || null;
+  const latestVersion = systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
+  const updateAvailable = latestVersion && latestVersion !== APP_VERSION;
 
   const refreshAudioOutputs = useCallback(async (preferredId = null) => {
     try {
@@ -245,8 +263,10 @@ export default function ViewerView() {
       audioOutDevices,
       selectedAudioOutId,
       viewerName: configRef.current.viewerName || '閲覧端末',
+      systemState,
+      updateNotice,
     };
-  }, [peers, status, error, speakerMuted, audioOutDevices, selectedAudioOutId]);
+  }, [peers, status, error, speakerMuted, audioOutDevices, selectedAudioOutId, systemState, updateNotice]);
 
   const releaseViewerRuntime = useCallback(({ status: nextStatus = 'connecting', updateState = true } = {}) => {
     const manager = managerRef.current;
@@ -259,6 +279,9 @@ export default function ViewerView() {
       manager.onAdminSetDevice = null;
       manager.onAdminSetMediaState = null;
       manager.onAdminRefreshDevices = null;
+      manager.onSystemStateUpdated = null;
+      manager.onPeerChannelChanged = null;
+      manager.onUpdateCommand = null;
       manager.disconnect();
     }
     if (updateState) {
@@ -293,6 +316,13 @@ export default function ViewerView() {
       });
     };
     manager.onConnectionChange = (ok) => setStatus(ok ? 'connected' : 'error');
+    manager.onSystemStateUpdated = (state = {}) => {
+      setSystemState({ ...DEFAULT_SYSTEM_STATE, ...state });
+    };
+    manager.onUpdateCommand = (payload) => {
+      if (payload?.appType && payload.appType !== APP_TYPE && payload.appType !== 'all') return;
+      setUpdateNotice(payload);
+    };
     manager.onRestartCommand = (payload) => quickRestartHandlerRef.current?.(payload);
     manager.onAdminSetDevice = (payload) => {
       if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
@@ -308,7 +338,9 @@ export default function ViewerView() {
     };
 
     const serverUrl = serverUrlFromViewerConfig(config);
-    const connectionState = await connectWithinStartupWindow(manager, serverUrl, config.viewerName);
+    const connectionState = await connectWithinStartupWindow(manager, serverUrl, config.viewerName, {
+      appVersion: APP_VERSION,
+    });
     setStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     setError(null);
     return { manager, connectionState };
@@ -458,6 +490,12 @@ export default function ViewerView() {
     }
   }, [settingsDraft]);
 
+  const openUpdate = useCallback(() => {
+    const url = updateNotice?.packageInfo?.url || updatePackage?.url;
+    if (!url) return;
+    window.electronAPI?.openExternal?.(url);
+  }, [updateNotice, updatePackage]);
+
   useEffect(() => {
     adminHandlersRef.current = {
       setDevice: async ({ kind, deviceId }) => {
@@ -491,20 +529,31 @@ export default function ViewerView() {
       const remotePeers = Array.from((state.peers || new Map()).entries()).map(([socketId, peer]) => {
         const video = peer.stream?.getVideoTracks()[0] || null;
         const audio = peer.stream?.getAudioTracks()[0] || null;
+        const screen = peer.screenStream?.getVideoTracks()[0] || null;
+        const screenAudio = peer.screenStream?.getAudioTracks()[0] || null;
         return {
           socketId,
           name: peer.locationName,
+          channelId: peer.channelId || '',
+          appType: peer.appType || 'client',
           videoPaused: !!peer.videoPaused,
           audioPaused: !!peer.audioPaused,
+          screenPaused: !!peer.screenPaused,
+          screenAudioPaused: !!peer.screenAudioPaused,
           video: trackReport(video),
           audio: trackReport(audio),
+          screen: trackReport(screen),
+          screenAudio: trackReport(screenAudio),
           receivingVideo: !!video && video.readyState === 'live' && !peer.videoPaused,
           receivingAudio: !!audio && audio.readyState === 'live' && !peer.audioPaused,
+          receivingScreen: !!screen && screen.readyState === 'live' && !peer.screenPaused,
+          receivingScreenAudio: !!screenAudio && screenAudio.readyState === 'live' && !peer.screenAudioPaused,
         };
       });
 
       manager.sendTelemetry({
         appType: 'viewer',
+        appVersion: APP_VERSION,
         locationName: state.viewerName,
         status: state.status,
         devices: {
@@ -523,7 +572,7 @@ export default function ViewerView() {
         },
         remoteMonitor: {
           peerCount: remotePeers.length,
-          receivingVideoCount: remotePeers.filter(peer => peer.receivingVideo).length,
+          receivingVideoCount: remotePeers.filter(peer => peer.receivingVideo || peer.receivingScreen).length,
           receivingAudioCount: remotePeers.filter(peer => peer.receivingAudio).length,
           peers: remotePeers,
         },
@@ -539,10 +588,51 @@ export default function ViewerView() {
   }, []);
 
   const peerList = Array.from(peers.entries());
-  const cols = getGridCols(peerList.length || 1);
+  const screenShares = peerList.filter(([, peer]) => (
+    peer.screenProducerId && peer.screenStream?.getVideoTracks().length && !peer.screenPaused
+  ));
+  const totalCells = peerList.length + screenShares.length;
+  const cols = getGridCols(totalCells || 1);
 
   return (
-    <div className="main-layout viewer-layout">
+    <div className="main-layout viewer-layout with-sidebar">
+      <aside className="channel-sidebar">
+        <div className="sidebar-brand">
+          <div className="sidebar-mark">CH</div>
+          <div>
+            <div className="sidebar-title">CHECKHOUSE</div>
+            <div className="sidebar-subtitle">Meeting System</div>
+          </div>
+        </div>
+
+        <div className="channel-section-label">チャンネル</div>
+        <div className="channel-list">
+          {channels.map(channel => (
+            <div key={channel.id} className="channel-item readonly" title={channel.name}>
+              <Hash size={15} />
+              <span>{channel.name}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="sidebar-footer">
+          {updateAvailable && (
+            <button
+              type="button"
+              className="update-mini"
+              onClick={openUpdate}
+              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url}
+              title="アップデート"
+            >
+              <Download size={14} />
+              <span>v{latestVersion}</span>
+            </button>
+          )}
+          <div className="version-line">Viewer v{APP_VERSION}</div>
+        </div>
+      </aside>
+
+      <div className="meeting-stage">
       <div className="header-bar">
         <div className="header-title">閲覧専用モニター</div>
         <div className="header-right">
@@ -659,13 +749,14 @@ export default function ViewerView() {
         className="video-grid"
         style={{ gridTemplateColumns: `repeat(${cols}, 1fr)` }}
       >
-        {peerList.length === 0 ? (
+        {totalCells === 0 ? (
           <div className="viewer-empty">
             <MonitorPlay size={42} color="rgba(255,255,255,0.35)" />
             <div>受信できる拠点映像を待機中</div>
           </div>
         ) : (
-	          peerList.map(([socketId, peer]) => (
+          <>
+	          {peerList.map(([socketId, peer]) => (
 	            <VideoCell
 	              key={`${uiResetToken}-${socketId}`}
 	              label={peer.locationName}
@@ -675,8 +766,21 @@ export default function ViewerView() {
               speakerDeviceId={selectedAudioOutId}
               speakerMuted={speakerMuted}
             />
-          ))
+          ))}
+          {screenShares.map(([socketId, peer]) => (
+            <VideoCell
+              key={`${uiResetToken}-${socketId}-screen`}
+              label={`${peer.locationName} / ${peer.screenLabel || '画面共有'}`}
+              stream={peer.screenStream}
+              videoPaused={peer.screenPaused}
+              audioPaused={!!peer.screenAudioPaused}
+              speakerDeviceId={selectedAudioOutId}
+              speakerMuted={speakerMuted}
+            />
+          ))}
+          </>
         )}
+      </div>
       </div>
     </div>
   );

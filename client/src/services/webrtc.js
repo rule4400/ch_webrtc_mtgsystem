@@ -31,10 +31,20 @@ export class WebRTCManager {
     this.camEnabled      = true;
     this.micEnabled      = true;
 
+    // 画面共有（カメラとは別 Producer。screen-share 専用アプリと同じ appData 規約）
+    this.localScreenVideoTrack = null;
+    this.localScreenAudioTrack = null;
+    this.screenLabel           = '';
+    this.screenProducer        = null;
+    this.screenAudioProducer   = null;
+    this.screenPaused          = false;
+
     this.iceServers      = [];     // サーバーから取得
     this._initialized    = false;
     this._pendingQueue   = [];     // 初期化前に届いた newProducer
     this._locationName   = '';
+    this._channelId      = 'general';
+    this._appVersion     = '0.1.0';
     this._manualDisconnect = false;
     this._setupInFlight = null;
     this._consumeInFlight = new Set();
@@ -45,6 +55,7 @@ export class WebRTCManager {
     this._lastTelemetryAckAt = null;
     this._connectGeneration = 0;
     this._sessionRebuildTimer = null;
+    this._selfSocketId = '';
 
     // コールバック
     this.onPeerUpdated      = null;  // (socketId, peer) => void
@@ -55,12 +66,22 @@ export class WebRTCManager {
     this.onAdminRefreshDevices = null; // () => Promise
     this.onConnectionChange = null;  // (connected: bool) => void
     this.onViewerPresenceChange = null; // (active: bool) => void
+    this.onSystemStateUpdated = null; // (state) => void
+    this.onPeerChannelChanged = null; // (payload) => void
+    this.onUpdateCommand = null;  // (payload) => void
+    this.onPeerJoined = null; // (payload) => void
+    this.onIncomingCall = null; // (payload) => void
+    this.onCallResult = null; // ({ callId, action }) => void 発信した呼び出しの結果
+    this.onCallCancelled = null; // ({ callId }) => void 着信中の呼び出しが取り消された
+    this.onScreenShareEnded = null; // () => void 共有トラック終了（ウィンドウが閉じた等）
   }
 
   // ── 接続（mediasoup 初期化＋ローカル produce まで await）──────────────
 
-  connect(serverUrl, locationName) {
+  connect(serverUrl, locationName, options = {}) {
     this._locationName = locationName;
+    this._channelId = options.channelId || this._channelId || 'general';
+    this._appVersion = options.appVersion || this._appVersion || '0.1.0';
     this._manualDisconnect = false;
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -89,6 +110,7 @@ export class WebRTCManager {
       this.socket.on('connect', async () => {
         const generation = this._connectGeneration + 1;
         this._connectGeneration = generation;
+        this._selfSocketId = this.socket.id || '';
         console.log('[WebRTC] connected', this.socket.id);
         try {
           await this._setupSession();
@@ -113,7 +135,7 @@ export class WebRTCManager {
         this._connectGeneration += 1;
         this._initialized = false;
         this._clearSetupRetry();
-        this._resetMediaSession({ notifyPeers: true });
+        this._resetMediaSession({ notifyPeers: true, keepPeers: false });
         this.onConnectionChange?.(false);
         if (!this._manualDisconnect && reason === 'io server disconnect') {
           setTimeout(() => this.socket?.connect(), 2000);
@@ -137,14 +159,19 @@ export class WebRTCManager {
     if (this._setupInFlight) return this._setupInFlight;
     this._setupInFlight = (async () => {
       this._clearSetupRetry();
-      this.socket.emit('setMetadata', { locationName: this._locationName, appType: 'client' });
+      this.socket.emit('setMetadata', {
+        locationName: this._locationName,
+        appType: 'client',
+        channelId: this._channelId,
+        appVersion: this._appVersion,
+      });
       await this._initMediasoup();
       this._initialized = true;
 
       // 初期化前にキューイングした newProducer を処理
       const queued = this._pendingQueue.splice(0);
       for (const p of queued) {
-        await this._consumePeer(p.producerId, p.socketId, p.locationName, p.kind, p.paused);
+        await this._consumePeer(p.producerId, p.socketId, p.locationName, p.kind, p.paused, p);
       }
 
       // ローカルトラックを（再）produce
@@ -194,7 +221,7 @@ export class WebRTCManager {
       if (this._manualDisconnect || !this.socket?.connected) return;
       console.warn(`[WebRTC] rebuilding media session reason=${reason}`);
       this._initialized = false;
-      this._resetMediaSession({ notifyPeers: true });
+      this._resetMediaSession({ keepPeers: true });
       try {
         await this._setupSession();
         this._setupRetryDelay = 1000;
@@ -212,9 +239,11 @@ export class WebRTCManager {
     this._sessionRebuildTimer = null;
   }
 
-  _resetMediaSession({ notifyPeers = false } = {}) {
+  _resetMediaSession({ notifyPeers = false, keepPeers = false } = {}) {
     try { this.videoProducer?.close(); } catch { /* ignore close errors */ }
     try { this.audioProducer?.close(); } catch { /* ignore close errors */ }
+    try { this.screenProducer?.close(); } catch { /* ignore close errors */ }
+    try { this.screenAudioProducer?.close(); } catch { /* ignore close errors */ }
     this.consumers.forEach(consumer => {
       try { consumer.close(); } catch { /* ignore close errors */ }
     });
@@ -230,22 +259,26 @@ export class WebRTCManager {
     this.recvTransport = null;
     this.videoProducer = null;
     this.audioProducer = null;
+    this.screenProducer = null;
+    this.screenAudioProducer = null;
 
-    if (notifyPeers) {
+    if (notifyPeers && !keepPeers) {
       for (const socketId of this.peers.keys()) this.onPeerRemoved?.(socketId);
     }
-    this.peers.clear();
+    if (!keepPeers) this.peers.clear();
   }
 
   _bindServerEvents() {
-    this.socket.on('newProducer', async ({ producerId, socketId, locationName: name, kind, paused }) => {
+    this.socket.on('newProducer', async ({ producerId, socketId, locationName: name, kind, paused, source, appData, channelId, appType }) => {
+      if (this._isSelfSocket(socketId)) return;
+      const payload = { producerId, socketId, locationName: name, kind, paused, source, appData, channelId, appType };
       if (!this._initialized) {
         if (!this._pendingQueue.find(p => p.producerId === producerId)) {
-          this._pendingQueue.push({ producerId, socketId, locationName: name, kind, paused });
+          this._pendingQueue.push(payload);
         }
         return;
       }
-      await this._consumePeer(producerId, socketId, name, kind, paused);
+      await this._consumePeer(producerId, socketId, name, kind, paused, payload);
     });
 
     this.socket.on('producerClosed', ({ producerId }) => this._handleProducerClosed(producerId));
@@ -256,10 +289,46 @@ export class WebRTCManager {
       this.onViewerPresenceChange?.(!!payload.active);
     });
 
+    this.socket.on('systemStateUpdated', (payload = {}) => {
+      this.onSystemStateUpdated?.(payload);
+    });
+
+    this.socket.on('peerChannelChanged', (payload = {}) => {
+      const socketId = payload.socketId;
+      const peer = this.peers.get(socketId);
+      if (peer) {
+        peer.channelId = payload.channelId || peer.channelId;
+        this.onPeerUpdated?.(socketId, { ...peer });
+      }
+      this.onPeerChannelChanged?.(payload);
+    });
+
+    this.socket.on('peerJoined', (payload = {}) => {
+      this.onPeerJoined?.(payload);
+    });
+
+    this.socket.on('incomingCall', (payload = {}, ack) => {
+      ack?.({ ok: true, receivedAt: Date.now(), socketId: this.socket.id });
+      this.onIncomingCall?.(payload);
+    });
+
+    this.socket.on('callResult', (payload = {}) => {
+      this.onCallResult?.(payload);
+    });
+
+    this.socket.on('callCancelled', (payload = {}) => {
+      this.onCallCancelled?.(payload);
+    });
+
+    this.socket.on('updateCommand', (payload = {}, ack) => {
+      ack?.({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
+      this.onUpdateCommand?.(payload);
+    });
+
     this.socket.on('peerDisconnected', ({ socketId }) => {
       const peer = this.peers.get(socketId);
       if (peer) {
-        for (const pid of [peer.videoProducerId, peer.audioProducerId]) {
+        for (const pid of [peer.videoProducerId, peer.audioProducerId, peer.screenProducerId, peer.screenAudioProducerId]) {
           if (!pid) continue;
           const consumer = this.consumers.get(pid);
           if (consumer) {
@@ -329,18 +398,23 @@ export class WebRTCManager {
     // 古い transport を掃除（再接続時）
     try { this.videoProducer?.close(); } catch { /* ignore close errors */ }
     try { this.audioProducer?.close(); } catch { /* ignore close errors */ }
-    try { this.sendTransport?.close(); } catch { /* ignore close errors */ }
-    try { this.recvTransport?.close(); } catch { /* ignore close errors */ }
+    try { this.screenProducer?.close(); } catch { /* ignore close errors */ }
+    try { this.screenAudioProducer?.close(); } catch { /* ignore close errors */ }
     this.sendTransport = null;
     this.recvTransport = null;
     this.videoProducer = null;
     this.audioProducer = null;
+    this.screenProducer = null;
+    this.screenAudioProducer = null;
     this.consumers.clear();
     // peers の stream は残すが、consumer は再生成される
     for (const peer of this.peers.values()) {
       peer.stream = new MediaStream();
+      peer.screenStream = new MediaStream();
       peer.videoProducerId = null;
       peer.audioProducerId = null;
+      peer.screenProducerId = null;
+      peer.screenAudioProducerId = null;
     }
 
     // サーバー設定（iceServers）取得（任意・失敗しても続行）
@@ -360,7 +434,7 @@ export class WebRTCManager {
     // 既存 Producer を全て消費
     const existing = await this._request('getProducers');
     for (const p of existing) {
-      await this._consumePeer(p.producerId, p.socketId, p.locationName, p.kind, p.paused);
+      await this._consumePeer(p.producerId, p.socketId, p.locationName, p.kind, p.paused, p);
     }
   }
 
@@ -383,7 +457,8 @@ export class WebRTCManager {
     });
     this.sendTransport.on('connectionstatechange', (s) => {
       console.log('[sendTransport]', s);
-      if (s === 'failed' || s === 'disconnected') this._scheduleIceRestart(this.sendTransport, 'sendTransport');
+      if (s === 'failed') this._scheduleIceRestart(this.sendTransport, 'sendTransport', 500);
+      if (s === 'disconnected') this._scheduleIceRestart(this.sendTransport, 'sendTransport', 4500);
     });
   }
 
@@ -396,11 +471,12 @@ export class WebRTCManager {
     });
     this.recvTransport.on('connectionstatechange', (s) => {
       console.log('[recvTransport]', s);
-      if (s === 'failed' || s === 'disconnected') this._scheduleIceRestart(this.recvTransport, 'recvTransport');
+      if (s === 'failed') this._scheduleIceRestart(this.recvTransport, 'recvTransport', 500);
+      if (s === 'disconnected') this._scheduleIceRestart(this.recvTransport, 'recvTransport', 4500);
     });
   }
 
-  _scheduleIceRestart(transport, label) {
+  _scheduleIceRestart(transport, label, delay = 1500) {
     if (!transport || transport.closed) return;
     if (this._iceRestartTimers.has(transport.id)) return;
 
@@ -410,7 +486,7 @@ export class WebRTCManager {
         console.warn(`[${label} restartIce]`, err.message);
         this._scheduleSessionRebuild(`${label}-ice-restart-failed`);
       });
-    }, 1500);
+    }, delay);
     this._iceRestartTimers.set(transport.id, timer);
   }
 
@@ -439,10 +515,22 @@ export class WebRTCManager {
       this.audioProducer = await this._produceTrack(this.localAudioTrack, 'audio');
       if (!this.micEnabled) await this._pauseProducer(this.audioProducer);
     }
+    // 画面共有中に再接続した場合は共有も復元する
+    try {
+      await this._reproduceScreen();
+    } catch (err) {
+      console.warn('[reproduceScreen]', err.message);
+    }
   }
 
   async _produceTrack(track, kind) {
-    const params = { track };
+    const params = {
+      track,
+      appData: {
+        source: kind === 'video' ? 'camera' : 'microphone',
+        channelId: this._channelId,
+      },
+    };
     if (kind === 'video') {
       params.encodings = [
         { rid: 'r0', maxBitrate: 150_000, scaleResolutionDownBy: 4 },
@@ -504,6 +592,162 @@ export class WebRTCManager {
     else         await this._pauseProducer(this.audioProducer);
   }
 
+  async setChannel(channelId) {
+    this._channelId = channelId || this._channelId || 'general';
+    if (!this.socket?.connected) return { channelId: this._channelId };
+    const result = await this._request('setChannel', { channelId: this._channelId });
+    if (result?.channelId) this._channelId = result.channelId;
+    return result;
+  }
+
+  async createChannel(name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) throw new Error('channel name is required');
+    const result = await this._request('createChannel', { name: trimmed });
+    return result;
+  }
+
+  async updateChannel(channelId, name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) throw new Error('channel name is required');
+    return this._request('updateChannel', { channelId, name: trimmed });
+  }
+
+  async deleteChannel(channelId) {
+    return this._request('deleteChannel', { channelId });
+  }
+
+  async movePeerToChannel(targetSocketId, channelId) {
+    return this._request('movePeerToChannel', { targetSocketId, channelId });
+  }
+
+  async callPeer(targetSocketId) {
+    return this._request('callPeer', { targetSocketId });
+  }
+
+  /** 着信への応答/拒否をサーバーへ通知し、発信側の鳴動表示を止める */
+  async ackCall(callId, action) {
+    if (!callId) return { ok: false };
+    return this._request('callAck', { callId, action: action === 'answered' ? 'answered' : 'dismissed' });
+  }
+
+  /** 発信した呼び出しをキャンセルし、相手の鳴動を止める */
+  async cancelCall(callId) {
+    if (!callId) return { ok: false };
+    return this._request('callCancel', { callId });
+  }
+
+  // ── 画面共有（送信側）─────────────────────────────────────
+  // screen-share 専用アプリと同じ appData 規約（source: 'screen' / 'screen-audio', label）
+  // を使うため、受信側（Client / Viewer / 旧バージョン）はそのまま表示できる。
+
+  async startScreenShare(videoTrack, label, audioTrack = null) {
+    if (!this.sendTransport) throw new Error('サーバー未接続のため画面共有を開始できません');
+    if (!videoTrack) throw new Error('共有映像を取得できませんでした');
+    await this.stopScreenShare({ stopTracks: false });
+
+    this.localScreenVideoTrack = videoTrack;
+    this.localScreenAudioTrack = audioTrack || null;
+    this.screenLabel = label || videoTrack.label || '画面共有';
+    this.screenPaused = false;
+    await this._reproduceScreen();
+  }
+
+  async _reproduceScreen() {
+    if (!this.sendTransport || !this.localScreenVideoTrack) return;
+    if (this.localScreenVideoTrack.readyState !== 'live') {
+      this.localScreenVideoTrack = null;
+      this.localScreenAudioTrack = null;
+      return;
+    }
+
+    this.screenProducer = await this.sendTransport.produce({
+      track: this.localScreenVideoTrack,
+      appData: {
+        source: 'screen',
+        label: this.screenLabel || '画面共有',
+        channelId: this._channelId,
+      },
+      encodings: [
+        { rid: 'r0', maxBitrate: 600_000, scaleResolutionDownBy: 2 },
+        { rid: 'r1', maxBitrate: 1_800_000 },
+      ],
+      codecOptions: { videoGoogleStartBitrate: 1200 },
+    });
+    this.screenProducer.on('transportclose', () => { this.screenProducer = null; });
+    this.screenProducer.on('trackended', () => {
+      // 共有元のウィンドウが閉じられた等。共有を終了してUIへ通知する。
+      this.stopScreenShare().catch(() => {});
+      this.onScreenShareEnded?.();
+    });
+
+    if (this.localScreenAudioTrack && this.localScreenAudioTrack.readyState === 'live') {
+      this.screenAudioProducer = await this.sendTransport.produce({
+        track: this.localScreenAudioTrack,
+        appData: {
+          source: 'screen-audio',
+          label: this.screenLabel || '画面共有音声',
+          channelId: this._channelId,
+        },
+        codecOptions: { opusStereo: 1, opusDtx: 1 },
+      });
+      this.screenAudioProducer.on('transportclose', () => { this.screenAudioProducer = null; });
+    }
+
+    if (this.screenPaused) {
+      await this.setScreenSharePaused(true);
+    }
+  }
+
+  async setScreenSharePaused(paused) {
+    this.screenPaused = !!paused;
+    for (const producer of [this.screenProducer, this.screenAudioProducer]) {
+      if (!producer) continue;
+      if (paused) await this._pauseProducer(producer);
+      else        await this._resumeProducer(producer);
+    }
+  }
+
+  async setScreenAudioEnabled(enabled) {
+    if (!this.screenAudioProducer) return;
+    if (enabled) await this._resumeProducer(this.screenAudioProducer);
+    else         await this._pauseProducer(this.screenAudioProducer);
+  }
+
+  async stopScreenShare({ stopTracks = true } = {}) {
+    const producers = [this.screenProducer, this.screenAudioProducer].filter(Boolean);
+    const tracks = [this.localScreenVideoTrack, this.localScreenAudioTrack].filter(Boolean);
+    this.screenProducer = null;
+    this.screenAudioProducer = null;
+    this.localScreenVideoTrack = null;
+    this.localScreenAudioTrack = null;
+    this.screenLabel = '';
+    this.screenPaused = false;
+
+    for (const producer of producers) {
+      const producerId = producer.id;
+      try { producer.close(); } catch { /* ignore close errors */ }
+      try {
+        if (this.socket?.connected) await this._request('closeProducer', { producerId });
+      } catch {
+        // サーバー側は transport close でも掃除される
+      }
+    }
+    if (stopTracks) {
+      for (const track of tracks) {
+        try { track.stop(); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  isScreenSharing() {
+    return !!this.screenProducer && !this.screenProducer.closed;
+  }
+
+  async getSystemState() {
+    return this._request('getSystemState');
+  }
+
   async _pauseProducer(p) {
     if (!p || p.paused) return;
     p.pause();
@@ -518,7 +762,8 @@ export class WebRTCManager {
 
   // ── 受信 ─────────────────────────────────────────────────
 
-  async _consumePeer(producerId, socketId, locationName, kind, paused) {
+  async _consumePeer(producerId, socketId, locationName, kind, paused, metadata = {}) {
+    if (this._isSelfSocket(socketId)) return;
     if (!this.recvTransport) { console.warn('[consume] recvTransport not ready'); return; }
     if (this.consumers.has(producerId)) return; // 重複消費を防ぐ
     if (this._consumeInFlight.has(producerId)) return;
@@ -543,18 +788,45 @@ export class WebRTCManager {
       if (!peer) {
         peer = {
           locationName:    locationName || '不明',
+          appType:         metadata.appType || 'client',
+          appVersion:      metadata.appVersion || '',
+          channelId:       metadata.peerChannelId || metadata.channelId || 'general',
           stream:          new MediaStream(),
+          screenStream:    new MediaStream(),
           videoProducerId: null,
           audioProducerId: null,
+          screenProducerId: null,
+          screenAudioProducerId: null,
           videoPaused:     false,
           audioPaused:     false,
+          screenPaused:    false,
+          screenAudioPaused: false,
+          screenLabel:     '',
         };
         this.peers.set(socketId, peer);
       }
       if (locationName) peer.locationName = locationName;
-      peer.stream.addTrack(consumer.track);
-      if (kind === 'video') { peer.videoProducerId = producerId; peer.videoPaused = !!paused; }
-      else                  { peer.audioProducerId = producerId; peer.audioPaused = !!paused; }
+      if (metadata.appType) peer.appType = metadata.appType;
+      if (metadata.appVersion) peer.appVersion = metadata.appVersion;
+      if (metadata.peerChannelId || metadata.channelId) peer.channelId = metadata.peerChannelId || metadata.channelId;
+
+      const appData = metadata.appData || {};
+      const source = metadata.source || appData.source || (kind === 'video' ? 'camera' : 'microphone');
+      if (kind === 'video' && source === 'screen') {
+        peer.screenStream.addTrack(consumer.track);
+        peer.screenProducerId = producerId;
+        peer.screenPaused = !!paused;
+        peer.screenLabel = appData.label || appData.sourceName || '画面共有';
+      } else if (kind === 'audio' && source === 'screen-audio') {
+        peer.screenStream.addTrack(consumer.track);
+        peer.screenAudioProducerId = producerId;
+        peer.screenAudioPaused = !!paused;
+        peer.screenLabel = peer.screenLabel || appData.label || appData.sourceName || '画面共有';
+      } else {
+        peer.stream.addTrack(consumer.track);
+        if (kind === 'video') { peer.videoProducerId = producerId; peer.videoPaused = !!paused; }
+        else                  { peer.audioProducerId = producerId; peer.audioPaused = !!paused; }
+      }
 
       this.onPeerUpdated?.(socketId, { ...peer, stream: peer.stream });
       console.log(`[consume] ${socketId} ${kind} ok`);
@@ -567,6 +839,7 @@ export class WebRTCManager {
 
   _handleProducerClosed(producerId) {
     const consumer = this.consumers.get(producerId);
+    const closedTrack = consumer?.track || null;
     if (consumer) {
       try { consumer.close(); } catch { /* ignore close errors */ }
       this.consumers.delete(producerId);
@@ -574,6 +847,24 @@ export class WebRTCManager {
     for (const [socketId, peer] of this.peers) {
       if (peer.videoProducerId === producerId) { peer.videoProducerId = null; this.onPeerUpdated?.(socketId, { ...peer }); break; }
       if (peer.audioProducerId === producerId) { peer.audioProducerId = null; this.onPeerUpdated?.(socketId, { ...peer }); break; }
+      if (peer.screenAudioProducerId === producerId) {
+        peer.screenAudioProducerId = null;
+        peer.screenAudioPaused = true;
+        if (closedTrack) {
+          try { peer.screenStream?.removeTrack(closedTrack); } catch { /* ignore */ }
+        }
+        this.onPeerUpdated?.(socketId, { ...peer });
+        break;
+      }
+      if (peer.screenProducerId === producerId) {
+        peer.screenProducerId = null;
+        peer.screenPaused = true;
+        peer.screenAudioProducerId = null;
+        peer.screenAudioPaused = true;
+        peer.screenStream = new MediaStream();
+        this.onPeerUpdated?.(socketId, { ...peer });
+        break;
+      }
     }
   }
 
@@ -582,6 +873,8 @@ export class WebRTCManager {
     if (!peer) return;
     if (peer.videoProducerId === producerId) peer.videoPaused = paused;
     if (peer.audioProducerId === producerId) peer.audioPaused = paused;
+    if (peer.screenProducerId === producerId) peer.screenPaused = paused;
+    if (peer.screenAudioProducerId === producerId) peer.screenAudioPaused = paused;
     this.onPeerUpdated?.(socketId, { ...peer });
   }
 
@@ -593,13 +886,22 @@ export class WebRTCManager {
       const peerList = await this._request('getPeers');
 
       for (const peer of peerList) {
-        if (peer.isSelf) continue;
-        for (const { producerId, kind, paused } of peer.producers) {
-          await this._consumePeer(producerId, peer.socketId, peer.locationName, kind, paused);
+        if (peer.isSelf || this._isSelfSocket(peer.socketId)) continue;
+        for (const producer of peer.producers) {
+          await this._consumePeer(
+            producer.producerId,
+            peer.socketId,
+            peer.locationName,
+            producer.kind,
+            producer.paused,
+            { ...producer, appType: peer.appType, appVersion: peer.appVersion, peerChannelId: peer.channelId },
+          );
         }
       }
 
-      const active = new Set(peerList.filter(p => !p.isSelf).map(p => p.socketId));
+      const active = new Set(peerList
+        .filter(p => !p.isSelf && !this._isSelfSocket(p.socketId) && (p.producers.length > 0 || p.appType !== 'screen-share'))
+        .map(p => p.socketId));
       for (const [socketId] of this.peers) {
         if (!active.has(socketId)) {
           this.peers.delete(socketId);
@@ -608,20 +910,31 @@ export class WebRTCManager {
       }
 
       for (const peer of peerList) {
-        if (peer.isSelf) continue;
+        if (peer.isSelf || this._isSelfSocket(peer.socketId)) continue;
         const localPeer = this.peers.get(peer.socketId);
         if (!localPeer) continue;
         if (peer.locationName && localPeer.locationName !== peer.locationName) {
           localPeer.locationName = peer.locationName;
           this.onPeerUpdated?.(peer.socketId, { ...localPeer });
         }
-        for (const { kind, paused } of peer.producers) {
-          if (kind === 'video' && localPeer.videoPaused !== !!paused) {
-            localPeer.videoPaused = !!paused;
+        if (peer.channelId && localPeer.channelId !== peer.channelId) {
+          localPeer.channelId = peer.channelId;
+          this.onPeerUpdated?.(peer.socketId, { ...localPeer });
+        }
+        for (const producer of peer.producers) {
+          const source = producer.source || producer.appData?.source || (producer.kind === 'video' ? 'camera' : 'microphone');
+          if (producer.kind === 'video' && source === 'screen' && localPeer.screenPaused !== !!producer.paused) {
+            localPeer.screenPaused = !!producer.paused;
+            this.onPeerUpdated?.(peer.socketId, { ...localPeer });
+          } else if (producer.kind === 'video' && localPeer.videoPaused !== !!producer.paused) {
+            localPeer.videoPaused = !!producer.paused;
             this.onPeerUpdated?.(peer.socketId, { ...localPeer });
           }
-          if (kind === 'audio' && localPeer.audioPaused !== !!paused) {
-            localPeer.audioPaused = !!paused;
+          if (producer.kind === 'audio' && source === 'screen-audio' && localPeer.screenAudioPaused !== !!producer.paused) {
+            localPeer.screenAudioPaused = !!producer.paused;
+            this.onPeerUpdated?.(peer.socketId, { ...localPeer });
+          } else if (producer.kind === 'audio' && localPeer.audioPaused !== !!producer.paused) {
+            localPeer.audioPaused = !!producer.paused;
             this.onPeerUpdated?.(peer.socketId, { ...localPeer });
           }
         }
@@ -638,6 +951,8 @@ export class WebRTCManager {
     const sentAt = Date.now();
     const payload = {
       ...report,
+      appVersion: report.appVersion || this._appVersion,
+      channelId: report.channelId || this._channelId,
       clientTime: sentAt,
       connection: {
         ...(report.connection || {}),
@@ -692,6 +1007,10 @@ export class WebRTCManager {
     });
   }
 
+  _isSelfSocket(socketId) {
+    return !!socketId && (socketId === this._selfSocketId || socketId === this.socket?.id);
+  }
+
   isSocketConnected() {
     return !!this.socket?.connected;
   }
@@ -714,7 +1033,7 @@ export class WebRTCManager {
     this._initialized = false;
     this._clearSetupRetry();
     this._clearSessionRebuild();
-    this._resetMediaSession({ notifyPeers: true });
+    this._resetMediaSession({ notifyPeers: true, keepPeers: false });
     this.socket?.disconnect();
   }
 }

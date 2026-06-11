@@ -1,7 +1,8 @@
-const { app, BrowserWindow, ipcMain, session } = require('electron');
+const { app, BrowserWindow, ipcMain, session, shell } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const { pathToFileURL } = require('url');
+const { readWindowState, trackWindowState, applyWindowState } = require('./window-state.cjs');
 
 let mainWindow;
 let restartInProgress = false;
@@ -58,9 +59,13 @@ function loadProductionApp() {
 }
 
 function createWindow() {
+  const windowState = readWindowState({ width: 1280, height: 800 });
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 800,
+    width: windowState.width,
+    height: windowState.height,
+    ...(Number.isFinite(windowState.x) && Number.isFinite(windowState.y)
+      ? { x: windowState.x, y: windowState.y }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -69,6 +74,10 @@ function createWindow() {
       autoplayPolicy: 'no-user-gesture-required',
     },
   });
+
+  // 終了時の状態（最大化・全画面・位置サイズ）を復元し、以後の変化を保存する
+  applyWindowState(mainWindow, windowState);
+  trackWindowState(mainWindow);
 
   const isDev = process.env.NODE_ENV === 'development';
 
@@ -140,6 +149,13 @@ app.on('window-all-closed', () => {
 
 ipcMain.on('restart-app', () => {
   restartApp();
+});
+
+ipcMain.handle('open-external', async (_event, url) => {
+  const target = String(url || '').trim();
+  if (!/^https?:\/\//i.test(target)) throw new Error('invalid update url');
+  await shell.openExternal(target);
+  return true;
 });
 
 ipcMain.on('quick-restart-result', (_event, result) => {
