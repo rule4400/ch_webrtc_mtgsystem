@@ -56,7 +56,121 @@ const DEFAULT_SYSTEM_SETTINGS = {
     'server-gui': '1.0.0',
   },
   updatePackages: {},
+  updateFolder: '',
 };
+
+// ── アップデート配布フォルダ ──────────────────────────────
+// ファイル名からアプリ種別とバージョンを自動判別する。
+// 例: CHECKHOUSE-Meeting-Client-0.3.0-arm64.dmg → client / 0.3.0
+
+const UPDATE_FILE_EXT = /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i;
+let updateFolderWatcher = null;
+let updateFolderScanTimer = null;
+
+function detectAppTypeFromFilename(name) {
+  const lower = String(name || '').toLowerCase();
+  if (/screen[-_ ]?share/.test(lower)) return 'screen-share';
+  if (lower.includes('viewer')) return 'viewer';
+  if (lower.includes('client')) return 'client';
+  if (/server[-_ ]?gui/.test(lower)) return 'server-gui';
+  if (lower.includes('server')) return 'server';
+  return null;
+}
+
+function detectVersionFromFilename(name) {
+  const match = String(name || '').match(/(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?)/);
+  return match ? match[1] : '';
+}
+
+function scanUpdateFolder(dir) {
+  const result = { folder: dir || '', files: [], packages: {} };
+  if (!dir || !fs.existsSync(dir)) return result;
+
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter(name => UPDATE_FILE_EXT.test(name));
+  } catch (err) {
+    safeSend('server-log', `WARN: アップデートフォルダを読み取れません: ${err.message}`);
+    return result;
+  }
+
+  for (const name of names) {
+    let stat;
+    try {
+      stat = fs.statSync(path.join(dir, name));
+    } catch {
+      continue;
+    }
+    const appType = detectAppTypeFromFilename(name);
+    const version = detectVersionFromFilename(name);
+    const file = { name, appType, version, size: stat.size, mtimeMs: stat.mtimeMs };
+    result.files.push(file);
+
+    if (!appType || !version) continue;
+    const existing = result.packages[appType];
+    // 同一アプリが複数ある場合は新しい mtime を採用
+    if (!existing || stat.mtimeMs > existing.mtimeMs) {
+      result.packages[appType] = {
+        version,
+        url: `/updates/${encodeURIComponent(name)}`,
+        notes: `自動検出: ${name}`,
+        fileName: name,
+        mtimeMs: stat.mtimeMs,
+      };
+    }
+  }
+  return result;
+}
+
+/** スキャン結果を system-settings に反映し、稼働中サーバーへも配信する */
+function applyUpdateScan(dir, { announce = true } = {}) {
+  const scan = scanUpdateFolder(dir);
+  const settings = readSystemSettings();
+  settings.updateFolder = dir || '';
+
+  for (const [appType, pkg] of Object.entries(scan.packages)) {
+    settings.latestVersions[appType] = pkg.version;
+    settings.updatePackages[appType] = {
+      ...(settings.updatePackages[appType] || {}),
+      version: pkg.version,
+      url: pkg.url,
+      notes: pkg.notes,
+      registeredAt: Date.now(),
+    };
+  }
+
+  const saved = writeSystemSettings(settings);
+  if (serverProcess) {
+    sendToServer({ type: 'set-update-dir', dir: dir || '' });
+    sendSystemSettingsToServer();
+  }
+  if (announce) {
+    const detected = Object.entries(scan.packages)
+      .map(([appType, pkg]) => `${appType}=${pkg.version}`)
+      .join(', ');
+    safeSend('server-log', `[Updates] フォルダスキャン完了: ${scan.files.length}ファイル ${detected ? `(${detected})` : '(配布対象なし)'}`);
+  }
+  safeSend('update-scan-result', { ...scan, settings: saved });
+  return { ...scan, settings: saved };
+}
+
+function watchUpdateFolder(dir) {
+  if (updateFolderWatcher) {
+    try { updateFolderWatcher.close(); } catch { /* ignore */ }
+    updateFolderWatcher = null;
+  }
+  if (!dir || !fs.existsSync(dir)) return;
+
+  try {
+    updateFolderWatcher = fs.watch(dir, () => {
+      // 連続イベントをまとめて1.5秒後に自動再スキャン（自動取得）
+      clearTimeout(updateFolderScanTimer);
+      updateFolderScanTimer = setTimeout(() => applyUpdateScan(dir), 1500);
+    });
+  } catch (err) {
+    safeSend('server-log', `WARN: アップデートフォルダの監視を開始できません: ${err.message}`);
+  }
+}
 
 function clientRegistryPath() {
   return path.join(app.getPath('userData'), CLIENT_REGISTRY_FILE);
@@ -115,6 +229,7 @@ function sanitizeSystemSettings(input = {}) {
 
   return {
     channels: sanitizeChannels(raw.channels),
+    updateFolder: shortText(raw.updateFolder, 1024),
     latestVersions: Object.fromEntries(Object.entries(latestVersions).map(([key, value]) => [key, shortText(value, 48)])),
     updatePackages: Object.fromEntries(Object.entries(updatePackages).map(([key, value]) => {
       const pkg = value && typeof value === 'object' ? value : {};
@@ -359,6 +474,30 @@ ipcMain.handle('save-system-settings', (_event, rawSettings) => {
   return settings;
 });
 
+ipcMain.handle('select-update-folder', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory'],
+    title: 'アップデートファイルの配布フォルダを選択',
+  });
+  if (result.canceled) return null;
+  const dir = result.filePaths[0];
+  const scan = applyUpdateScan(dir);
+  watchUpdateFolder(dir);
+  return scan;
+});
+
+ipcMain.handle('scan-update-folder', () => {
+  const dir = readSystemSettings().updateFolder;
+  if (!dir) return { folder: '', files: [], packages: {}, settings: readSystemSettings() };
+  watchUpdateFolder(dir);
+  return applyUpdateScan(dir);
+});
+
+ipcMain.handle('clear-update-folder', () => {
+  watchUpdateFolder(null);
+  return applyUpdateScan('');
+});
+
 ipcMain.handle('list-registered-clients', () => {
   return readClientRegistry().map(publicRegisteredClient);
 });
@@ -598,7 +737,13 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
 
   safeSend('server-status', 'Running');
   setTimeout(() => {
-    if (serverProcess) sendSystemSettingsToServer();
+    if (!serverProcess) return;
+    sendSystemSettingsToServer();
+    const updateFolder = readSystemSettings().updateFolder;
+    if (updateFolder) {
+      sendToServer({ type: 'set-update-dir', dir: updateFolder });
+      watchUpdateFolder(updateFolder);
+    }
   }, 500);
 }
 

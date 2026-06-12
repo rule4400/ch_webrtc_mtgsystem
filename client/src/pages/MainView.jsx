@@ -91,6 +91,7 @@ const VideoCell = React.memo(function VideoCell({
   tileId = '',
   focused = false,
   compact = false,
+  mini = false,
   dimmed = false,
   canFocus = true,
   canControlVolume = false,
@@ -163,7 +164,7 @@ const VideoCell = React.memo(function VideoCell({
 
   return (
     <div
-      className={`video-cell ${focused ? 'focused' : ''} ${compact ? 'compact' : ''} ${dimmed ? 'dimmed' : ''}`}
+      className={`video-cell ${focused ? 'focused' : ''} ${compact ? 'compact' : ''} ${mini ? 'mini' : ''} ${dimmed ? 'dimmed' : ''}`}
       style={{ outline: isSelf ? '2px solid #4ade80' : '2px solid rgba(255,255,255,0.08)' }}
       onDoubleClick={() => canFocus && onFocus?.(tileId)}
       onContextMenu={(event) => {
@@ -682,6 +683,7 @@ export default function MainView() {
   const softRestartHandlerRef = useRef(null);
   const serverProbeInFlightRef = useRef(false);
   const speakerMutedRef = useRef(false);
+  const sendTelemetryRef = useRef(null);
   const joinAudioRef = useRef(null);
   const callAudioRef = useRef(null);
   const incomingCallTimerRef = useRef(null);
@@ -1048,6 +1050,11 @@ export default function MainView() {
     systemState,
     updateNotice,
   ]);
+
+  // 状態変更を次のレンダリング反映後すぐサーバーへ通知する（サーバー監視のリアルタイム性向上）
+  const flushTelemetrySoon = useCallback(() => {
+    setTimeout(() => sendTelemetryRef.current?.(), 150);
+  }, []);
 
   // ─── デバイス一覧を取得 ──────────────────────────────────
   const refreshDevices = useCallback(async () => {
@@ -1447,35 +1454,40 @@ export default function MainView() {
 
       if (type === 'video')   setSelectedVideoId(deviceId);
       if (type === 'audioIn') setSelectedAudioInId(deviceId);
+      flushTelemetrySoon();
     } catch (err) {
       console.error('[changeDevice]', err);
     }
-  }, [installLocalStream, selectedVideoId, selectedAudioInId]);
+  }, [installLocalStream, selectedVideoId, selectedAudioInId, flushTelemetrySoon]);
 
   const changeSpeaker = useCallback((deviceId) => {
     setSelectedAudioOutId(deviceId);
     const conf = { ...configRef.current, selectedAudioOutId: deviceId };
     configRef.current = conf;
     localStorage.setItem('sfu_config', JSON.stringify(conf));
-  }, []);
+    flushTelemetrySoon();
+  }, [flushTelemetrySoon]);
 
   const setCameraEnabled = useCallback(async (enabled) => {
     const next = !!enabled;
     streamRef.current?.getVideoTracks().forEach(t => (t.enabled = next));
     setCamEnabled(next);
     await webrtcRef.current?.setCamEnabled(next);
-  }, []);
+    flushTelemetrySoon();
+  }, [flushTelemetrySoon]);
 
   const setMicrophoneEnabled = useCallback(async (enabled) => {
     const next = !!enabled;
     streamRef.current?.getAudioTracks().forEach(t => (t.enabled = next));
     setMicEnabled(next);
     await webrtcRef.current?.setMicEnabled(next);
-  }, []);
+    flushTelemetrySoon();
+  }, [flushTelemetrySoon]);
 
   const setSpeakerOutputEnabled = useCallback((enabled) => {
     setSpeakerMuted(!enabled);
-  }, []);
+    flushTelemetrySoon();
+  }, [flushTelemetrySoon]);
 
   useEffect(() => {
     adminHandlersRef.current = {
@@ -1599,9 +1611,13 @@ export default function MainView() {
       });
     };
 
+    sendTelemetryRef.current = sendTelemetry;
     sendTelemetry();
-    const id = setInterval(sendTelemetry, 2000);
-    return () => clearInterval(id);
+    const id = setInterval(sendTelemetry, 1000);
+    return () => {
+      clearInterval(id);
+      sendTelemetryRef.current = null;
+    };
   }, []);
 
   // ─── カメラ ON/OFF ────────────────────────────────────────
@@ -1864,8 +1880,13 @@ export default function MainView() {
   }, [sidebarCollapsed, sidebarWidth]);
 
   const openUpdate = useCallback(() => {
-    const url = updateNotice?.packageInfo?.url || updatePackage?.url;
+    let url = updateNotice?.packageInfo?.url || updatePackage?.url;
     if (!url) return;
+    // サーバー配布の相対パス（/updates/...）は接続中サーバーのURLで解決する
+    if (!/^https?:\/\//i.test(url)) {
+      const base = serverUrlFromConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+      url = `${base}${url.startsWith('/') ? '' : '/'}${url}`;
+    }
     window.electronAPI?.openExternal?.(url);
   }, [updateNotice, updatePackage]);
 
@@ -1976,6 +1997,7 @@ export default function MainView() {
       audioPaused: !micEnabled,
       speakerMuted: false,
       sameChannel: true,
+      channelId: activeChannelId,
       canControlVolume: false,
       baseVolume: 0,
       sortRank: 0,
@@ -1995,6 +2017,7 @@ export default function MainView() {
         audioPaused: !screenShare.hasAudio || !screenShare.audioEnabled,
         speakerMuted: true,
         sameChannel: true,
+        channelId: activeChannelId,
         canControlVolume: false,
         baseVolume: 0,
         sortRank: 2,
@@ -2018,6 +2041,7 @@ export default function MainView() {
           speakerDeviceId: selectedAudioOutId,
           speakerMuted: speakerMuted || !sameChannel,
           sameChannel,
+          channelId: peerChannelId,
           canControlVolume: true,
           baseVolume: remoteAudioVolume,
           sortRank: sameChannel ? 1 : 3,
@@ -2037,6 +2061,7 @@ export default function MainView() {
           speakerDeviceId: selectedAudioOutId,
           speakerMuted,
           sameChannel: true,
+          channelId: peerChannelId,
           canControlVolume: true,
           baseVolume: remoteAudioVolume,
           sortRank: 2,
@@ -2063,18 +2088,48 @@ export default function MainView() {
     uiResetToken,
   ]);
 
+  // ── チャンネル別グルーピング ──
+  //   メイン: 自チャンネルのカメラON・画面共有タイル（大きく表示）
+  //   ドック: 自チャンネルのカメラOFFタイル（小さくアイコン表示。ONになれば即メインへ戻る）
+  //   右レール: 他チャンネルのタイルをチャンネルごとにまとめて表示
+  const { mainTiles, camOffDockTiles, otherChannelGroups } = useMemo(() => {
+    const main = [];
+    const dock = [];
+    const groupsMap = new Map();
+
+    for (const tile of videoTiles) {
+      if (!tile.sameChannel) {
+        const groupId = tile.channelId || 'general';
+        if (!groupsMap.has(groupId)) groupsMap.set(groupId, []);
+        groupsMap.get(groupId).push(tile);
+        continue;
+      }
+      if (tile.videoPaused && !tile.isScreen) dock.push(tile);
+      else main.push(tile);
+    }
+
+    const groups = Array.from(groupsMap, ([id, tiles]) => ({
+      id,
+      name: channels.find(channel => channel.id === id)?.name || id,
+      tiles,
+    })).sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+
+    return { mainTiles: main, camOffDockTiles: dock, otherChannelGroups: groups };
+  }, [videoTiles, channels]);
+
   const visibleFocusedTileId = videoTiles.some(tile => tile.id === focusedTileId) ? focusedTileId : '';
   const focusedTile = videoTiles.find(tile => tile.id === visibleFocusedTileId) || null;
   const secondaryTiles = focusedTile ? videoTiles.filter(tile => tile.id !== focusedTile.id) : videoTiles;
-  const { gridRef, layout: gridLayout } = useFittedVideoGrid(focusedTile ? secondaryTiles.length : videoTiles.length);
+  const { gridRef, layout: gridLayout } = useFittedVideoGrid(focusedTile ? secondaryTiles.length : Math.max(1, mainTiles.length));
 
   const renderVideoTile = useCallback((tile, options = {}) => {
     const volumeValue = getTileVolume(tile.id);
     // カメラタイル（peer:xxx）のみ呼び出しボタンを表示する
     const callTargetSocketId = tile.id.startsWith('peer:') ? tile.id.slice(5) : '';
+    const variant = options.focused ? 'focus' : options.mini ? 'mini' : options.compact ? 'compact' : 'grid';
     return (
       <VideoCell
-        key={`${tile.key}-${options.focused ? 'focus' : options.compact ? 'compact' : 'grid'}`}
+        key={`${tile.key}-${variant}`}
         tileId={tile.id}
         label={tile.label}
         stream={tile.stream}
@@ -2086,7 +2141,8 @@ export default function MainView() {
         speakerMuted={tile.speakerMuted}
         volume={tile.baseVolume * volumeValue}
         focused={!!options.focused}
-        compact={!!options.compact}
+        compact={!!options.compact || !!options.mini}
+        mini={!!options.mini}
         dimmed={!!options.dimmed || !tile.sameChannel}
         canFocus={true}
         canControlVolume={tile.canControlVolume}
@@ -2405,15 +2461,51 @@ export default function MainView() {
           )}
         </div>
       ) : (
-        <div
-          ref={gridRef}
-          className="video-grid"
-          style={{
-            gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, ${gridLayout.cellWidth || 1}px))`,
-            gridTemplateRows: `repeat(${gridLayout.rows}, minmax(0, ${gridLayout.cellHeight || 1}px))`,
-          }}
-        >
-          {videoTiles.map(tile => renderVideoTile(tile))}
+        <div className={`stage-body ${otherChannelGroups.length ? 'with-rail' : ''}`}>
+          <div className="stage-main">
+            <div className="stage-channel-box">
+              <div className="stage-channel-head">
+                <Volume2 size={14} />
+                <span>{activeChannel?.name || 'チャンネル'}</span>
+                <strong>{mainTiles.length + camOffDockTiles.length}拠点</strong>
+              </div>
+              <div
+                ref={gridRef}
+                className="video-grid"
+                style={{
+                  gridTemplateColumns: `repeat(${gridLayout.cols}, minmax(0, ${gridLayout.cellWidth || 1}px))`,
+                  gridTemplateRows: `repeat(${gridLayout.rows}, minmax(0, ${gridLayout.cellHeight || 1}px))`,
+                }}
+              >
+                {mainTiles.map(tile => renderVideoTile(tile))}
+                {mainTiles.length === 0 && (
+                  <div className="stage-empty">カメラONの拠点はありません</div>
+                )}
+              </div>
+              {camOffDockTiles.length > 0 && (
+                <div className="camoff-dock" aria-label="カメラOFFの拠点">
+                  {camOffDockTiles.map(tile => renderVideoTile(tile, { mini: true }))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {otherChannelGroups.length > 0 && (
+            <aside className="channel-rail" aria-label="他チャンネルの拠点">
+              {otherChannelGroups.map(group => (
+                <div key={group.id} className="channel-rail-group">
+                  <div className="channel-rail-head">
+                    <Volume2 size={12} />
+                    <span>{group.name}</span>
+                    <strong>{group.tiles.length}</strong>
+                  </div>
+                  <div className="channel-rail-tiles">
+                    {group.tiles.map(tile => renderVideoTile(tile, { compact: true }))}
+                  </div>
+                </div>
+              ))}
+            </aside>
+          )}
         </div>
       )}
 

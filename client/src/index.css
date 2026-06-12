@@ -1858,3 +1858,236 @@ body.resizing-sidebar {
 .share-audio-toggle.disabled { opacity: 0.55; cursor: default; }
 .share-audio-toggle input { accent-color: var(--blue, #8ab4f8); }
 .share-audio-note { color: rgba(255,255,255,0.5); font-size: 0.72rem; }
+
+/* ════════════════════════════════════════════════════════
+   チャンネル別グルーピング表示 / カメラOFFドック
+   - メイン: 自チャンネルの大グリッド（チャンネル名付きの箱）
+   - ドック: カメラOFF拠点を小さくアイコン表示（ホバー操作は維持）
+   - 右レール: 他チャンネルをチャンネルごとにまとめて表示
+   ════════════════════════════════════════════════════════ */
+
+.stage-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px;
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+}
+
+.stage-body.with-rail {
+  grid-template-columns: minmax(0, 1fr) clamp(184px, 19vw, 256px);
+}
+
+.stage-main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.stage-channel-box {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(74,222,128,0.26);
+  border-radius: 10px;
+  background: rgba(74,222,128,0.045);
+  overflow: hidden;
+}
+
+.stage-channel-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 12px;
+  color: #a7f3c7;
+  font-size: 0.78rem;
+  font-weight: 800;
+  border-bottom: 1px solid rgba(74,222,128,0.18);
+  flex-shrink: 0;
+}
+
+.stage-channel-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage-channel-head strong {
+  margin-left: auto;
+  min-width: 30px;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(74,222,128,0.16);
+  color: #b8f7dc;
+  font-size: 0.66rem;
+  flex-shrink: 0;
+}
+
+.stage-channel-box .video-grid {
+  flex: 1;
+  min-height: 0;
+  padding: 8px;
+}
+
+.stage-empty {
+  grid-column: 1 / -1;
+  display: grid;
+  place-items: center;
+  padding: 26px;
+  color: rgba(255,255,255,0.42);
+  font-size: 0.8rem;
+}
+
+/* ── カメラOFFドック ── */
+.camoff-dock {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px;
+  border-top: 1px dashed rgba(255,255,255,0.14);
+  flex-shrink: 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.camoff-dock .video-cell {
+  flex: 0 0 auto;
+  width: 192px;
+  height: 86px;
+  min-height: 86px;
+}
+
+.video-cell.mini .cam-off-overlay {
+  flex-direction: row;
+  gap: 8px;
+}
+
+.video-cell.mini .cam-off-overlay svg {
+  width: 20px;
+  height: 20px;
+}
+
+.video-cell.mini .cam-off-overlay span {
+  font-size: 0.68rem !important;
+  margin-top: 0 !important;
+}
+
+.video-cell.mini .cell-label {
+  bottom: 4px;
+  left: 4px;
+  max-width: calc(100% - 8px);
+  font-size: 0.62rem;
+  padding: 2px 5px;
+}
+
+.video-cell.mini .tile-actions {
+  top: 4px;
+  padding: 2px;
+  gap: 2px;
+}
+
+.video-cell.mini .tile-btn {
+  min-width: 24px;
+  height: 24px;
+}
+
+.video-cell.mini .mute-badge {
+  width: 20px;
+  height: 20px;
+  top: 4px;
+  right: 4px;
+}
+
+/* ── 他チャンネル右レール ── */
+.channel-rail {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding-right: 2px;
+}
+
+.channel-rail-group {
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 10px;
+  background: rgba(255,255,255,0.03);
+  overflow: hidden;
+}
+
+.channel-rail-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  color: #aeb1bb;
+  font-size: 0.72rem;
+  font-weight: 800;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+
+.channel-rail-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.channel-rail-head strong {
+  margin-left: auto;
+  min-width: 22px;
+  height: 18px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255,255,255,0.08);
+  color: #b8bac2;
+  font-size: 0.64rem;
+}
+
+.channel-rail-tiles {
+  display: grid;
+  gap: 6px;
+  padding: 6px;
+}
+
+.channel-rail .video-cell {
+  height: auto;
+  min-height: 90px;
+  aspect-ratio: 16 / 9;
+}
+
+@media (max-width: 700px) {
+  .stage-body.with-rail {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) auto;
+  }
+
+  .channel-rail {
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(170px, 220px);
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 4px;
+  }
+
+  .camoff-dock .video-cell {
+    width: 160px;
+    height: 74px;
+    min-height: 74px;
+  }
+}

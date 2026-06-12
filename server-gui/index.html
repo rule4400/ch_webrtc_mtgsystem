@@ -277,12 +277,19 @@
     }
 
     .client-head {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px 12px;
       padding: 12px;
       border-bottom: 1px solid var(--border);
       background: rgba(255,255,255,0.025);
+    }
+
+    .client-head > div:first-child {
+      min-width: 0;
+      flex: 1 1 180px;
     }
 
     .client-card:not([open]) .client-head {
@@ -322,6 +329,8 @@
       gap: 6px;
       align-items: center;
       justify-content: flex-end;
+      min-width: 0;
+      flex: 0 1 auto;
     }
 
     .mini-btn {
@@ -347,9 +356,14 @@
 
     .kv-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
       gap: 8px;
     }
+
+    .kv strong.q-good { color: var(--green); }
+    .kv strong.q-fair { color: var(--amber); }
+    .kv strong.q-poor { color: var(--red); }
+    .kv strong.q-unknown { color: var(--muted); }
 
     .kv {
       background: rgba(255,255,255,0.045);
@@ -683,6 +697,32 @@
       margin-top: 12px;
     }
 
+    .update-files {
+      display: grid;
+      gap: 6px;
+      margin-top: 10px;
+    }
+
+    .update-file-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 10px;
+      min-height: 32px;
+      padding: 5px 9px;
+      background: rgba(255,255,255,0.04);
+      border-radius: 6px;
+      font-size: 0.76rem;
+    }
+
+    .update-file-name {
+      min-width: 0;
+      flex: 1 1 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
     @media (max-width: 760px) {
       .topbar {
         align-items: flex-start;
@@ -704,12 +744,12 @@
         padding: 12px;
       }
 
-      .client-head {
-        grid-template-columns: 1fr;
-      }
-
       .client-actions {
         justify-content: flex-start;
+      }
+
+      .update-row {
+        grid-template-columns: 1fr;
       }
     }
   </style>
@@ -751,6 +791,7 @@
           <div class="metric"><div class="metric-label">サーバーIP</div><div class="metric-value" id="mCurrentIp">-</div><div class="metric-note" id="mAnnounced">ANNOUNCED_IP</div></div>
           <div class="metric"><div class="metric-label">メモリ</div><div class="metric-value" id="mMemory">0 MB</div><div class="metric-note" id="mUptime">起動時間 0s</div></div>
           <div class="metric"><div class="metric-label">CPU</div><div class="metric-value" id="mCpu">0.0%</div><div class="metric-note" id="mRtcPorts">RTP -</div></div>
+          <div class="metric"><div class="metric-label">通信品質</div><div class="metric-value" id="mQuality">-</div><div class="metric-note" id="mQualityNote">平均RTT / 安定度</div></div>
           <div class="metric"><div class="metric-label">一括操作</div><button id="restartAllBtn" class="btn danger" style="width:100%; margin-top:4px;">全端末を再構築</button><div class="metric-note">接続中の全クライアント</div></div>
         </div>
         <div id="clientCards" class="client-grid">
@@ -831,6 +872,21 @@
             <div class="settings-help">1行につき「id,表示名」。例: general,一般</div>
           </div>
           <div class="settings-row">
+            <label>アップデート配布フォルダ（ファイル名からアプリを自動判別して配信）</label>
+            <div class="path-display" id="updateFolderDisplay">未設定</div>
+            <div class="settings-actions" style="margin-top:0">
+              <button class="btn ghost" id="selectUpdateFolderBtn">フォルダを選択</button>
+              <button class="btn ghost" id="rescanUpdateFolderBtn">再スキャン</button>
+              <button class="btn ghost" id="clearUpdateFolderBtn">解除</button>
+            </div>
+            <div id="updateFilesList" class="update-files"></div>
+            <div class="settings-help">
+              対応ファイル: dmg / pkg / zip / exe / msi など（ビルド済みのインストーラ/パッケージを配置してください）。
+              ファイル名に client / viewer / screen-share とバージョン番号（例: 0.3.0）を含めると自動登録されます。
+              フォルダは常時監視され、ファイル追加時に自動で配信情報を更新します。
+            </div>
+          </div>
+          <div class="settings-row">
             <label>最新版 / 更新URL</label>
             <div class="update-grid">
               <div class="update-row">
@@ -880,6 +936,11 @@
     const urlClient = document.getElementById('urlClient');
     const urlViewer = document.getElementById('urlViewer');
     const urlScreenShare = document.getElementById('urlScreenShare');
+    const updateFolderDisplay = document.getElementById('updateFolderDisplay');
+    const selectUpdateFolderBtn = document.getElementById('selectUpdateFolderBtn');
+    const rescanUpdateFolderBtn = document.getElementById('rescanUpdateFolderBtn');
+    const clearUpdateFolderBtn = document.getElementById('clearUpdateFolderBtn');
+    const updateFilesList = document.getElementById('updateFilesList');
     const saveSystemSettingsBtn = document.getElementById('saveSystemSettingsBtn');
     const forceUpdateClientsBtn = document.getElementById('forceUpdateClientsBtn');
     const forceUpdateViewersBtn = document.getElementById('forceUpdateViewersBtn');
@@ -918,6 +979,13 @@
       warming: '準備中',
       stale: '応答なし',
       offline: '切断',
+    };
+
+    const qualityText = {
+      good: '良好',
+      fair: '普通',
+      poor: '不安定',
+      unknown: '計測中',
     };
 
     function activateTab(target) {
@@ -1021,6 +1089,7 @@
         updatePackages: { ...(systemSettings.updatePackages || {}), ...((settings || {}).updatePackages || {}) },
       };
       channelsText.value = channelsToText(systemSettings.channels);
+      updateFolderDisplay.innerText = systemSettings.updateFolder || '未設定';
       verClient.value = systemSettings.latestVersions?.client || '';
       verViewer.value = systemSettings.latestVersions?.viewer || '';
       verScreenShare.value = systemSettings.latestVersions?.['screen-share'] || '';
@@ -1032,6 +1101,7 @@
     function collectSystemSettings() {
       return {
         channels: textToChannels(channelsText.value),
+        updateFolder: systemSettings.updateFolder || '',
         latestVersions: {
           ...(systemSettings.latestVersions || {}),
           client: verClient.value.trim() || '0.1.0',
@@ -1172,6 +1242,8 @@
       const devices = client.devices || {};
       const selected = client.selectedDevices || {};
       const local = client.localMedia || {};
+      const media = client.mediaState || {};
+      const quality = client.connectionQuality || {};
       const remote = client.remoteMonitor || {};
       const transports = client.transports || {};
       const isViewer = client.appType === 'viewer';
@@ -1182,6 +1254,14 @@
       const speakerDisabled = !(devices.audioOutput || []).length;
       const recvOk = (remote.receivingVideoCount || 0) + (remote.receivingAudioCount || 0);
       const open = expandedClientIds.has(client.id) || health === 'stale' || health === 'offline';
+
+      // producer の実状態（即時反映）を優先し、無ければ telemetry の自己申告を使う
+      const camOn = media.camera ? media.camera === 'on'
+        : (!!local.cameraEnabled && local.video?.readyState === 'live');
+      const micOn = media.mic ? media.mic === 'on'
+        : (!!local.micEnabled && local.audio?.readyState === 'live');
+      const screenOn = media.screen === 'on';
+      const qualityLevel = quality.level || 'unknown';
 
       return `
         <details class="client-card ${escapeHtml(health)}" data-socket="${escapeHtml(client.id)}" ${open ? 'open' : ''}>
@@ -1205,18 +1285,21 @@
           <div class="client-body">
             <div class="kv-grid">
               <div class="kv"><span>状態</span><strong>${escapeHtml(healthText[health] || health)}</strong></div>
-              <div class="kv"><span>最終応答</span><strong>${fmtMs(client.heartbeatAgeMs)}</strong></div>
-              <div class="kv"><span>RTT</span><strong>${fmtMs(client.rttMs)}</strong></div>
+              <div class="kv"><span>応答時間 (RTT)</span><strong>${fmtMs(quality.rttMs ?? client.rttMs)}</strong></div>
+              <div class="kv"><span>平均 / 揺らぎ</span><strong>${fmtMs(quality.avgRttMs)} / ${fmtMs(quality.jitterMs)}</strong></div>
+              <div class="kv"><span>安定度</span><strong class="q-${escapeHtml(qualityLevel)}">${escapeHtml(qualityText[qualityLevel] || qualityLevel)}</strong></div>
+              <div class="kv"><span>最終受信</span><strong>${fmtMs(client.heartbeatAgeMs)}</strong></div>
               <div class="kv"><span>受信OK</span><strong>${recvOk}</strong></div>
               <div class="kv"><span>チャンネル</span><strong>${escapeHtml(channelId)}</strong></div>
             </div>
 
             <div>
-              <div class="section-title">メディア状態</div>
+              <div class="section-title">メディア状態（実機反映）</div>
               <div class="chip-row">
-                ${mediaChip('カメラ', !!local.cameraEnabled && local.video?.readyState === 'live', !local.cameraEnabled)}
-                ${mediaChip('マイク', !!local.micEnabled && local.audio?.readyState === 'live', !local.micEnabled)}
-                ${mediaChip('スピーカー', !local.speakerMuted, !!local.speakerMuted)}
+                ${mediaChip(camOn ? 'カメラ ON' : 'カメラ OFF', camOn, !camOn)}
+                ${mediaChip(micOn ? 'マイク ON' : 'マイク OFF', micOn, !micOn)}
+                ${mediaChip(local.speakerMuted ? 'スピーカー OFF' : 'スピーカー ON', !local.speakerMuted, !!local.speakerMuted)}
+                ${screenOn ? mediaChip('画面共有中', true) : ''}
                 <span class="chip blue">送信 ${escapeHtml(transports.sendState || 'none')}</span>
                 <span class="chip blue">受信 ${escapeHtml(transports.recvState || 'none')}</span>
               </div>
@@ -1225,8 +1308,8 @@
             <div>
               <div class="section-title">ON/OFF制御</div>
               <div class="chip-row">
-                ${mediaToggleButton(client.id, 'camera', 'カメラ', !!local.cameraEnabled, isViewer)}
-                ${mediaToggleButton(client.id, 'mic', 'マイク', !!local.micEnabled, isViewer)}
+                ${mediaToggleButton(client.id, 'camera', 'カメラ', camOn, isViewer)}
+                ${mediaToggleButton(client.id, 'mic', 'マイク', micOn, isViewer)}
                 ${mediaToggleButton(client.id, 'speaker', 'スピーカー', !local.speakerMuted)}
               </div>
             </div>
@@ -1322,6 +1405,24 @@
       document.getElementById('mCpu').innerText = `${stats.cpu || '0.0'}%`;
       document.getElementById('mAnnounced').innerText = `公開IP ${stats.announcedIp || '-'} / 実IP ${(stats.serverIps || []).join(', ') || '-'}`;
       document.getElementById('mRtcPorts').innerText = `RTP ${stats.rtcPortRange?.min || '-'}-${stats.rtcPortRange?.max || '-'}`;
+
+      // 通信品質サマリー（全クライアントの平均RTTと安定度内訳）
+      const qualitySamples = clients
+        .map(client => client.connectionQuality)
+        .filter(quality => quality && Number.isFinite(quality.avgRttMs));
+      if (qualitySamples.length) {
+        const avgAll = Math.round(qualitySamples.reduce((sum, q) => sum + q.avgRttMs, 0) / qualitySamples.length);
+        const counts = qualitySamples.reduce((acc, q) => {
+          acc[q.level] = (acc[q.level] || 0) + 1;
+          return acc;
+        }, {});
+        document.getElementById('mQuality').innerText = `${avgAll}ms`;
+        document.getElementById('mQualityNote').innerText =
+          `良好 ${counts.good || 0} / 普通 ${counts.fair || 0} / 不安定 ${counts.poor || 0}`;
+      } else {
+        document.getElementById('mQuality').innerText = '-';
+        document.getElementById('mQualityNote').innerText = '平均RTT / 安定度';
+      }
       refreshRegistryDefaults();
 
       if (isDeviceSelectActive()) {
@@ -1402,7 +1503,12 @@
       });
 
       container.addEventListener('pointerdown', event => {
-        if (event.target.closest('select[data-action="device"]')) holdClientCardRender();
+        if (event.target.closest('select[data-action="device"]')) {
+          holdClientCardRender();
+          return;
+        }
+        // 高頻度更新（毎秒4回）中でもクリック操作が再描画で途切れないように短時間ホールド
+        if (event.target.closest('button, select, summary')) holdClientCardRender(700);
       });
 
       container.addEventListener('focusout', event => {
@@ -1512,6 +1618,72 @@
         saveSystemSettingsBtn.disabled = false;
       }
     });
+
+    // ── アップデート配布フォルダ ──
+    function fmtFileSize(size) {
+      const value = Number(size) || 0;
+      if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+      if (value >= 1024) return `${Math.round(value / 1024)} KB`;
+      return `${value} B`;
+    }
+
+    function renderUpdateScan(result) {
+      if (!result) return;
+      if (result.settings) renderSystemSettings(result.settings);
+      const files = result.files || [];
+      if (!files.length) {
+        updateFilesList.innerHTML = result.folder
+          ? '<div class="empty">配布可能なファイルが見つかりません</div>'
+          : '';
+        return;
+      }
+      updateFilesList.innerHTML = files.map(file => `
+        <div class="update-file-row">
+          <span class="update-file-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
+          <span class="chip ${file.appType ? 'ok' : 'warn'}">${escapeHtml(file.appType || '判別不可')}</span>
+          <span class="chip ${file.version ? 'blue' : 'warn'}">${escapeHtml(file.version || 'ver不明')}</span>
+          <span class="chip">${fmtFileSize(file.size)}</span>
+        </div>
+      `).join('');
+    }
+
+    selectUpdateFolderBtn.addEventListener('click', async () => {
+      try {
+        const result = await window.api.selectUpdateFolder();
+        if (result) {
+          renderUpdateScan(result);
+          appendLog(`[Admin] アップデート配布フォルダを設定: ${result.folder}`);
+        }
+      } catch (err) {
+        appendLog(`ERROR: 配布フォルダの設定に失敗: ${err.message}`);
+      }
+    });
+
+    rescanUpdateFolderBtn.addEventListener('click', async () => {
+      try {
+        renderUpdateScan(await window.api.scanUpdateFolder());
+      } catch (err) {
+        appendLog(`ERROR: 配布フォルダの再スキャンに失敗: ${err.message}`);
+      }
+    });
+
+    clearUpdateFolderBtn.addEventListener('click', async () => {
+      if (!confirm('アップデート配布フォルダの設定を解除しますか？')) return;
+      try {
+        renderUpdateScan(await window.api.clearUpdateFolder());
+        updateFilesList.innerHTML = '';
+      } catch (err) {
+        appendLog(`ERROR: 配布フォルダの解除に失敗: ${err.message}`);
+      }
+    });
+
+    // フォルダ監視による自動再スキャン結果（自動取得）
+    window.api.onUpdateScanResult?.(result => {
+      renderUpdateScan(result);
+    });
+
+    // 起動時に保存済みフォルダがあれば自動スキャン
+    window.api.scanUpdateFolder?.().then(renderUpdateScan).catch(() => {});
 
     forceUpdateClientsBtn.addEventListener('click', () => {
       if (confirm('クライアントへアップデート指示を送信しますか？')) window.api.forceUpdate('client');

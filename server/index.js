@@ -33,6 +33,8 @@
 const express = require('express');
 const http = require('http');
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 const { Server } = require('socket.io');
 const mediasoup = require('mediasoup');
 const cors = require('cors');
@@ -93,6 +95,12 @@ let systemState = {
 const peers = {};
 const MAX_DEVICE_LIST = 32;
 const MAX_MONITOR_PEERS = 32;
+const MAX_RTT_SAMPLES = 20;
+
+// アップデート配布フォルダ（server-gui から set-update-dir で指定される）
+let updateDir = process.env.UPDATE_DIR && fs.existsSync(process.env.UPDATE_DIR)
+  ? process.env.UPDATE_DIR
+  : null;
 
 // ── Workers ──────────────────────────────────────────────
 
@@ -274,9 +282,23 @@ function sanitizeSystemStatePatch(patch) {
   };
 }
 
+/** 配布URLが相対パス（/updates/...）の場合、サーバーの公開IPで絶対URLへ解決する */
+function resolveUpdateUrl(url) {
+  const value = shortString(url, 1024).trim();
+  if (!value || /^https?:\/\//i.test(value)) return value;
+  const host = config.announcedIp || localIpv4Addresses()[0] || config.listenIp || '127.0.0.1';
+  const pathname = value.startsWith('/') ? value : `/${value}`;
+  return `http://${host}:${config.listenPort}${pathname}`;
+}
+
 function getSystemStateSnapshot() {
+  const updatePackages = {};
+  for (const [appType, pkg] of Object.entries(systemState.updatePackages || {})) {
+    updatePackages[appType] = { ...pkg, url: resolveUpdateUrl(pkg.url) };
+  }
   return {
     ...systemState,
+    updatePackages,
     serverVersion: SERVER_APP_VERSION,
   };
 }
@@ -452,6 +474,49 @@ function healthStatus(peer, now = Date.now()) {
   return 'stale';
 }
 
+/** telemetry RTT の履歴から平均・ジッタ・安定度を算出する */
+function connectionQuality(peer) {
+  const samples = Array.isArray(peer.rttHistory) ? peer.rttHistory : [];
+  if (!samples.length) {
+    return { rttMs: peer.rttMs ?? null, avgRttMs: null, jitterMs: null, level: 'unknown', samples: 0 };
+  }
+  const avg = samples.reduce((sum, v) => sum + v, 0) / samples.length;
+  let jitter = 0;
+  for (let i = 1; i < samples.length; i += 1) jitter += Math.abs(samples[i] - samples[i - 1]);
+  jitter = samples.length > 1 ? jitter / (samples.length - 1) : 0;
+
+  const level =
+    avg <= 80 && jitter <= 30 ? 'good' :
+    avg <= 200 && jitter <= 80 ? 'fair' :
+    'poor';
+
+  return {
+    rttMs: peer.rttMs ?? null,
+    avgRttMs: Math.round(avg),
+    jitterMs: Math.round(jitter),
+    level,
+    samples: samples.length,
+  };
+}
+
+/**
+ * producer の実状態からカメラ/マイク/画面共有の ON/OFF を導出する。
+ * クライアントの pause/resume はサーバーへ即時通知されるため、
+ * telemetry（2秒周期）より早く・確実に実態を反映できる。
+ */
+function deriveMediaState(peer) {
+  const state = { camera: 'none', mic: 'none', screen: 'none', screenAudio: 'none' };
+  for (const entry of peer.producers.values()) {
+    const source = entry.source || sanitizeProducerSource(entry.kind, entry.appData);
+    const value = entry.paused ? 'off' : 'on';
+    if (source === 'camera') state.camera = value;
+    else if (source === 'microphone') state.mic = value;
+    else if (source === 'screen') state.screen = value;
+    else if (source === 'screen-audio') state.screenAudio = value;
+  }
+  return state;
+}
+
 function getPeerClientSnapshot(id, peer, now = Date.now()) {
   const producerList = Array.from(peer.producers.entries()).map(([producerId, entry]) => publicProducer(producerId, entry));
   const consumerList = Array.from(peer.consumers.entries()).map(([consumerId, consumer]) => ({
@@ -474,6 +539,8 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     heartbeatAgeMs,
     health: healthStatus(peer, now),
     rttMs: peer.rttMs ?? null,
+    connectionQuality: connectionQuality(peer),
+    mediaState: deriveMediaState(peer),
     producers: peer.producers.size,
     consumers: peer.consumers.size,
     producerList,
@@ -537,6 +604,38 @@ function getStatsSnapshot() {
   };
 }
 
+// ── アップデートファイル配信 ──────────────────────────────
+// server-gui で選択されたフォルダ内のビルド済みパッケージを配布する。
+
+function listUpdateFiles() {
+  if (!updateDir || !fs.existsSync(updateDir)) return [];
+  try {
+    return fs.readdirSync(updateDir)
+      .filter(name => /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i.test(name))
+      .map(name => {
+        const stat = fs.statSync(path.join(updateDir, name));
+        return { name, size: stat.size, mtimeMs: stat.mtimeMs };
+      });
+  } catch (err) {
+    console.error('[Updates] list failed:', err.message);
+    return [];
+  }
+}
+
+app.get('/updates', (_, res) => {
+  res.json({ updateDir: updateDir || null, files: listUpdateFiles() });
+});
+
+app.get('/updates/:filename', (req, res) => {
+  if (!updateDir) return res.status(404).json({ error: 'update dir not configured' });
+  const fileName = path.basename(String(req.params.filename || ''));
+  const filePath = path.join(updateDir, fileName);
+  if (!fileName || !filePath.startsWith(updateDir) || !fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'file not found' });
+  }
+  res.download(filePath, fileName);
+});
+
 app.get('/health', (_, res) => res.json(getStatsSnapshot()));
 app.get('/ready', (_, res) => {
   const ready = !!router && workers.length > 0 && !recovering;
@@ -579,7 +678,8 @@ function applySystemStatePatch(patch, source = 'server') {
 
 function emitUpdateCommand(target, recipientCount, appType, { forced = false, reason = 'server-gui' } = {}) {
   const type = shortString(appType, 24);
-  const packageInfo = systemState.updatePackages[type] || null;
+  const rawPackage = systemState.updatePackages[type] || null;
+  const packageInfo = rawPackage ? { ...rawPackage, url: resolveUpdateUrl(rawPackage.url) } : null;
   const version = systemState.latestVersions[type] || packageInfo?.version || '';
   const payload = {
     appType: type,
@@ -778,6 +878,7 @@ io.on('connection', async socket => {
     connectedAt: Date.now(),
     lastHeartbeatAt: null,
     rttMs: null,
+    rttHistory: [],
     telemetry: null,
     deviceState: { devices: { video: [], audioInput: [], audioOutput: [] }, selectedDevices: {} },
     monitorState: {},
@@ -831,9 +932,11 @@ io.on('connection', async socket => {
     peer.appVersion = clean.appVersion || peer.appVersion || '';
     peer.channelId = clean.channelId || peer.channelId || DEFAULT_CHANNELS[0].id;
     if (clean.locationName) peer.locationName = clean.locationName;
-    peer.rttMs = Number.isFinite(clean.connection?.telemetryRttMs)
-      ? Math.round(clean.connection.telemetryRttMs)
-      : peer.rttMs;
+    if (Number.isFinite(clean.connection?.telemetryRttMs)) {
+      peer.rttMs = Math.round(clean.connection.telemetryRttMs);
+      peer.rttHistory.push(peer.rttMs);
+      if (peer.rttHistory.length > MAX_RTT_SAMPLES) peer.rttHistory.shift();
+    }
     peer.deviceState = {
       devices: clean.devices || peer.deviceState.devices,
       selectedDevices: clean.selectedDevices || peer.deviceState.selectedDevices,
@@ -1303,7 +1406,7 @@ if (process.send) {
       type: 'stats',
       data: { ...snapshot, cpu: cpuPercent },
     });
-  }, 1000);
+  }, 250); // 監視表示のリアルタイム性向上のため毎秒4回送信
 
   process.on('message', rawMessage => {
     const msg = asObject(rawMessage);
@@ -1348,6 +1451,17 @@ if (process.send) {
         fromName: 'サーバー管理画面',
         fromAppType: 'server-gui',
       }, 'server-gui');
+    } else if (msg.type === 'set-update-dir') {
+      const dir = shortString(msg.dir, 1024);
+      if (dir && fs.existsSync(dir)) {
+        updateDir = dir;
+        sendAdminLog(`[Updates] 配布フォルダを設定: ${dir} (${listUpdateFiles().length}ファイル)`);
+      } else if (!dir) {
+        updateDir = null;
+        sendAdminLog('[Updates] 配布フォルダを解除しました');
+      } else {
+        sendAdminLog(`[Updates] 配布フォルダが見つかりません: ${dir}`);
+      }
     } else if (msg.type === 'set-system-state') {
       applySystemStatePatch(msg.state || {}, 'server-gui');
     } else if (msg.type === 'force-update') {
