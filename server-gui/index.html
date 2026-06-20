@@ -630,6 +630,23 @@
       margin-bottom: 8px;
     }
 
+    .settings-row .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 0.82rem;
+      line-height: 1.35;
+      margin: 0;
+    }
+
+    .settings-row .check-row input {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      flex: 0 0 auto;
+    }
+
     .path-display {
       padding: 10px;
       background: #080a0d;
@@ -872,7 +889,15 @@
             <div class="settings-help">1行につき「id,表示名」。例: general,一般</div>
           </div>
           <div class="settings-row">
-            <label>アップデート配布フォルダ（ファイル名からアプリを自動判別して配信）</label>
+            <label>メディア通信</label>
+            <label class="check-row">
+              <input id="forceTcpMedia" type="checkbox">
+              <span>L3 / VPN拠点向けにWebRTCメディア通信をTCP固定にする</span>
+            </label>
+            <div class="settings-help">TCP 10000-10200 が到達しているのに映像だけ届かない場合に有効です。保存後、接続中の端末はメディア接続を再構築します。</div>
+          </div>
+          <div class="settings-row">
+            <label>アップデート配布フォルダ（1つのフォルダ配下でOS/アプリを自動判別）</label>
             <div class="path-display" id="updateFolderDisplay">未設定</div>
             <div class="settings-actions" style="margin-top:0">
               <button class="btn ghost" id="selectUpdateFolderBtn">フォルダを選択</button>
@@ -883,6 +908,7 @@
             <div class="settings-help">
               対応ファイル: dmg / pkg / zip / exe / msi など（ビルド済みのインストーラ/パッケージを配置してください）。
               ファイル名に client / viewer / screen-share とバージョン番号（例: 0.3.0）を含めると自動登録されます。
+              macOS / Windows フォルダ名、または拡張子からOSを判別します。
               フォルダは常時監視され、ファイル追加時に自動で配信情報を更新します。
             </div>
           </div>
@@ -891,17 +917,17 @@
             <div class="update-grid">
               <div class="update-row">
                 <span>クライアント</span>
-                <input id="verClient" placeholder="0.1.0">
+                <input id="verClient" placeholder="0.2.5">
                 <input id="urlClient" placeholder="https://...">
               </div>
               <div class="update-row">
                 <span>閲覧用</span>
-                <input id="verViewer" placeholder="0.1.0">
+                <input id="verViewer" placeholder="0.1.5">
                 <input id="urlViewer" placeholder="https://...">
               </div>
               <div class="update-row">
                 <span>画面共有用</span>
-                <input id="verScreenShare" placeholder="0.1.0">
+                <input id="verScreenShare" placeholder="0.1.4">
                 <input id="urlScreenShare" placeholder="https://...">
               </div>
             </div>
@@ -930,6 +956,7 @@
     const envDisplay = document.getElementById('envDisplay');
     const systemSettingsPath = document.getElementById('systemSettingsPath');
     const channelsText = document.getElementById('channelsText');
+    const forceTcpMedia = document.getElementById('forceTcpMedia');
     const verClient = document.getElementById('verClient');
     const verViewer = document.getElementById('verViewer');
     const verScreenShare = document.getElementById('verScreenShare');
@@ -968,8 +995,9 @@
     const expandedClientIds = new Set();
     let systemSettings = {
       channels: [{ id: 'general', name: '一般' }],
-      latestVersions: { client: '0.1.0', viewer: '0.1.0', 'screen-share': '0.1.0' },
+      latestVersions: { client: '0.2.5', viewer: '0.1.5', 'screen-share': '0.1.4' },
       updatePackages: {},
+      mediaTransport: { forceTcp: false },
     };
     pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
 
@@ -1087,34 +1115,58 @@
         ...(settings || {}),
         latestVersions: { ...(systemSettings.latestVersions || {}), ...((settings || {}).latestVersions || {}) },
         updatePackages: { ...(systemSettings.updatePackages || {}), ...((settings || {}).updatePackages || {}) },
+        mediaTransport: { ...(systemSettings.mediaTransport || {}), ...((settings || {}).mediaTransport || {}) },
       };
       channelsText.value = channelsToText(systemSettings.channels);
+      forceTcpMedia.checked = !!systemSettings.mediaTransport?.forceTcp;
       updateFolderDisplay.innerText = systemSettings.updateFolder || '未設定';
       verClient.value = systemSettings.latestVersions?.client || '';
       verViewer.value = systemSettings.latestVersions?.viewer || '';
       verScreenShare.value = systemSettings.latestVersions?.['screen-share'] || '';
-      urlClient.value = systemSettings.updatePackages?.client?.url || '';
-      urlViewer.value = systemSettings.updatePackages?.viewer?.url || '';
-      urlScreenShare.value = systemSettings.updatePackages?.['screen-share']?.url || '';
+      urlClient.value = packageUrlSummary(systemSettings.updatePackages?.client);
+      urlViewer.value = packageUrlSummary(systemSettings.updatePackages?.viewer);
+      urlScreenShare.value = packageUrlSummary(systemSettings.updatePackages?.['screen-share']);
+    }
+
+    function packageUrlSummary(pkg) {
+      if (!pkg) return '';
+      const platforms = pkg.platforms || {};
+      const items = Object.entries(platforms)
+        .filter(([, item]) => item?.url)
+        .map(([platform, item]) => `${platform}: ${item.url}`);
+      return items.join(' / ') || pkg.url || '';
     }
 
     function collectSystemSettings() {
+      const manualClientUrl = normalizeManualUpdateUrl(urlClient.value);
+      const manualViewerUrl = normalizeManualUpdateUrl(urlViewer.value);
+      const manualScreenShareUrl = normalizeManualUpdateUrl(urlScreenShare.value);
       return {
         channels: textToChannels(channelsText.value),
         updateFolder: systemSettings.updateFolder || '',
+        mediaTransport: {
+          forceTcp: !!forceTcpMedia.checked,
+        },
         latestVersions: {
           ...(systemSettings.latestVersions || {}),
-          client: verClient.value.trim() || '0.1.0',
-          viewer: verViewer.value.trim() || '0.1.0',
-          'screen-share': verScreenShare.value.trim() || '0.1.0',
+          client: verClient.value.trim() || '0.2.5',
+          viewer: verViewer.value.trim() || '0.1.5',
+          'screen-share': verScreenShare.value.trim() || '0.1.4',
         },
         updatePackages: {
           ...(systemSettings.updatePackages || {}),
-          client: { ...(systemSettings.updatePackages?.client || {}), version: verClient.value.trim(), url: urlClient.value.trim() },
-          viewer: { ...(systemSettings.updatePackages?.viewer || {}), version: verViewer.value.trim(), url: urlViewer.value.trim() },
-          'screen-share': { ...(systemSettings.updatePackages?.['screen-share'] || {}), version: verScreenShare.value.trim(), url: urlScreenShare.value.trim() },
+          client: { ...(systemSettings.updatePackages?.client || {}), version: verClient.value.trim(), url: manualClientUrl },
+          viewer: { ...(systemSettings.updatePackages?.viewer || {}), version: verViewer.value.trim(), url: manualViewerUrl },
+          'screen-share': { ...(systemSettings.updatePackages?.['screen-share'] || {}), version: verScreenShare.value.trim(), url: manualScreenShareUrl },
         },
       };
+    }
+
+    function normalizeManualUpdateUrl(value) {
+      const text = String(value || '').trim();
+      if (!text) return '';
+      if (/^(https?:\/\/|\/)/i.test(text)) return text;
+      return '';
     }
 
     function channelOptions(selected) {
@@ -1226,6 +1278,76 @@
       `;
     }
 
+    function fmtBytes(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '-';
+      if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)}MB`;
+      if (n >= 1024) return `${Math.round(n / 1024)}KB`;
+      return `${Math.round(n)}B`;
+    }
+
+    function candidatePairText(pair) {
+      if (!pair) return '-';
+      const local = pair.local || {};
+      const remote = pair.remote || {};
+      const protocol = local.protocol || remote.protocol || '-';
+      const type = local.candidateType || '-';
+      const rtt = Number.isFinite(pair.currentRoundTripTime)
+        ? ` / ${Math.round(pair.currentRoundTripTime * 1000)}ms`
+        : '';
+      return `${protocol.toUpperCase()} ${type} ${local.address || '-'}:${local.port || '-'} -> ${remote.address || '-'}:${remote.port || '-'}${rtt}`;
+    }
+
+    function serverTransportText(item) {
+      if (!item) return '-';
+      const tuple = item.selectedTuple || {};
+      const proto = tuple.protocol ? tuple.protocol.toUpperCase() : '-';
+      const tcp = item.forceTcp ? ' TCP固定' : '';
+      return `${item.direction || '-'} ${item.iceState || '-'} / ${item.dtlsState || '-'} ${proto} ${tuple.remoteIp || '-'}:${tuple.remotePort || '-'}${tcp}`;
+    }
+
+    function rtpTotals(items, direction) {
+      const list = Array.isArray(items) ? items : [];
+      const stats = list.flatMap(item => Array.isArray(item.stats) ? item.stats : []);
+      const videoStats = stats.filter(item => (item.kind || '') === 'video');
+      const audioStats = stats.filter(item => (item.kind || '') === 'audio');
+      const sum = (rows, key) => rows.reduce((total, row) => total + (Number(row[key]) || 0), 0);
+      return {
+        videoBytes: sum(videoStats, direction === 'out' ? 'bytesSent' : 'bytesReceived'),
+        audioBytes: sum(audioStats, direction === 'out' ? 'bytesSent' : 'bytesReceived'),
+        videoFrames: sum(videoStats, direction === 'out' ? 'framesEncoded' : 'framesDecoded'),
+        lost: sum(stats, 'packetsLost'),
+      };
+    }
+
+    function diagnosticsRows(client) {
+      const transports = client.transports || {};
+      const serverTransports = Array.isArray(transports.server) ? transports.server : [];
+      const mediaStats = client.mediaStats || {};
+      const outbound = rtpTotals(mediaStats.producers, 'out');
+      const inbound = rtpTotals(mediaStats.consumers, 'in');
+      return `
+        <div>
+          <div class="section-title">ICE経路</div>
+          <div class="kv-grid">
+            <div class="kv"><span>送信候補</span><strong>${escapeHtml(candidatePairText(transports.sendSelectedCandidatePair))}</strong></div>
+            <div class="kv"><span>受信候補</span><strong>${escapeHtml(candidatePairText(transports.recvSelectedCandidatePair))}</strong></div>
+            <div class="kv"><span>SFU送信</span><strong>${escapeHtml(serverTransportText(serverTransports.find(item => item.direction === 'send')))}</strong></div>
+            <div class="kv"><span>SFU受信</span><strong>${escapeHtml(serverTransportText(serverTransports.find(item => item.direction === 'recv')))}</strong></div>
+          </div>
+        </div>
+        <div>
+          <div class="section-title">RTP実測</div>
+          <div class="kv-grid">
+            <div class="kv"><span>送信映像</span><strong>${fmtBytes(outbound.videoBytes)} / ${outbound.videoFrames || 0}f</strong></div>
+            <div class="kv"><span>送信音声</span><strong>${fmtBytes(outbound.audioBytes)}</strong></div>
+            <div class="kv"><span>受信映像</span><strong>${fmtBytes(inbound.videoBytes)} / ${inbound.videoFrames || 0}f</strong></div>
+            <div class="kv"><span>受信音声</span><strong>${fmtBytes(inbound.audioBytes)} / lost ${inbound.lost || 0}</strong></div>
+          </div>
+        </div>
+      `;
+    }
+
     function monitorRows(client) {
       const peers = client.remoteMonitor?.peers || [];
       if (!peers.length) return '<div class="empty">受信モニターなし</div>';
@@ -1304,6 +1426,8 @@
                 <span class="chip blue">受信 ${escapeHtml(transports.recvState || 'none')}</span>
               </div>
             </div>
+
+            ${diagnosticsRows(client)}
 
             <div>
               <div class="section-title">ON/OFF制御</div>
@@ -1641,6 +1765,7 @@
         <div class="update-file-row">
           <span class="update-file-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
           <span class="chip ${file.appType ? 'ok' : 'warn'}">${escapeHtml(file.appType || '判別不可')}</span>
+          <span class="chip ${file.platform ? 'ok' : 'warn'}">${escapeHtml(file.platform || 'OS不明')}</span>
           <span class="chip ${file.version ? 'blue' : 'warn'}">${escapeHtml(file.version || 'ver不明')}</span>
           <span class="chip">${fmtFileSize(file.size)}</span>
         </div>

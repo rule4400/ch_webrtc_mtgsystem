@@ -13,6 +13,139 @@
 import { io } from 'socket.io-client';
 import * as mediasoupClient from 'mediasoup-client';
 
+const CAMERA_ENCODINGS = [
+  { rid: 'r0', maxBitrate: 80_000, scaleResolutionDownBy: 4 },
+  { rid: 'r1', maxBitrate: 220_000, scaleResolutionDownBy: 2 },
+  { rid: 'r2', maxBitrate: 450_000 },
+];
+const SCREEN_SHARE_ENCODINGS = [
+  { rid: 'r0', maxBitrate: 180_000, scaleResolutionDownBy: 2 },
+  { rid: 'r1', maxBitrate: 700_000 },
+];
+
+function statsItems(stats) {
+  if (!stats || typeof stats.values !== 'function') return [];
+  return Array.from(stats.values());
+}
+
+function candidateAddress(candidate = {}) {
+  return candidate.address || candidate.ip || candidate.ipAddress || '';
+}
+
+function selectedCandidatePair(stats) {
+  const items = statsItems(stats);
+  const byId = new Map(items.map(item => [item.id, item]));
+  let pair = items.find(item => item.type === 'transport' && item.selectedCandidatePairId);
+  pair = pair ? byId.get(pair.selectedCandidatePairId) : null;
+  if (!pair) {
+    pair = items.find(item => item.type === 'candidate-pair' && (item.selected || item.nominated || item.state === 'succeeded'));
+  }
+  if (!pair) return null;
+  const local = byId.get(pair.localCandidateId) || {};
+  const remote = byId.get(pair.remoteCandidateId) || {};
+  return {
+    state: pair.state || '',
+    nominated: !!pair.nominated,
+    currentRoundTripTime: Number.isFinite(pair.currentRoundTripTime) ? pair.currentRoundTripTime : null,
+    availableOutgoingBitrate: Number.isFinite(pair.availableOutgoingBitrate) ? pair.availableOutgoingBitrate : null,
+    bytesSent: Number.isFinite(pair.bytesSent) ? pair.bytesSent : null,
+    bytesReceived: Number.isFinite(pair.bytesReceived) ? pair.bytesReceived : null,
+    local: {
+      protocol: local.protocol || '',
+      candidateType: local.candidateType || '',
+      address: candidateAddress(local),
+      port: Number(local.port) || null,
+      networkType: local.networkType || '',
+    },
+    remote: {
+      protocol: remote.protocol || '',
+      candidateType: remote.candidateType || '',
+      address: candidateAddress(remote),
+      port: Number(remote.port) || null,
+    },
+  };
+}
+
+function summarizeRtpStats(stats, direction) {
+  const targetType = direction === 'outbound' ? 'outbound-rtp' : 'inbound-rtp';
+  return statsItems(stats)
+    .filter(item => item.type === targetType && !item.isRemote)
+    .map(item => ({
+      id: item.id,
+      kind: item.kind || item.mediaType || '',
+      bytesSent: Number.isFinite(item.bytesSent) ? item.bytesSent : null,
+      packetsSent: Number.isFinite(item.packetsSent) ? item.packetsSent : null,
+      bytesReceived: Number.isFinite(item.bytesReceived) ? item.bytesReceived : null,
+      packetsReceived: Number.isFinite(item.packetsReceived) ? item.packetsReceived : null,
+      packetsLost: Number.isFinite(item.packetsLost) ? item.packetsLost : null,
+      framesEncoded: Number.isFinite(item.framesEncoded) ? item.framesEncoded : null,
+      framesDecoded: Number.isFinite(item.framesDecoded) ? item.framesDecoded : null,
+      framesDropped: Number.isFinite(item.framesDropped) ? item.framesDropped : null,
+      frameWidth: Number.isFinite(item.frameWidth) ? item.frameWidth : null,
+      frameHeight: Number.isFinite(item.frameHeight) ? item.frameHeight : null,
+      framesPerSecond: Number.isFinite(item.framesPerSecond) ? item.framesPerSecond : null,
+      jitter: Number.isFinite(item.jitter) ? item.jitter : null,
+    }));
+}
+
+function firstStats(items = [], kindOrSource = '') {
+  for (const item of items) {
+    if (item.kind === kindOrSource || item.source === kindOrSource) return Array.isArray(item.stats) ? item.stats[0] : null;
+  }
+  return null;
+}
+
+function telemetrySummary(payload = {}) {
+  const mediaStats = payload.mediaStats || {};
+  const producers = Array.isArray(mediaStats.producers) ? mediaStats.producers : [];
+  const consumers = Array.isArray(mediaStats.consumers) ? mediaStats.consumers : [];
+  const localMedia = payload.localMedia || {};
+  const transports = payload.transports || {};
+  const remoteMonitor = payload.remoteMonitor || {};
+  const outboundVideo = firstStats(producers, 'camera') || firstStats(producers, 'video');
+  const outboundAudio = firstStats(producers, 'microphone') || firstStats(producers, 'audio');
+  const inboundVideo = firstStats(consumers, 'video');
+  const inboundAudio = firstStats(consumers, 'audio');
+  const flags = [];
+
+  if (localMedia.cameraEnabled && !localMedia.video?.present) flags.push('camera-enabled-but-track-missing');
+  if (localMedia.micEnabled && !localMedia.audio?.present) flags.push('mic-enabled-but-track-missing');
+  if (localMedia.video?.readyState === 'live' && Number(outboundVideo?.bytesSent || 0) <= 0) flags.push('video-track-live-but-no-outbound-rtp');
+  if (localMedia.audio?.readyState === 'live' && Number(outboundAudio?.bytesSent || 0) <= 0) flags.push('audio-track-live-but-no-outbound-rtp');
+  if (remoteMonitor.peerCount > 0 && Number(inboundVideo?.bytesReceived || 0) <= 0) flags.push('remote-peer-present-but-no-inbound-video-rtp');
+  if (remoteMonitor.peerCount > 0 && Number(inboundAudio?.bytesReceived || 0) <= 0) flags.push('remote-peer-present-but-no-inbound-audio-rtp');
+  if (transports.socketConnected && !['connected', 'completed'].includes(String(transports.sendState || '').toLowerCase())) flags.push('socket-connected-send-transport-not-connected');
+  if (transports.socketConnected && !['connected', 'completed'].includes(String(transports.recvState || '').toLowerCase())) flags.push('socket-connected-recv-transport-not-connected');
+
+  return {
+    appType: payload.appType || '',
+    appVersion: payload.appVersion || '',
+    locationName: payload.locationName || '',
+    channelId: payload.channelId || '',
+    status: payload.status || '',
+    connection: payload.connection || {},
+    localMedia: {
+      cameraEnabled: !!localMedia.cameraEnabled,
+      micEnabled: !!localMedia.micEnabled,
+      speakerMuted: !!localMedia.speakerMuted,
+      video: localMedia.video || {},
+      audio: localMedia.audio || {},
+      error: localMedia.error || null,
+      audioProfile: localMedia.audioProfile || {},
+    },
+    remoteMonitor,
+    transports,
+    mediaStats,
+    rtpQuickLook: {
+      outboundVideo,
+      outboundAudio,
+      inboundVideo,
+      inboundAudio,
+    },
+    flags,
+  };
+}
+
 export class WebRTCManager {
   constructor() {
     this.socket        = null;
@@ -40,11 +173,14 @@ export class WebRTCManager {
     this.screenPaused          = false;
 
     this.iceServers      = [];     // サーバーから取得
+    this.forceTcpMedia   = false;
     this._initialized    = false;
     this._pendingQueue   = [];     // 初期化前に届いた newProducer
     this._locationName   = '';
     this._channelId      = 'general';
-    this._appVersion     = '0.1.0';
+    this._appVersion     = '0.2.5';
+    this._clientInstanceId = '';
+    this._platform       = '';
     this._manualDisconnect = false;
     this._setupInFlight = null;
     this._consumeInFlight = new Set();
@@ -56,6 +192,7 @@ export class WebRTCManager {
     this._connectGeneration = 0;
     this._sessionRebuildTimer = null;
     this._selfSocketId = '';
+    this._debugSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
     // コールバック
     this.onPeerUpdated      = null;  // (socketId, peer) => void
@@ -76,12 +213,38 @@ export class WebRTCManager {
     this.onScreenShareEnded = null; // () => void 共有トラック終了（ウィンドウが閉じた等）
   }
 
+  _debugLog(event, details = {}, severity = 'info') {
+    const payload = {
+      event,
+      severity,
+      details: {
+        debugSessionId: this._debugSessionId,
+        socketId: this.socket?.id || this._selfSocketId || '',
+        locationName: this._locationName,
+        channelId: this._channelId,
+        appVersion: this._appVersion,
+        platform: this._platform,
+        initialized: !!this._initialized,
+        forceTcpMedia: !!this.forceTcpMedia,
+        ...details,
+      },
+    };
+    try {
+      const result = window.electronAPI?.writeDebugLog?.(payload);
+      result?.catch?.(() => {});
+    } catch {
+      // Browser/dev environments without Electron logging still use console output.
+    }
+  }
+
   // ── 接続（mediasoup 初期化＋ローカル produce まで await）──────────────
 
   connect(serverUrl, locationName, options = {}) {
     this._locationName = locationName;
     this._channelId = options.channelId || this._channelId || 'general';
-    this._appVersion = options.appVersion || this._appVersion || '0.1.0';
+    this._appVersion = options.appVersion || this._appVersion || '0.2.5';
+    this._clientInstanceId = options.clientInstanceId || this._clientInstanceId || '';
+    this._platform = options.platform || this._platform || '';
     this._manualDisconnect = false;
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -106,18 +269,31 @@ export class WebRTCManager {
         randomizationFactor: 0.5,
         timeout: 12000,
       });
+      this._debugLog('socket.connect-start', {
+        serverUrl,
+        options: {
+          channelId: this._channelId,
+          clientInstanceId: this._clientInstanceId,
+        },
+      });
 
       this.socket.on('connect', async () => {
         const generation = this._connectGeneration + 1;
         this._connectGeneration = generation;
         this._selfSocketId = this.socket.id || '';
         console.log('[WebRTC] connected', this.socket.id);
+        this._debugLog('socket.connected', {
+          socketId: this.socket.id,
+          transport: this.socket.io?.engine?.transport?.name || '',
+        });
+        this._sendMetadata();
         try {
           await this._setupSession();
           this._setupRetryDelay = 1000;
           if (generation === this._connectGeneration) resolveOnce();
         } catch (err) {
           console.error('[WebRTC] connect setup failed', err);
+          this._debugLog('session.setup-error', { error: err.message, stack: err.stack }, 'error');
           this.onConnectionChange?.(false);
           this._scheduleSetupRetry();
           rejectOnce(err);
@@ -126,12 +302,14 @@ export class WebRTCManager {
 
       this.socket.on('connect_error', (err) => {
         console.warn('[WebRTC] connect_error:', err.message);
+        this._debugLog('socket.connect-error', { error: err.message, stack: err.stack }, 'error');
         this._initialized = false;
         this.onConnectionChange?.(false);
       });
 
       this.socket.on('disconnect', (reason) => {
         console.warn('[WebRTC] disconnected:', reason);
+        this._debugLog('socket.disconnected', { reason }, 'warn');
         this._connectGeneration += 1;
         this._initialized = false;
         this._clearSetupRetry();
@@ -143,28 +321,56 @@ export class WebRTCManager {
       });
 
       this.socket.io.on('reconnect_attempt', () => {
+        this._debugLog('socket.reconnect-attempt', {});
         if (!this._manualDisconnect) this.onConnectionChange?.(false);
       });
 
       this.socket.io.on('reconnect', () => {
         console.log('[WebRTC] reconnect transport restored');
+        this._debugLog('socket.reconnected', { transport: this.socket.io?.engine?.transport?.name || '' });
       });
 
       this._bindServerEvents();
     });
   }
 
+  _sendMetadata() {
+    if (!this.socket?.connected) return;
+    this.socket.emit('setMetadata', {
+      locationName: this._locationName,
+      appType: 'client',
+      channelId: this._channelId,
+      appVersion: this._appVersion,
+      clientInstanceId: this._clientInstanceId,
+      platform: this._platform,
+    });
+  }
+
+  _extractForceTcpMedia(config) {
+    if (typeof config?.forceTcpMedia === 'boolean') return config.forceTcpMedia;
+    if (typeof config?.mediaTransport?.forceTcp === 'boolean') return config.mediaTransport.forceTcp;
+    return null;
+  }
+
+  _applyMediaTransportConfig(config, reason = 'server-config') {
+    const nextForceTcp = this._extractForceTcpMedia(config);
+    if (nextForceTcp == null || nextForceTcp === this.forceTcpMedia) return false;
+    this.forceTcpMedia = nextForceTcp;
+    console.warn(`[WebRTC] media transport mode changed reason=${reason} forceTcp=${this.forceTcpMedia}`);
+    return true;
+  }
+
   /** 接続/再接続のたびに呼ぶ: device→transport→既存consume→ローカルreproduceを再構築 */
   async _setupSession() {
     if (this._setupInFlight) return this._setupInFlight;
     this._setupInFlight = (async () => {
-      this._clearSetupRetry();
-      this.socket.emit('setMetadata', {
-        locationName: this._locationName,
-        appType: 'client',
-        channelId: this._channelId,
-        appVersion: this._appVersion,
+      this._debugLog('session.setup-start', {
+        hasVideoTrack: !!this.localVideoTrack,
+        hasAudioTrack: !!this.localAudioTrack,
+        queuedProducers: this._pendingQueue.length,
       });
+      this._clearSetupRetry();
+      this._sendMetadata();
       await this._initMediasoup();
       this._initialized = true;
 
@@ -179,6 +385,14 @@ export class WebRTCManager {
 
       this.onConnectionChange?.(true);
       await this.syncPeers();
+      this._debugLog('session.setup-complete', {
+        sendTransportId: this.sendTransport?.id || '',
+        recvTransportId: this.recvTransport?.id || '',
+        videoProducerId: this.videoProducer?.id || '',
+        audioProducerId: this.audioProducer?.id || '',
+        consumers: this.consumers.size,
+        peers: this.peers.size,
+      });
     })();
 
     try {
@@ -197,11 +411,13 @@ export class WebRTCManager {
       this._setupRetryTimer = null;
       if (this._manualDisconnect || !this.socket?.connected) return;
       console.warn(`[WebRTC] retrying media setup in-place after ${delay}ms backoff`);
+      this._debugLog('session.setup-retry', { delayMs: delay }, 'warn');
       try {
         await this._setupSession();
         this._setupRetryDelay = 1000;
       } catch (err) {
         console.error('[WebRTC] setup retry failed', err);
+        this._debugLog('session.setup-retry-error', { error: err.message, stack: err.stack }, 'error');
         this.onConnectionChange?.(false);
         this._scheduleSetupRetry();
       }
@@ -220,6 +436,7 @@ export class WebRTCManager {
       this._sessionRebuildTimer = null;
       if (this._manualDisconnect || !this.socket?.connected) return;
       console.warn(`[WebRTC] rebuilding media session reason=${reason}`);
+      this._debugLog('session.rebuild-start', { reason }, 'warn');
       this._initialized = false;
       this._resetMediaSession({ keepPeers: true });
       try {
@@ -227,6 +444,7 @@ export class WebRTCManager {
         this._setupRetryDelay = 1000;
       } catch (err) {
         console.error('[WebRTC] session rebuild failed', err);
+        this._debugLog('session.rebuild-error', { reason, error: err.message, stack: err.stack }, 'error');
         this.onConnectionChange?.(false);
         this._scheduleSetupRetry();
       }
@@ -240,6 +458,18 @@ export class WebRTCManager {
   }
 
   _resetMediaSession({ notifyPeers = false, keepPeers = false } = {}) {
+    this._debugLog('session.reset-media', {
+      notifyPeers,
+      keepPeers,
+      producers: {
+        video: this.videoProducer?.id || '',
+        audio: this.audioProducer?.id || '',
+        screen: this.screenProducer?.id || '',
+        screenAudio: this.screenAudioProducer?.id || '',
+      },
+      consumers: this.consumers.size,
+      peers: this.peers.size,
+    });
     try { this.videoProducer?.close(); } catch { /* ignore close errors */ }
     try { this.audioProducer?.close(); } catch { /* ignore close errors */ }
     try { this.screenProducer?.close(); } catch { /* ignore close errors */ }
@@ -272,6 +502,7 @@ export class WebRTCManager {
     this.socket.on('newProducer', async ({ producerId, socketId, locationName: name, kind, paused, source, appData, channelId, appType }) => {
       if (this._isSelfSocket(socketId)) return;
       const payload = { producerId, socketId, locationName: name, kind, paused, source, appData, channelId, appType };
+      this._debugLog('server.new-producer', payload);
       if (!this._initialized) {
         if (!this._pendingQueue.find(p => p.producerId === producerId)) {
           this._pendingQueue.push(payload);
@@ -281,16 +512,35 @@ export class WebRTCManager {
       await this._consumePeer(producerId, socketId, name, kind, paused, payload);
     });
 
-    this.socket.on('producerClosed', ({ producerId }) => this._handleProducerClosed(producerId));
-    this.socket.on('producerPaused',  ({ producerId, socketId }) => this._setProducerPaused(producerId, socketId, true));
-    this.socket.on('producerResumed', ({ producerId, socketId }) => this._setProducerPaused(producerId, socketId, false));
+    this.socket.on('producerClosed', ({ producerId }) => {
+      this._debugLog('server.producer-closed', { producerId });
+      this._handleProducerClosed(producerId);
+    });
+    this.socket.on('producerPaused',  ({ producerId, socketId }) => {
+      this._debugLog('server.producer-paused', { producerId, socketId });
+      this._setProducerPaused(producerId, socketId, true);
+    });
+    this.socket.on('producerResumed', ({ producerId, socketId }) => {
+      this._debugLog('server.producer-resumed', { producerId, socketId });
+      this._setProducerPaused(producerId, socketId, false);
+    });
 
     this.socket.on('viewerPresence', (payload = {}) => {
       this.onViewerPresenceChange?.(!!payload.active);
     });
 
     this.socket.on('systemStateUpdated', (payload = {}) => {
+      const mediaTransportChanged = this._applyMediaTransportConfig(payload, 'system-state');
+      this._debugLog('server.system-state', {
+        mediaTransportChanged,
+        mediaTransport: payload.mediaTransport || {},
+        channels: Array.isArray(payload.channels) ? payload.channels.length : 0,
+        latestVersions: payload.latestVersions || {},
+      });
       this.onSystemStateUpdated?.(payload);
+      if (mediaTransportChanged && this._initialized) {
+        this._scheduleSessionRebuild('media-transport-config-changed');
+      }
     });
 
     this.socket.on('peerChannelChanged', (payload = {}) => {
@@ -325,7 +575,21 @@ export class WebRTCManager {
       this.onUpdateCommand?.(payload);
     });
 
+    this.socket.on('instanceReplaced', (payload = {}, ack) => {
+      ack?.({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
+      console.warn('[WebRTC] instance replaced by newer connection:', payload.replacementSocketId || 'unknown');
+      this._debugLog('server.instance-replaced', payload, 'warn');
+      this._manualDisconnect = true;
+      this._initialized = false;
+      this._clearSetupRetry();
+      this._clearSessionRebuild();
+      this._resetMediaSession({ notifyPeers: true, keepPeers: false });
+      this.onConnectionChange?.(false);
+      this.socket?.disconnect();
+    });
+
     this.socket.on('peerDisconnected', ({ socketId }) => {
+      this._debugLog('server.peer-disconnected', { socketId });
       const peer = this.peers.get(socketId);
       if (peer) {
         for (const pid of [peer.videoProducerId, peer.audioProducerId, peer.screenProducerId, peer.screenAudioProducerId]) {
@@ -380,6 +644,7 @@ export class WebRTCManager {
 
     this.socket.on('mediaLayerRestarted', async () => {
       console.warn('[WebRTC] media layer restarted, rebuilding session');
+      this._debugLog('server.media-layer-restarted', {}, 'warn');
       this._initialized = false;
       try {
         await this._setupSession();
@@ -421,13 +686,24 @@ export class WebRTCManager {
     try {
       const cfg = await this._request('getServerConfig');
       if (cfg && Array.isArray(cfg.iceServers)) this.iceServers = cfg.iceServers;
+      this._applyMediaTransportConfig(cfg, 'server-config');
+      this._debugLog('server.config', {
+        iceServersConfigured: this.iceServers.length,
+        forceTcpMedia: this.forceTcpMedia,
+      });
     } catch {
       // Older server versions did not expose this optional event.
+      this._debugLog('server.config-unavailable', {}, 'warn');
     }
 
     const caps = await this._request('getRouterRtpCapabilities');
     this.device = new mediasoupClient.Device();
     await this.device.load({ routerRtpCapabilities: caps });
+    this._debugLog('mediasoup.device-loaded', {
+      handlerName: this.device.handlerName,
+      canProduceVideo: this.device.canProduce('video'),
+      canProduceAudio: this.device.canProduce('audio'),
+    });
     await this._initSendTransport();
     await this._initRecvTransport();
 
@@ -445,32 +721,80 @@ export class WebRTCManager {
   }
 
   async _initSendTransport() {
-    const { params } = await this._request('createWebRtcTransport', { forceTcp: false });
+    const { params } = await this._request('createWebRtcTransport', { forceTcp: this.forceTcpMedia, direction: 'send' });
     this.sendTransport = this.device.createSendTransport(this._transportOptions(params));
+    this._debugLog('transport.created', {
+      direction: 'send',
+      transportId: this.sendTransport.id,
+      forceTcpMedia: this.forceTcpMedia,
+      iceServersConfigured: this.iceServers.length,
+      iceCandidates: params.iceCandidates || [],
+    });
     this.sendTransport.on('connect', async ({ dtlsParameters }, cb, eb) => {
-      try { await this._request('connectTransport', { transportId: this.sendTransport.id, dtlsParameters }); cb(); }
-      catch (e) { eb(e); }
+      try {
+        await this._request('connectTransport', { transportId: this.sendTransport.id, dtlsParameters });
+        this._debugLog('transport.connected', { direction: 'send', transportId: this.sendTransport.id });
+        cb();
+      }
+      catch (e) {
+        this._debugLog('transport.connect-error', { direction: 'send', transportId: this.sendTransport?.id || '', error: e.message }, 'error');
+        eb(e);
+      }
     });
     this.sendTransport.on('produce', async ({ kind, rtpParameters, appData }, cb, eb) => {
-      try { const { id } = await this._request('produce', { transportId: this.sendTransport.id, kind, rtpParameters, appData }); cb({ id }); }
-      catch (e) { eb(e); }
+      try {
+        const { id } = await this._request('produce', { transportId: this.sendTransport.id, kind, rtpParameters, appData });
+        this._debugLog('producer.created', {
+          producerId: id,
+          transportId: this.sendTransport.id,
+          kind,
+          source: appData?.source || '',
+          rtpEncodings: rtpParameters?.encodings || [],
+          rtpCodecs: rtpParameters?.codecs?.map(codec => ({
+            mimeType: codec.mimeType,
+            clockRate: codec.clockRate,
+            channels: codec.channels,
+          })) || [],
+        });
+        cb({ id });
+      }
+      catch (e) {
+        this._debugLog('producer.create-error', { kind, source: appData?.source || '', error: e.message }, 'error');
+        eb(e);
+      }
     });
     this.sendTransport.on('connectionstatechange', (s) => {
       console.log('[sendTransport]', s);
+      this._debugLog('transport.connection-state', { direction: 'send', transportId: this.sendTransport?.id || '', state: s }, ['failed', 'disconnected', 'closed'].includes(s) ? 'warn' : 'info');
       if (s === 'failed') this._scheduleIceRestart(this.sendTransport, 'sendTransport', 500);
       if (s === 'disconnected') this._scheduleIceRestart(this.sendTransport, 'sendTransport', 4500);
     });
   }
 
   async _initRecvTransport() {
-    const { params } = await this._request('createWebRtcTransport', { forceTcp: false });
+    const { params } = await this._request('createWebRtcTransport', { forceTcp: this.forceTcpMedia, direction: 'recv' });
     this.recvTransport = this.device.createRecvTransport(this._transportOptions(params));
+    this._debugLog('transport.created', {
+      direction: 'recv',
+      transportId: this.recvTransport.id,
+      forceTcpMedia: this.forceTcpMedia,
+      iceServersConfigured: this.iceServers.length,
+      iceCandidates: params.iceCandidates || [],
+    });
     this.recvTransport.on('connect', async ({ dtlsParameters }, cb, eb) => {
-      try { await this._request('connectTransport', { transportId: this.recvTransport.id, dtlsParameters }); cb(); }
-      catch (e) { eb(e); }
+      try {
+        await this._request('connectTransport', { transportId: this.recvTransport.id, dtlsParameters });
+        this._debugLog('transport.connected', { direction: 'recv', transportId: this.recvTransport.id });
+        cb();
+      }
+      catch (e) {
+        this._debugLog('transport.connect-error', { direction: 'recv', transportId: this.recvTransport?.id || '', error: e.message }, 'error');
+        eb(e);
+      }
     });
     this.recvTransport.on('connectionstatechange', (s) => {
       console.log('[recvTransport]', s);
+      this._debugLog('transport.connection-state', { direction: 'recv', transportId: this.recvTransport?.id || '', state: s }, ['failed', 'disconnected', 'closed'].includes(s) ? 'warn' : 'info');
       if (s === 'failed') this._scheduleIceRestart(this.recvTransport, 'recvTransport', 500);
       if (s === 'disconnected') this._scheduleIceRestart(this.recvTransport, 'recvTransport', 4500);
     });
@@ -482,8 +806,10 @@ export class WebRTCManager {
 
     const timer = setTimeout(() => {
       this._iceRestartTimers.delete(transport.id);
+      this._debugLog('transport.ice-restart-start', { label, transportId: transport.id, delayMs: delay }, 'warn');
       this._restartTransportIce(transport).catch(err => {
         console.warn(`[${label} restartIce]`, err.message);
+        this._debugLog('transport.ice-restart-error', { label, transportId: transport.id, error: err.message }, 'error');
         this._scheduleSessionRebuild(`${label}-ice-restart-failed`);
       });
     }, delay);
@@ -532,27 +858,37 @@ export class WebRTCManager {
       },
     };
     if (kind === 'video') {
-      params.encodings = [
-        { rid: 'r0', maxBitrate: 150_000, scaleResolutionDownBy: 4 },
-        { rid: 'r1', maxBitrate: 500_000, scaleResolutionDownBy: 2 },
-        { rid: 'r2', maxBitrate: 1_200_000 },
-      ];
-      params.codecOptions = { videoGoogleStartBitrate: 1000 };
+      params.encodings = CAMERA_ENCODINGS;
+      params.codecOptions = { videoGoogleStartBitrate: 250 };
     } else if (kind === 'audio') {
       params.codecOptions = {
         opusStereo: false,
         opusDtx: true,
         opusFec: true,
+        opusMaxAverageBitrate: 24_000,
         opusMaxPlaybackRate: 48000,
       };
     }
     const producer = await this.sendTransport.produce(params);
     producer.on('transportclose', () => {
+      this._debugLog('producer.transport-closed', {
+        producerId: producer.id,
+        kind,
+        source: params.appData.source,
+      }, 'warn');
       if (kind === 'video' && this.videoProducer === producer) this.videoProducer = null;
       if (kind === 'audio' && this.audioProducer === producer) this.audioProducer = null;
     });
     producer.on('trackended', () => {
       console.warn(`[producer] ${kind} track ended`);
+      this._debugLog('producer.track-ended', {
+        producerId: producer.id,
+        kind,
+        source: params.appData.source,
+        trackLabel: track.label || '',
+        trackReadyState: track.readyState,
+        trackMuted: !!track.muted,
+      }, 'warn');
     });
     return producer;
   }
@@ -668,11 +1004,8 @@ export class WebRTCManager {
         label: this.screenLabel || '画面共有',
         channelId: this._channelId,
       },
-      encodings: [
-        { rid: 'r0', maxBitrate: 600_000, scaleResolutionDownBy: 2 },
-        { rid: 'r1', maxBitrate: 1_800_000 },
-      ],
-      codecOptions: { videoGoogleStartBitrate: 1200 },
+      encodings: SCREEN_SHARE_ENCODINGS,
+      codecOptions: { videoGoogleStartBitrate: 500 },
     });
     this.screenProducer.on('transportclose', () => { this.screenProducer = null; });
     this.screenProducer.on('trackended', () => {
@@ -689,7 +1022,12 @@ export class WebRTCManager {
           label: this.screenLabel || '画面共有音声',
           channelId: this._channelId,
         },
-        codecOptions: { opusStereo: 1, opusDtx: 1 },
+        codecOptions: {
+          opusStereo: false,
+          opusDtx: true,
+          opusFec: true,
+          opusMaxAverageBitrate: 32_000,
+        },
       });
       this.screenAudioProducer.on('transportclose', () => { this.screenAudioProducer = null; });
     }
@@ -783,6 +1121,34 @@ export class WebRTCManager {
       });
       this.consumers.set(producerId, consumer);
       await this._request('resume', { consumerId: consumer.id });
+      this._debugLog('consumer.created', {
+        consumerId: consumer.id,
+        producerId,
+        socketId,
+        locationName,
+        kind: consumer.kind,
+        source: metadata.source || metadata.appData?.source || '',
+        trackReadyState: consumer.track?.readyState || '',
+        trackMuted: !!consumer.track?.muted,
+      });
+      consumer.on('transportclose', () => {
+        this._debugLog('consumer.transport-closed', {
+          consumerId: consumer.id,
+          producerId,
+          socketId,
+          kind: consumer.kind,
+        }, 'warn');
+      });
+      consumer.on('trackended', () => {
+        this._debugLog('consumer.track-ended', {
+          consumerId: consumer.id,
+          producerId,
+          socketId,
+          kind: consumer.kind,
+          trackReadyState: consumer.track?.readyState || '',
+          trackMuted: !!consumer.track?.muted,
+        }, 'warn');
+      });
 
       let peer = this.peers.get(socketId);
       if (!peer) {
@@ -832,6 +1198,15 @@ export class WebRTCManager {
       console.log(`[consume] ${socketId} ${kind} ok`);
     } catch (err) {
       console.error('[_consumePeer]', err);
+      this._debugLog('consumer.create-error', {
+        producerId,
+        socketId,
+        locationName,
+        kind,
+        source: metadata.source || metadata.appData?.source || '',
+        error: err.message,
+        stack: err.stack,
+      }, 'error');
     } finally {
       this._consumeInFlight.delete(producerId);
     }
@@ -946,28 +1321,88 @@ export class WebRTCManager {
 
   // ── ユーティリティ ────────────────────────────────────────
 
+  async _collectWebRtcDiagnostics() {
+    const transports = {};
+    const producers = [];
+    const consumers = [];
+
+    try {
+      const stats = await this.sendTransport?.getStats?.();
+      if (stats) transports.sendSelectedCandidatePair = selectedCandidatePair(stats);
+    } catch (err) {
+      transports.sendStatsError = err.message;
+    }
+
+    try {
+      const stats = await this.recvTransport?.getStats?.();
+      if (stats) transports.recvSelectedCandidatePair = selectedCandidatePair(stats);
+    } catch (err) {
+      transports.recvStatsError = err.message;
+    }
+
+    for (const [source, producer] of [
+      ['camera', this.videoProducer],
+      ['microphone', this.audioProducer],
+      ['screen', this.screenProducer],
+      ['screen-audio', this.screenAudioProducer],
+    ]) {
+      if (!producer || producer.closed) continue;
+      try {
+        const stats = await producer.getStats();
+        producers.push({ source, id: producer.id, kind: producer.kind, stats: summarizeRtpStats(stats, 'outbound') });
+      } catch (err) {
+        producers.push({ source, id: producer.id, kind: producer.kind, error: err.message });
+      }
+    }
+
+    for (const [producerId, consumer] of this.consumers.entries()) {
+      if (!consumer || consumer.closed) continue;
+      try {
+        const stats = await consumer.getStats();
+        consumers.push({ producerId, id: consumer.id, kind: consumer.kind, stats: summarizeRtpStats(stats, 'inbound') });
+      } catch (err) {
+        consumers.push({ producerId, id: consumer.id, kind: consumer.kind, error: err.message });
+      }
+    }
+
+    return { transports, mediaStats: { producers, consumers } };
+  }
+
   sendTelemetry(report) {
     if (!this.socket?.connected) return;
     const sentAt = Date.now();
-    const payload = {
-      ...report,
-      appVersion: report.appVersion || this._appVersion,
-      channelId: report.channelId || this._channelId,
-      clientTime: sentAt,
-      connection: {
-        ...(report.connection || {}),
-        telemetryRttMs: this._lastTelemetryRtt,
-        lastTelemetryAckAt: this._lastTelemetryAckAt,
-      },
-      transports: this.getTransportReport(),
-      consumers: this.getConsumerReport(),
-    };
+    this._collectWebRtcDiagnostics().then(diagnostics => {
+      if (!this.socket?.connected) return;
+      const payload = {
+        ...report,
+        appVersion: report.appVersion || this._appVersion,
+        platform: report.platform || this._platform,
+        channelId: report.channelId || this._channelId,
+        clientTime: sentAt,
+        connection: {
+          ...(report.connection || {}),
+          telemetryRttMs: this._lastTelemetryRtt,
+          lastTelemetryAckAt: this._lastTelemetryAckAt,
+        },
+        transports: {
+          ...this.getTransportReport(),
+          ...(diagnostics.transports || {}),
+        },
+        consumers: this.getConsumerReport(),
+        mediaStats: diagnostics.mediaStats || {},
+      };
 
-    this.socket.timeout(1500).emit('clientTelemetry', payload, (err) => {
-      if (err) return;
-      this._lastTelemetryRtt = Date.now() - sentAt;
-      this._lastTelemetryAckAt = Date.now();
-    });
+      this._debugLog('client.telemetry', telemetrySummary(payload));
+
+      this.socket.timeout(1500).emit('clientTelemetry', payload, (err) => {
+        if (err) {
+          this._debugLog('client.telemetry-ack-error', { error: err.message || String(err) }, 'warn');
+          return;
+        }
+        this._lastTelemetryRtt = Date.now() - sentAt;
+        this._lastTelemetryAckAt = Date.now();
+      });
+    }).catch(() => {});
   }
 
   getTransportReport() {
@@ -994,15 +1429,32 @@ export class WebRTCManager {
 
   _request(type, data = {}) {
     return new Promise((resolve, reject) => {
-      if (!this.socket?.connected) return reject(new Error('not connected'));
+      if (!this.socket?.connected) {
+        this._debugLog('signal.request-error', { type, error: 'not connected' }, 'error');
+        return reject(new Error('not connected'));
+      }
+      const startedAt = Date.now();
       let done = false;
-      const timer = setTimeout(() => { if (!done) { done = true; reject(new Error(`${type} timeout`)); } }, 12000);
+      const timer = setTimeout(() => {
+        if (!done) {
+          done = true;
+          this._debugLog('signal.request-timeout', { type, elapsedMs: Date.now() - startedAt }, 'error');
+          reject(new Error(`${type} timeout`));
+        }
+      }, 12000);
       this.socket.emit(type, data, (res) => {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        if (res && res.error) reject(new Error(res.error));
-        else resolve(res);
+        if (res && res.error) {
+          this._debugLog('signal.request-error', { type, elapsedMs: Date.now() - startedAt, error: res.error }, 'error');
+          reject(new Error(res.error));
+        } else {
+          if (['createWebRtcTransport', 'connectTransport', 'produce', 'consume', 'resume', 'restartIce'].includes(type)) {
+            this._debugLog('signal.request-ok', { type, elapsedMs: Date.now() - startedAt });
+          }
+          resolve(res);
+        }
       });
     });
   }
@@ -1029,6 +1481,7 @@ export class WebRTCManager {
   }
 
   disconnect() {
+    this._debugLog('client.disconnect-requested', {});
     this._manualDisconnect = true;
     this._initialized = false;
     this._clearSetupRetry();

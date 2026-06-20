@@ -18,7 +18,7 @@ import {
 import { WebRTCManager } from '../services/webrtc';
 import ScreenShareModal from '../components/ScreenShareModal';
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.2.5';
 const APP_TYPE = 'client';
 const CALL_RING_TIMEOUT_MS = 30000;
 const CALL_RING_INTERVAL_MS = 1500;
@@ -305,7 +305,11 @@ async function acquireMedia({ videoId, audioId, wantVideo = true, wantAudio = tr
     return { stream: null, error: 'この環境ではカメラ/マイクAPI（getUserMedia）が利用できません。' };
   }
 
-  const videoBase = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+  const videoBase = {
+    width: { ideal: 640, max: 960 },
+    height: { ideal: 360, max: 540 },
+    frameRate: { ideal: 15, max: 15 },
+  };
   const audioBase = {
     echoCancellation: { ideal: true },
     voiceIsolation: { ideal: true },
@@ -516,6 +520,26 @@ const defaultClientConfig = {
   channelId: 'general',
 };
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
+const CLIENT_INSTANCE_ID_KEY = 'sfu_client_instance_id';
+
+function createInstanceId(prefix) {
+  const random = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  return `${prefix}:${random}`;
+}
+
+function getOrCreateInstanceId(storageKey, prefix) {
+  try {
+    const saved = localStorage.getItem(storageKey);
+    if (saved) return saved;
+    const next = createInstanceId(prefix);
+    localStorage.setItem(storageKey, next);
+    return next;
+  } catch {
+    return createInstanceId(prefix);
+  }
+}
 
 async function connectWithinStartupWindow(manager, serverUrl, locationName, options = {}) {
   let timedOut = false;
@@ -657,6 +681,7 @@ export default function MainView() {
   const [systemState, setSystemState] = useState(DEFAULT_SYSTEM_STATE);
   const [channelId, setChannelId] = useState(() => sanitizeClientConfig(loadClientConfig()).channelId);
   const [updateNotice, setUpdateNotice] = useState(null);
+  const [updateDownload, setUpdateDownload] = useState(null);
   const [focusedTileId, setFocusedTileId] = useState('');
   const [peerVolumes, setPeerVolumes] = useState({});
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -693,6 +718,7 @@ export default function MainView() {
   const outgoingCallTimerRef = useRef(null);
   const callNoticeTimerRef = useRef(null);
   const screenShareRef = useRef(null);
+  const updateDownloadKeyRef = useRef('');
 
   useEffect(() => { outgoingCallRef.current = outgoingCall; }, [outgoingCall]);
   useEffect(() => { screenShareRef.current = screenShare; }, [screenShare]);
@@ -709,8 +735,10 @@ export default function MainView() {
   ), [channels, channelId]);
   const activeChannelId = activeChannel?.id || channelId || 'general';
 
-  const updatePackage = systemState.updatePackages?.[APP_TYPE] || null;
-  const latestVersion = systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
+  const currentPlatform = window.electronAPI?.platform || '';
+  const rawUpdatePackage = systemState.updatePackages?.[APP_TYPE] || null;
+  const updatePackage = rawUpdatePackage?.platforms?.[currentPlatform] || rawUpdatePackage;
+  const latestVersion = updatePackage?.version || systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
   const updateAvailable = latestVersion && latestVersion !== APP_VERSION;
   const peerEntries = useMemo(() => Array.from(peers.entries()), [peers]);
 
@@ -1281,6 +1309,8 @@ export default function MainView() {
     const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName, {
       channelId: conf.channelId,
       appVersion: APP_VERSION,
+      clientInstanceId: getOrCreateInstanceId(CLIENT_INSTANCE_ID_KEY, APP_TYPE),
+      platform: window.electronAPI?.platform || '',
     });
     setSfuStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     return { manager: rtcManager, connectionState };
@@ -1880,6 +1910,10 @@ export default function MainView() {
   }, [sidebarCollapsed, sidebarWidth]);
 
   const openUpdate = useCallback(() => {
+    if (updateDownload?.path && updateDownload.status === 'ready') {
+      window.electronAPI?.openDownloadedUpdate?.(updateDownload.path);
+      return;
+    }
     let url = updateNotice?.packageInfo?.url || updatePackage?.url;
     if (!url) return;
     // サーバー配布の相対パス（/updates/...）は接続中サーバーのURLで解決する
@@ -1888,7 +1922,27 @@ export default function MainView() {
       url = `${base}${url.startsWith('/') ? '' : '/'}${url}`;
     }
     window.electronAPI?.openExternal?.(url);
-  }, [updateNotice, updatePackage]);
+  }, [updateDownload, updateNotice, updatePackage]);
+
+  useEffect(() => {
+    const packageInfo = updateNotice?.packageInfo || updatePackage;
+    if (!updateAvailable || !packageInfo?.url || !window.electronAPI?.downloadUpdatePackage) return;
+    const key = `${packageInfo.version || latestVersion}:${packageInfo.url}`;
+    if (updateDownloadKeyRef.current === key) return;
+    updateDownloadKeyRef.current = key;
+    let cancelled = false;
+    setUpdateDownload({ status: 'downloading', packageInfo });
+    window.electronAPI.downloadUpdatePackage(packageInfo)
+      .then(result => {
+        if (cancelled) return;
+        setUpdateDownload({ status: 'ready', packageInfo, ...result });
+      })
+      .catch(err => {
+        console.warn('[updateDownload]', err.message);
+        if (!cancelled) setUpdateDownload({ status: 'error', packageInfo, error: err.message });
+      });
+    return () => { cancelled = true; };
+  }, [latestVersion, updateAvailable, updateNotice, updatePackage]);
 
   // ─── 画面共有（Client内蔵）──────────────────────────────
   const stopScreenShare = useCallback(async () => {
@@ -1919,9 +1973,9 @@ export default function MainView() {
           mandatory: {
             chromeMediaSource: 'desktop',
             chromeMediaSourceId: source.id,
-            maxWidth: 1920,
-            maxHeight: 1080,
-            maxFrameRate: 15,
+            maxWidth: 1280,
+            maxHeight: 720,
+            maxFrameRate: 10,
           },
         },
       };
@@ -2335,8 +2389,8 @@ export default function MainView() {
               type="button"
               className="update-mini"
               onClick={openUpdate}
-              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url}
-              title="アップデート"
+              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url && updateDownload?.status !== 'ready'}
+              title={updateDownload?.status === 'ready' ? 'ダウンロード済みアップデートを開く' : 'アップデート'}
             >
               <Download size={14} />
               <span>v{latestVersion}</span>

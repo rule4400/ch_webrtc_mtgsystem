@@ -49,13 +49,16 @@ const DEFAULT_SYSTEM_SETTINGS = {
     { id: 'support', name: 'サポート' },
   ],
   latestVersions: {
-    client: '0.1.0',
-    viewer: '0.1.0',
-    'screen-share': '0.1.0',
-    server: '1.0.0',
-    'server-gui': '1.0.0',
+    client: '0.2.5',
+    viewer: '0.1.5',
+    'screen-share': '0.1.4',
+    server: '1.1.5',
+    'server-gui': '1.0.5',
   },
   updatePackages: {},
+  mediaTransport: {
+    forceTcp: false,
+  },
   updateFolder: '',
 };
 
@@ -66,6 +69,44 @@ const DEFAULT_SYSTEM_SETTINGS = {
 const UPDATE_FILE_EXT = /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i;
 let updateFolderWatcher = null;
 let updateFolderScanTimer = null;
+
+function normalizeUpdatePlatform(value) {
+  const raw = String(value || '').toLowerCase();
+  if (raw === 'macos' || raw === 'mac' || raw === 'darwin' || raw === 'osx') return 'darwin';
+  if (raw === 'windows' || raw === 'win' || raw === 'win32' || raw === 'win64') return 'win32';
+  if (raw === 'linux') return 'linux';
+  return '';
+}
+
+function detectPlatformFromPath(relativeName) {
+  const normalized = String(relativeName || '').replace(/\\/g, '/').toLowerCase();
+  const parts = normalized.split('/').filter(Boolean);
+  for (const part of parts) {
+    const platform = normalizeUpdatePlatform(part);
+    if (platform) return platform;
+  }
+  if (/\.(dmg|pkg)$/i.test(normalized)) return 'darwin';
+  if (/\.(exe|msi)$/i.test(normalized)) return 'win32';
+  if (/\.(appimage|deb)$/i.test(normalized)) return 'linux';
+  return '';
+}
+
+function walkUpdateFiles(dir, prefix = '') {
+  const files = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === '.DS_Store') continue;
+    const fullPath = path.join(dir, entry.name);
+    const relativeName = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      files.push(...walkUpdateFiles(fullPath, relativeName));
+      continue;
+    }
+    if (!entry.isFile() || !UPDATE_FILE_EXT.test(entry.name)) continue;
+    const stat = fs.statSync(fullPath);
+    files.push({ name: relativeName, path: fullPath, size: stat.size, mtimeMs: stat.mtimeMs });
+  }
+  return files;
+}
 
 function detectAppTypeFromFilename(name) {
   const lower = String(name || '').toLowerCase();
@@ -78,7 +119,7 @@ function detectAppTypeFromFilename(name) {
 }
 
 function detectVersionFromFilename(name) {
-  const match = String(name || '').match(/(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?)/);
+  const match = String(name || '').match(/(\d+\.\d+\.\d+)(?=[^0-9]|$)/);
   return match ? match[1] : '';
 }
 
@@ -86,37 +127,37 @@ function scanUpdateFolder(dir) {
   const result = { folder: dir || '', files: [], packages: {} };
   if (!dir || !fs.existsSync(dir)) return result;
 
-  let names = [];
+  let files = [];
   try {
-    names = fs.readdirSync(dir).filter(name => UPDATE_FILE_EXT.test(name));
+    files = walkUpdateFiles(dir);
   } catch (err) {
     safeSend('server-log', `WARN: アップデートフォルダを読み取れません: ${err.message}`);
     return result;
   }
 
-  for (const name of names) {
-    let stat;
-    try {
-      stat = fs.statSync(path.join(dir, name));
-    } catch {
-      continue;
-    }
+  for (const source of files) {
+    const name = source.name;
     const appType = detectAppTypeFromFilename(name);
     const version = detectVersionFromFilename(name);
-    const file = { name, appType, version, size: stat.size, mtimeMs: stat.mtimeMs };
+    const platform = detectPlatformFromPath(name);
+    const file = { name, appType, version, platform, size: source.size, mtimeMs: source.mtimeMs };
     result.files.push(file);
 
-    if (!appType || !version) continue;
-    const existing = result.packages[appType];
-    // 同一アプリが複数ある場合は新しい mtime を採用
-    if (!existing || stat.mtimeMs > existing.mtimeMs) {
-      result.packages[appType] = {
+    if (!appType || !version || !platform) continue;
+    const currentAppPackage = result.packages[appType] || { version, platforms: {} };
+    const existing = currentAppPackage.platforms[platform];
+    // 同一アプリ/OSが複数ある場合は新しい mtime を採用
+    if (!existing || source.mtimeMs > existing.mtimeMs) {
+      currentAppPackage.version = version;
+      currentAppPackage.platforms[platform] = {
         version,
+        platform,
         url: `/updates/${encodeURIComponent(name)}`,
         notes: `自動検出: ${name}`,
         fileName: name,
-        mtimeMs: stat.mtimeMs,
+        mtimeMs: source.mtimeMs,
       };
+      result.packages[appType] = currentAppPackage;
     }
   }
   return result;
@@ -133,8 +174,10 @@ function applyUpdateScan(dir, { announce = true } = {}) {
     settings.updatePackages[appType] = {
       ...(settings.updatePackages[appType] || {}),
       version: pkg.version,
-      url: pkg.url,
-      notes: pkg.notes,
+      platforms: {
+        ...(settings.updatePackages[appType]?.platforms || {}),
+        ...(pkg.platforms || {}),
+      },
       registeredAt: Date.now(),
     };
   }
@@ -226,19 +269,42 @@ function sanitizeSystemSettings(input = {}) {
   const updatePackages = raw.updatePackages && typeof raw.updatePackages === 'object'
     ? raw.updatePackages
     : {};
+  const rawMediaTransport = raw.mediaTransport && typeof raw.mediaTransport === 'object'
+    ? raw.mediaTransport
+    : {};
 
   return {
     channels: sanitizeChannels(raw.channels),
     updateFolder: shortText(raw.updateFolder, 1024),
     latestVersions: Object.fromEntries(Object.entries(latestVersions).map(([key, value]) => [key, shortText(value, 48)])),
+    mediaTransport: {
+      forceTcp: !!rawMediaTransport.forceTcp,
+    },
     updatePackages: Object.fromEntries(Object.entries(updatePackages).map(([key, value]) => {
       const pkg = value && typeof value === 'object' ? value : {};
+      const platforms = {};
+      for (const [platform, platformPkg] of Object.entries(pkg.platforms && typeof pkg.platforms === 'object' ? pkg.platforms : {})) {
+        const normalizedPlatform = normalizeUpdatePlatform(platform);
+        if (!normalizedPlatform) continue;
+        const item = platformPkg && typeof platformPkg === 'object' ? platformPkg : {};
+        platforms[normalizedPlatform] = {
+          version: shortText(item.version || pkg.version || latestVersions[key] || '', 48),
+          platform: normalizedPlatform,
+          url: shortText(item.url, 1024),
+          notes: shortText(item.notes, 1000),
+          sha256: shortText(item.sha256, 128),
+          fileName: shortText(item.fileName, 512),
+          required: !!item.required,
+          registeredAt: Number.isFinite(item.registeredAt) ? item.registeredAt : Date.now(),
+        };
+      }
       return [key, {
         version: shortText(pkg.version || latestVersions[key] || '', 48),
         url: shortText(pkg.url, 1024),
         notes: shortText(pkg.notes, 1000),
         sha256: shortText(pkg.sha256, 128),
         required: !!pkg.required,
+        platforms,
         registeredAt: Number.isFinite(pkg.registeredAt) ? pkg.registeredAt : Date.now(),
       }];
     })),
@@ -606,7 +672,7 @@ function ensureBundledServerRuntime() {
   const runtimeDir = getBundledServerRuntimeDir();
   fs.mkdirSync(runtimeDir, { recursive: true });
 
-  for (const file of ['index.js', 'config.js', 'package.json', '.env.example']) {
+  for (const file of ['index.js', 'config.js', 'debug-log.js', 'package.json', '.env.example']) {
     const src = path.join(sourceDir, file);
     if (fs.existsSync(src)) copyFileIfChanged(src, path.join(runtimeDir, file));
   }
