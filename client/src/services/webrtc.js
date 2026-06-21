@@ -926,18 +926,19 @@ export class WebRTCManager {
 
   async _consumePeer(producerId, socketId, locationName, kind, paused, metadata = {}) {
     if (this._isSelfSocket(socketId)) return;
-    if (!this.recvTransport) { console.warn('[consume] recvTransport not ready'); return; }
+    if (!this.recvTransport || this.recvTransport.closed) { console.warn('[consume] recvTransport not ready'); return; }
     if (this.consumers.has(producerId)) return; // 重複消費を防ぐ
     if (this._consumeInFlight.has(producerId)) return;
     this._consumeInFlight.add(producerId);
 
+    let consumer = null;
     try {
       const { params } = await this._request('consume', {
         transportId:     this.recvTransport.id,
         producerId,
         rtpCapabilities: this.device.rtpCapabilities,
       });
-      const consumer = await this.recvTransport.consume({
+      consumer = await this.recvTransport.consume({
         id:            params.id,
         producerId:    params.producerId,
         kind:          params.kind,
@@ -994,6 +995,21 @@ export class WebRTCManager {
       console.log(`[consume] ${socketId} ${kind} ok`);
     } catch (err) {
       console.error('[_consumePeer]', err);
+      // consume / resume が途中で失敗した場合、作りかけの consumer を確実に破棄して
+      // consumers から取り除く。残したままだと consumers.has(producerId) により
+      // syncPeers / newProducer が再消費をスキップし、一過性の失敗でタイルが
+      // 恒久的に黒画面・無音のまま固定されてしまう。破棄しておけば 1 秒周期の
+      // syncPeers が同じ producer を再消費して自己回復する。
+      if (consumer) {
+        const orphanTrack = consumer.track || null;
+        try { consumer.close(); } catch { /* ignore close errors */ }
+        const peer = this.peers.get(socketId);
+        if (orphanTrack && peer) {
+          try { peer.stream?.removeTrack(orphanTrack); } catch { /* ignore */ }
+          try { peer.screenStream?.removeTrack(orphanTrack); } catch { /* ignore */ }
+        }
+      }
+      this.consumers.delete(producerId);
     } finally {
       this._consumeInFlight.delete(producerId);
     }
