@@ -1,6 +1,6 @@
 {
   "name": "checkhouse-meeting-server-gui",
-  "version": "1.0.0",
+  "version": "1.0.9",
   "description": "CHECKHOUSE Meeting System server controller",
   "main": "main.cjs",
   "scripts": {
@@ -16,13 +16,20 @@
     "productName": "CHECKHOUSE Meeting Server",
     "mac": {
       "icon": "build/icon.icns",
-      "target": ["dmg", "dir"],
+      "target": [
+        "dmg",
+        "dir"
+      ],
       "hardenedRuntime": true,
       "gatekeeperAssess": false
     },
     "win": {
       "icon": "build/icon.ico",
-      "target": ["nsis", "portable", "zip"]
+      "target": [
+        "nsis",
+        "portable",
+        "zip"
+      ]
     },
     "directories": {
       "output": "release"
@@ -34,6 +41,7 @@
         "filter": [
           "index.js",
           "config.js",
+          "debug-log.js",
           "package.json",
           ".env.example"
         ]

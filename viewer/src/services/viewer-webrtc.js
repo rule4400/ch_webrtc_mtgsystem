@@ -1,6 +1,67 @@
 import { io } from 'socket.io-client';
 import * as mediasoupClient from 'mediasoup-client';
 
+function statsItems(stats) {
+  if (!stats || typeof stats.values !== 'function') return [];
+  return Array.from(stats.values());
+}
+
+function candidateAddress(candidate = {}) {
+  return candidate.address || candidate.ip || candidate.ipAddress || '';
+}
+
+function selectedCandidatePair(stats) {
+  const items = statsItems(stats);
+  const byId = new Map(items.map(item => [item.id, item]));
+  let pair = items.find(item => item.type === 'transport' && item.selectedCandidatePairId);
+  pair = pair ? byId.get(pair.selectedCandidatePairId) : null;
+  if (!pair) {
+    pair = items.find(item => item.type === 'candidate-pair' && (item.selected || item.nominated || item.state === 'succeeded'));
+  }
+  if (!pair) return null;
+  const local = byId.get(pair.localCandidateId) || {};
+  const remote = byId.get(pair.remoteCandidateId) || {};
+  return {
+    state: pair.state || '',
+    nominated: !!pair.nominated,
+    currentRoundTripTime: Number.isFinite(pair.currentRoundTripTime) ? pair.currentRoundTripTime : null,
+    availableOutgoingBitrate: Number.isFinite(pair.availableOutgoingBitrate) ? pair.availableOutgoingBitrate : null,
+    bytesSent: Number.isFinite(pair.bytesSent) ? pair.bytesSent : null,
+    bytesReceived: Number.isFinite(pair.bytesReceived) ? pair.bytesReceived : null,
+    local: {
+      protocol: local.protocol || '',
+      candidateType: local.candidateType || '',
+      address: candidateAddress(local),
+      port: Number(local.port) || null,
+      networkType: local.networkType || '',
+    },
+    remote: {
+      protocol: remote.protocol || '',
+      candidateType: remote.candidateType || '',
+      address: candidateAddress(remote),
+      port: Number(remote.port) || null,
+    },
+  };
+}
+
+function summarizeRtpStats(stats) {
+  return statsItems(stats)
+    .filter(item => item.type === 'inbound-rtp' && !item.isRemote)
+    .map(item => ({
+      id: item.id,
+      kind: item.kind || item.mediaType || '',
+      bytesReceived: Number.isFinite(item.bytesReceived) ? item.bytesReceived : null,
+      packetsReceived: Number.isFinite(item.packetsReceived) ? item.packetsReceived : null,
+      packetsLost: Number.isFinite(item.packetsLost) ? item.packetsLost : null,
+      framesDecoded: Number.isFinite(item.framesDecoded) ? item.framesDecoded : null,
+      framesDropped: Number.isFinite(item.framesDropped) ? item.framesDropped : null,
+      frameWidth: Number.isFinite(item.frameWidth) ? item.frameWidth : null,
+      frameHeight: Number.isFinite(item.frameHeight) ? item.frameHeight : null,
+      framesPerSecond: Number.isFinite(item.framesPerSecond) ? item.framesPerSecond : null,
+      jitter: Number.isFinite(item.jitter) ? item.jitter : null,
+    }));
+}
+
 export class ViewerWebRTCManager {
   constructor() {
     this.socket = null;
@@ -11,10 +72,13 @@ export class ViewerWebRTCManager {
     this.peers = new Map();
 
     this.iceServers = [];
+    this.forceTcpMedia = false;
     this._initialized = false;
     this._pendingQueue = [];
     this._viewerName = '';
-    this._appVersion = '0.1.0';
+    this._appVersion = '0.1.5';
+    this._clientInstanceId = '';
+    this._platform = '';
     this._manualDisconnect = false;
     this._setupInFlight = null;
     this._consumeInFlight = new Set();
@@ -39,7 +103,9 @@ export class ViewerWebRTCManager {
 
   connect(serverUrl, viewerName, options = {}) {
     this._viewerName = viewerName || '閲覧端末';
-    this._appVersion = options.appVersion || this._appVersion || '0.1.0';
+    this._appVersion = options.appVersion || this._appVersion || '0.1.5';
+    this._clientInstanceId = options.clientInstanceId || this._clientInstanceId || '';
+    this._platform = options.platform || this._platform || '';
     this._manualDisconnect = false;
 
     return new Promise((resolve, reject) => {
@@ -56,6 +122,7 @@ export class ViewerWebRTCManager {
 
       this.socket.once('connect', async () => {
         console.log('[ViewerWebRTC] connected', this.socket.id);
+        this._sendMetadata();
         try {
           await this._setupSession();
           this._setupRetryDelay = 1000;
@@ -84,6 +151,7 @@ export class ViewerWebRTCManager {
 
       this.socket.io.on('reconnect', async () => {
         console.log('[ViewerWebRTC] reconnected, rebuilding session');
+        this._sendMetadata();
         try {
           await this._setupSession();
           this._setupRetryDelay = 1000;
@@ -98,16 +166,37 @@ export class ViewerWebRTCManager {
     });
   }
 
+  _extractForceTcpMedia(config) {
+    if (typeof config?.forceTcpMedia === 'boolean') return config.forceTcpMedia;
+    if (typeof config?.mediaTransport?.forceTcp === 'boolean') return config.mediaTransport.forceTcp;
+    return null;
+  }
+
+  _applyMediaTransportConfig(config, reason = 'server-config') {
+    const nextForceTcp = this._extractForceTcpMedia(config);
+    if (nextForceTcp == null || nextForceTcp === this.forceTcpMedia) return false;
+    this.forceTcpMedia = nextForceTcp;
+    console.warn(`[ViewerWebRTC] media transport mode changed reason=${reason} forceTcp=${this.forceTcpMedia}`);
+    return true;
+  }
+
+  _sendMetadata() {
+    if (!this.socket?.connected) return;
+    this.socket.emit('setMetadata', {
+      locationName: this._viewerName,
+      appType: 'viewer',
+      appVersion: this._appVersion,
+      clientInstanceId: this._clientInstanceId,
+      platform: this._platform,
+    });
+  }
+
   async _setupSession() {
     if (this._setupInFlight) return this._setupInFlight;
 
     this._setupInFlight = (async () => {
       this._clearSetupRetry();
-      this.socket.emit('setMetadata', {
-        locationName: this._viewerName,
-        appType: 'viewer',
-        appVersion: this._appVersion,
-      });
+      this._sendMetadata();
       await this._initMediasoup();
       this._initialized = true;
 
@@ -213,7 +302,11 @@ export class ViewerWebRTCManager {
     this.socket.on('producerResumed', ({ producerId, socketId }) => this._setProducerPaused(producerId, socketId, false));
 
     this.socket.on('systemStateUpdated', (payload = {}) => {
+      const mediaTransportChanged = this._applyMediaTransportConfig(payload, 'system-state');
       this.onSystemStateUpdated?.(payload);
+      if (mediaTransportChanged && this._initialized) {
+        this._scheduleSessionRebuild('media-transport-config-changed');
+      }
     });
 
     this.socket.on('peerChannelChanged', (payload = {}) => {
@@ -228,6 +321,18 @@ export class ViewerWebRTCManager {
     this.socket.on('updateCommand', (payload = {}, ack) => {
       ack?.({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
       this.onUpdateCommand?.(payload);
+    });
+
+    this.socket.on('instanceReplaced', (payload = {}, ack) => {
+      ack?.({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
+      console.warn('[ViewerWebRTC] instance replaced by newer connection:', payload.replacementSocketId || 'unknown');
+      this._manualDisconnect = true;
+      this._initialized = false;
+      this._clearSetupRetry();
+      this._clearSessionRebuild();
+      this._resetMediaSession({ notifyPeers: true });
+      this.onConnectionChange?.(false);
+      this.socket?.disconnect();
     });
 
     this.socket.on('peerDisconnected', ({ socketId }) => {
@@ -314,6 +419,7 @@ export class ViewerWebRTCManager {
     try {
       const config = await this._request('getServerConfig');
       if (config && Array.isArray(config.iceServers)) this.iceServers = config.iceServers;
+      this._applyMediaTransportConfig(config, 'server-config');
     } catch {
       // Older server versions did not expose this optional event.
     }
@@ -334,7 +440,7 @@ export class ViewerWebRTCManager {
   }
 
   async _initRecvTransport() {
-    const { params } = await this._request('createWebRtcTransport', { forceTcp: false });
+    const { params } = await this._request('createWebRtcTransport', { forceTcp: this.forceTcpMedia, direction: 'recv' });
     this.recvTransport = this.device.createRecvTransport(this._transportOptions(params));
     this.recvTransport.on('connect', async ({ dtlsParameters }, cb, eb) => {
       try {
@@ -594,27 +700,59 @@ export class ViewerWebRTCManager {
     });
   }
 
+  async _collectWebRtcDiagnostics() {
+    const transports = {};
+    const consumers = [];
+
+    try {
+      const stats = await this.recvTransport?.getStats?.();
+      if (stats) transports.recvSelectedCandidatePair = selectedCandidatePair(stats);
+    } catch (err) {
+      transports.recvStatsError = err.message;
+    }
+
+    for (const [producerId, consumer] of this.consumers.entries()) {
+      if (!consumer || consumer.closed) continue;
+      try {
+        const stats = await consumer.getStats();
+        consumers.push({ producerId, id: consumer.id, kind: consumer.kind, stats: summarizeRtpStats(stats) });
+      } catch (err) {
+        consumers.push({ producerId, id: consumer.id, kind: consumer.kind, error: err.message });
+      }
+    }
+
+    return { transports, mediaStats: { producers: [], consumers } };
+  }
+
   sendTelemetry(report) {
     if (!this.socket?.connected) return;
     const sentAt = Date.now();
-    const payload = {
-      ...report,
-      appVersion: report.appVersion || this._appVersion,
-      clientTime: sentAt,
-      connection: {
-        ...(report.connection || {}),
-        telemetryRttMs: this._lastTelemetryRtt,
-        lastTelemetryAckAt: this._lastTelemetryAckAt,
-      },
-      transports: this.getTransportReport(),
-      consumers: this.getConsumerReport(),
-    };
+    this._collectWebRtcDiagnostics().then(diagnostics => {
+      if (!this.socket?.connected) return;
+      const payload = {
+        ...report,
+        appVersion: report.appVersion || this._appVersion,
+        platform: report.platform || this._platform,
+        clientTime: sentAt,
+        connection: {
+          ...(report.connection || {}),
+          telemetryRttMs: this._lastTelemetryRtt,
+          lastTelemetryAckAt: this._lastTelemetryAckAt,
+        },
+        transports: {
+          ...this.getTransportReport(),
+          ...(diagnostics.transports || {}),
+        },
+        consumers: this.getConsumerReport(),
+        mediaStats: diagnostics.mediaStats || {},
+      };
 
-    this.socket.timeout(1500).emit('clientTelemetry', payload, (err) => {
-      if (err) return;
-      this._lastTelemetryRtt = Date.now() - sentAt;
-      this._lastTelemetryAckAt = Date.now();
-    });
+      this.socket.timeout(1500).emit('clientTelemetry', payload, (err) => {
+        if (err) return;
+        this._lastTelemetryRtt = Date.now() - sentAt;
+        this._lastTelemetryAckAt = Date.now();
+      });
+    }).catch(() => {});
   }
 
   getTransportReport() {

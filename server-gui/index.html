@@ -197,7 +197,7 @@
     }
 
     .dashboard-layout {
-      grid-template-rows: auto 1fr;
+      grid-template-rows: auto minmax(0, 1fr);
       gap: 14px;
       min-height: 0;
     }
@@ -246,11 +246,12 @@
       max-height: 100%;
       overflow: auto;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr));
       align-content: start;
       gap: 12px;
-      padding-right: 4px;
+      padding: 0 6px 18px 0;
       overscroll-behavior: contain;
+      scrollbar-gutter: stable;
     }
 
     .client-card {
@@ -259,8 +260,6 @@
       border-radius: 8px;
       min-width: 0;
       overflow: hidden;
-      content-visibility: auto;
-      contain-intrinsic-size: 96px;
     }
 
     .client-card.healthy { border-color: rgba(56,217,150,0.45); }
@@ -309,18 +308,14 @@
     }
 
     .client-name {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
     }
 
     .client-meta {
       margin-top: 4px;
       color: var(--muted);
       font-size: 0.72rem;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
     }
 
     .client-actions {
@@ -330,7 +325,7 @@
       align-items: center;
       justify-content: flex-end;
       min-width: 0;
-      flex: 0 1 auto;
+      flex: 1 1 230px;
     }
 
     .mini-btn {
@@ -352,6 +347,12 @@
       padding: 12px;
       display: grid;
       gap: 12px;
+    }
+
+    .client-section {
+      min-width: 0;
+      display: grid;
+      gap: 8px;
     }
 
     .kv-grid {
@@ -382,9 +383,9 @@
     .kv strong {
       display: block;
       font-size: 0.82rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      white-space: normal;
+      overflow-wrap: anywhere;
+      line-height: 1.35;
     }
 
     .section-title {
@@ -444,11 +445,99 @@
       font-size: 0.7rem;
       border: 1px solid transparent;
       max-width: 100%;
+      overflow-wrap: anywhere;
     }
     .chip.ok { color: #b8f7dc; background: rgba(56,217,150,0.12); border-color: rgba(56,217,150,0.24); }
     .chip.warn { color: #ffe0a3; background: rgba(246,195,91,0.12); border-color: rgba(246,195,91,0.28); }
     .chip.bad { color: #ffc0c0; background: rgba(239,91,91,0.12); border-color: rgba(239,91,91,0.28); }
     .chip.blue { color: #b8dcff; background: rgba(90,176,255,0.12); border-color: rgba(90,176,255,0.24); }
+
+    .media-switch-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(156px, 1fr));
+      gap: 8px;
+    }
+
+    .media-switch {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 9px;
+      min-height: 42px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.045);
+      color: var(--text);
+      text-align: left;
+    }
+
+    .media-switch:not(:disabled):hover {
+      border-color: rgba(90,176,255,0.38);
+      background: rgba(255,255,255,0.07);
+    }
+
+    .media-switch:disabled {
+      opacity: 0.52;
+      cursor: not-allowed;
+    }
+
+    .switch-track {
+      position: relative;
+      width: 42px;
+      height: 22px;
+      border-radius: 999px;
+      background: rgba(239,91,91,0.34);
+      border: 1px solid rgba(239,91,91,0.55);
+      flex-shrink: 0;
+    }
+
+    .switch-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+      transition: transform 120ms ease;
+    }
+
+    .media-switch.on .switch-track {
+      background: rgba(56,217,150,0.28);
+      border-color: rgba(56,217,150,0.58);
+    }
+
+    .media-switch.on .switch-track::after {
+      transform: translateX(20px);
+    }
+
+    .switch-label {
+      min-width: 0;
+      font-weight: 760;
+      font-size: 0.8rem;
+      overflow-wrap: anywhere;
+    }
+
+    .switch-state {
+      justify-self: end;
+      min-width: 34px;
+      padding: 3px 7px;
+      border-radius: 999px;
+      font-size: 0.66rem;
+      font-weight: 800;
+      color: #ffc0c0;
+      background: rgba(239,91,91,0.12);
+      border: 1px solid rgba(239,91,91,0.25);
+    }
+
+    .media-switch.on .switch-state {
+      color: #b8f7dc;
+      background: rgba(56,217,150,0.12);
+      border-color: rgba(56,217,150,0.25);
+    }
 
     .monitor-list {
       display: grid;
@@ -469,9 +558,7 @@
     }
 
     .monitor-name {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      overflow-wrap: anywhere;
       font-size: 0.76rem;
     }
 
@@ -630,6 +717,23 @@
       margin-bottom: 8px;
     }
 
+    .settings-row .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 0.82rem;
+      line-height: 1.35;
+      margin: 0;
+    }
+
+    .settings-row .check-row input {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      flex: 0 0 auto;
+    }
+
     .path-display {
       padding: 10px;
       background: #080a0d;
@@ -656,6 +760,18 @@
       line-height: 1.45;
     }
 
+    .settings-input-wide {
+      width: 100%;
+      margin-top: 10px;
+      padding: 10px;
+      color: var(--text);
+      background: #080a0d;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      outline: none;
+      box-sizing: border-box;
+    }
+
     .settings-help {
       color: var(--muted);
       font-size: 0.72rem;
@@ -679,7 +795,8 @@
       font-size: 0.76rem;
     }
 
-    .update-row input {
+    .update-row input,
+    .update-row select {
       min-width: 0;
       min-height: 34px;
       color: var(--text);
@@ -867,12 +984,73 @@
             <div class="path-display" id="systemSettingsPath">Loading...</div>
           </div>
           <div class="settings-row">
+            <label>サーバー起動設定</label>
+            <div class="update-grid">
+              <div class="update-row">
+                <span>公開IP</span>
+                <input id="srvAnnouncedIp" placeholder="例: 192.168.2.200">
+                <input id="srvListenPort" placeholder="待受Port 3000">
+              </div>
+              <div class="update-row">
+                <span>RTPポート</span>
+                <input id="srvRtcMinPort" placeholder="最小 10000">
+                <input id="srvRtcMaxPort" placeholder="最大 10200">
+              </div>
+              <div class="update-row">
+                <span>STUN</span>
+                <input id="srvStunUrls" placeholder="stun:stun.example.com:3478">
+                <input id="srvVpnBandwidthMbps" placeholder="拠点間帯域Mbps">
+              </div>
+              <div class="update-row">
+                <span>TURN</span>
+                <input id="srvTurnUrls" placeholder="turn:turn.example.com:3478?transport=tcp">
+                <input id="srvTurnUser" placeholder="TURNユーザー">
+              </div>
+              <div class="update-row">
+                <span>TURN認証</span>
+                <input id="srvTurnPass" type="password" placeholder="TURNパスワード">
+                <input id="srvStatsIntervalMs" placeholder="統計間隔ms">
+              </div>
+            </div>
+            <label class="check-row">
+              <input id="srvDebugLogEnabled" type="checkbox">
+              <span>サーバーデバッグログを保存する</span>
+            </label>
+            <input id="srvDebugLogDir" class="settings-input-wide" placeholder="ログ保存先を変更する場合のみ入力">
+            <div class="settings-help">公開IPは mediasoup の ANNOUNCED_IP として使われます。ポート、STUN/TURN、デバッグログは保存後、次回サーバー起動から反映されます。</div>
+          </div>
+          <div class="settings-row">
             <label>チャンネル設定</label>
             <textarea id="channelsText" class="settings-textarea" spellcheck="false"></textarea>
             <div class="settings-help">1行につき「id,表示名」。例: general,一般</div>
           </div>
           <div class="settings-row">
-            <label>アップデート配布フォルダ（ファイル名からアプリを自動判別して配信）</label>
+            <label>メディア通信</label>
+            <label class="check-row">
+              <input id="forceTcpMedia" type="checkbox">
+              <span>L3 / VPN拠点向けにWebRTCメディア通信をTCP固定にする</span>
+            </label>
+            <div class="update-grid">
+              <div class="update-row">
+                <span>映像品質</span>
+                <select id="videoProfile">
+                  <option value="stable">安定優先 360p/15fps</option>
+                  <option value="vpn-balanced">VPN標準 540p/24fps</option>
+                  <option value="high">高画質 720p/30fps</option>
+                  <option value="fhd">FHD 1080p/30fps</option>
+                </select>
+                <input id="cameraMaxBitrateKbps" placeholder="カメラ上限kbps">
+              </div>
+              <div class="update-row">
+                <span>送信帯域</span>
+                <input id="cameraStartBitrateKbps" placeholder="カメラ開始kbps">
+                <input id="screenMaxBitrateKbps" placeholder="画面共有上限kbps">
+              </div>
+            </div>
+            <div class="settings-help">TCP 10000-10200 が到達しているのに映像だけ届かない場合に有効です。保存後、接続中の端末はメディア接続を再構築します。</div>
+          </div>
+          <div class="settings-row">
+            <label>アップデート配布フォルダ（1つのフォルダ配下でOS/アプリを自動判別）</label>
             <div class="path-display" id="updateFolderDisplay">未設定</div>
             <div class="settings-actions" style="margin-top:0">
               <button class="btn ghost" id="selectUpdateFolderBtn">フォルダを選択</button>
@@ -883,6 +1061,7 @@
             <div class="settings-help">
               対応ファイル: dmg / pkg / zip / exe / msi など（ビルド済みのインストーラ/パッケージを配置してください）。
               ファイル名に client / viewer / screen-share とバージョン番号（例: 0.3.0）を含めると自動登録されます。
+              macOS / Windows フォルダ名、または拡張子からOSを判別します。
               フォルダは常時監視され、ファイル追加時に自動で配信情報を更新します。
             </div>
           </div>
@@ -891,17 +1070,17 @@
             <div class="update-grid">
               <div class="update-row">
                 <span>クライアント</span>
-                <input id="verClient" placeholder="0.1.0">
+                <input id="verClient" placeholder="0.2.10">
                 <input id="urlClient" placeholder="https://...">
               </div>
               <div class="update-row">
                 <span>閲覧用</span>
-                <input id="verViewer" placeholder="0.1.0">
+                <input id="verViewer" placeholder="0.1.5">
                 <input id="urlViewer" placeholder="https://...">
               </div>
               <div class="update-row">
                 <span>画面共有用</span>
-                <input id="verScreenShare" placeholder="0.1.0">
+                <input id="verScreenShare" placeholder="0.1.4">
                 <input id="urlScreenShare" placeholder="https://...">
               </div>
             </div>
@@ -930,6 +1109,23 @@
     const envDisplay = document.getElementById('envDisplay');
     const systemSettingsPath = document.getElementById('systemSettingsPath');
     const channelsText = document.getElementById('channelsText');
+    const forceTcpMedia = document.getElementById('forceTcpMedia');
+    const videoProfile = document.getElementById('videoProfile');
+    const cameraMaxBitrateKbps = document.getElementById('cameraMaxBitrateKbps');
+    const cameraStartBitrateKbps = document.getElementById('cameraStartBitrateKbps');
+    const screenMaxBitrateKbps = document.getElementById('screenMaxBitrateKbps');
+    const srvAnnouncedIp = document.getElementById('srvAnnouncedIp');
+    const srvListenPort = document.getElementById('srvListenPort');
+    const srvRtcMinPort = document.getElementById('srvRtcMinPort');
+    const srvRtcMaxPort = document.getElementById('srvRtcMaxPort');
+    const srvStunUrls = document.getElementById('srvStunUrls');
+    const srvTurnUrls = document.getElementById('srvTurnUrls');
+    const srvTurnUser = document.getElementById('srvTurnUser');
+    const srvTurnPass = document.getElementById('srvTurnPass');
+    const srvDebugLogEnabled = document.getElementById('srvDebugLogEnabled');
+    const srvDebugLogDir = document.getElementById('srvDebugLogDir');
+    const srvStatsIntervalMs = document.getElementById('srvStatsIntervalMs');
+    const srvVpnBandwidthMbps = document.getElementById('srvVpnBandwidthMbps');
     const verClient = document.getElementById('verClient');
     const verViewer = document.getElementById('verViewer');
     const verScreenShare = document.getElementById('verScreenShare');
@@ -968,8 +1164,29 @@
     const expandedClientIds = new Set();
     let systemSettings = {
       channels: [{ id: 'general', name: '一般' }],
-      latestVersions: { client: '0.1.0', viewer: '0.1.0', 'screen-share': '0.1.0' },
+        latestVersions: { client: '0.2.10', viewer: '0.1.5', 'screen-share': '0.1.4' },
       updatePackages: {},
+      serverRuntime: {
+        announcedIp: '',
+        listenPort: '3000',
+        rtcMinPort: '10000',
+        rtcMaxPort: '10200',
+        stunUrls: '',
+        turnUrls: '',
+        turnUser: '',
+        turnPass: '',
+        debugLogEnabled: true,
+        debugLogDir: '',
+        statsIntervalMs: '1000',
+        vpnBandwidthMbps: '200',
+      },
+      mediaTransport: {
+        forceTcp: false,
+        videoProfile: 'vpn-balanced',
+        cameraMaxBitrateKbps: '1400',
+        cameraStartBitrateKbps: '900',
+        screenMaxBitrateKbps: '1800',
+      },
     };
     pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
 
@@ -1087,34 +1304,93 @@
         ...(settings || {}),
         latestVersions: { ...(systemSettings.latestVersions || {}), ...((settings || {}).latestVersions || {}) },
         updatePackages: { ...(systemSettings.updatePackages || {}), ...((settings || {}).updatePackages || {}) },
+        serverRuntime: { ...(systemSettings.serverRuntime || {}), ...((settings || {}).serverRuntime || {}) },
+        mediaTransport: { ...(systemSettings.mediaTransport || {}), ...((settings || {}).mediaTransport || {}) },
       };
       channelsText.value = channelsToText(systemSettings.channels);
+      forceTcpMedia.checked = !!systemSettings.mediaTransport?.forceTcp;
+      videoProfile.value = systemSettings.mediaTransport?.videoProfile || 'vpn-balanced';
+      cameraMaxBitrateKbps.value = systemSettings.mediaTransport?.cameraMaxBitrateKbps || '1400';
+      cameraStartBitrateKbps.value = systemSettings.mediaTransport?.cameraStartBitrateKbps || '900';
+      screenMaxBitrateKbps.value = systemSettings.mediaTransport?.screenMaxBitrateKbps || '1800';
+      srvAnnouncedIp.value = systemSettings.serverRuntime?.announcedIp || '';
+      srvListenPort.value = systemSettings.serverRuntime?.listenPort || '3000';
+      srvRtcMinPort.value = systemSettings.serverRuntime?.rtcMinPort || '10000';
+      srvRtcMaxPort.value = systemSettings.serverRuntime?.rtcMaxPort || '10200';
+      srvStunUrls.value = systemSettings.serverRuntime?.stunUrls || '';
+      srvTurnUrls.value = systemSettings.serverRuntime?.turnUrls || '';
+      srvTurnUser.value = systemSettings.serverRuntime?.turnUser || '';
+      srvTurnPass.value = systemSettings.serverRuntime?.turnPass || '';
+      srvDebugLogEnabled.checked = systemSettings.serverRuntime?.debugLogEnabled !== false;
+      srvDebugLogDir.value = systemSettings.serverRuntime?.debugLogDir || '';
+      srvStatsIntervalMs.value = systemSettings.serverRuntime?.statsIntervalMs || '1000';
+      srvVpnBandwidthMbps.value = systemSettings.serverRuntime?.vpnBandwidthMbps || '200';
       updateFolderDisplay.innerText = systemSettings.updateFolder || '未設定';
       verClient.value = systemSettings.latestVersions?.client || '';
       verViewer.value = systemSettings.latestVersions?.viewer || '';
       verScreenShare.value = systemSettings.latestVersions?.['screen-share'] || '';
-      urlClient.value = systemSettings.updatePackages?.client?.url || '';
-      urlViewer.value = systemSettings.updatePackages?.viewer?.url || '';
-      urlScreenShare.value = systemSettings.updatePackages?.['screen-share']?.url || '';
+      urlClient.value = packageUrlSummary(systemSettings.updatePackages?.client);
+      urlViewer.value = packageUrlSummary(systemSettings.updatePackages?.viewer);
+      urlScreenShare.value = packageUrlSummary(systemSettings.updatePackages?.['screen-share']);
+    }
+
+    function packageUrlSummary(pkg) {
+      if (!pkg) return '';
+      const platforms = pkg.platforms || {};
+      const items = Object.entries(platforms)
+        .filter(([, item]) => item?.url)
+        .map(([platform, item]) => `${platform}: ${item.url}`);
+      return items.join(' / ') || pkg.url || '';
     }
 
     function collectSystemSettings() {
+      const manualClientUrl = normalizeManualUpdateUrl(urlClient.value);
+      const manualViewerUrl = normalizeManualUpdateUrl(urlViewer.value);
+      const manualScreenShareUrl = normalizeManualUpdateUrl(urlScreenShare.value);
       return {
         channels: textToChannels(channelsText.value),
         updateFolder: systemSettings.updateFolder || '',
+        serverRuntime: {
+          announcedIp: srvAnnouncedIp.value.trim(),
+          listenPort: srvListenPort.value.trim() || '3000',
+          rtcMinPort: srvRtcMinPort.value.trim() || '10000',
+          rtcMaxPort: srvRtcMaxPort.value.trim() || '10200',
+          stunUrls: srvStunUrls.value.trim(),
+          turnUrls: srvTurnUrls.value.trim(),
+          turnUser: srvTurnUser.value.trim(),
+          turnPass: srvTurnPass.value,
+          debugLogEnabled: !!srvDebugLogEnabled.checked,
+          debugLogDir: srvDebugLogDir.value.trim(),
+          statsIntervalMs: srvStatsIntervalMs.value.trim() || '1000',
+          vpnBandwidthMbps: srvVpnBandwidthMbps.value.trim() || '200',
+        },
+        mediaTransport: {
+          forceTcp: !!forceTcpMedia.checked,
+          videoProfile: videoProfile.value || 'vpn-balanced',
+          cameraMaxBitrateKbps: cameraMaxBitrateKbps.value.trim() || '1400',
+          cameraStartBitrateKbps: cameraStartBitrateKbps.value.trim() || '900',
+          screenMaxBitrateKbps: screenMaxBitrateKbps.value.trim() || '1800',
+        },
         latestVersions: {
           ...(systemSettings.latestVersions || {}),
-          client: verClient.value.trim() || '0.1.0',
-          viewer: verViewer.value.trim() || '0.1.0',
-          'screen-share': verScreenShare.value.trim() || '0.1.0',
+          client: verClient.value.trim() || '0.2.10',
+          viewer: verViewer.value.trim() || '0.1.5',
+          'screen-share': verScreenShare.value.trim() || '0.1.4',
         },
         updatePackages: {
           ...(systemSettings.updatePackages || {}),
-          client: { ...(systemSettings.updatePackages?.client || {}), version: verClient.value.trim(), url: urlClient.value.trim() },
-          viewer: { ...(systemSettings.updatePackages?.viewer || {}), version: verViewer.value.trim(), url: urlViewer.value.trim() },
-          'screen-share': { ...(systemSettings.updatePackages?.['screen-share'] || {}), version: verScreenShare.value.trim(), url: urlScreenShare.value.trim() },
+          client: { ...(systemSettings.updatePackages?.client || {}), version: verClient.value.trim(), url: manualClientUrl },
+          viewer: { ...(systemSettings.updatePackages?.viewer || {}), version: verViewer.value.trim(), url: manualViewerUrl },
+          'screen-share': { ...(systemSettings.updatePackages?.['screen-share'] || {}), version: verScreenShare.value.trim(), url: manualScreenShareUrl },
         },
       };
+    }
+
+    function normalizeManualUpdateUrl(value) {
+      const text = String(value || '').trim();
+      if (!text) return '';
+      if (/^(https?:\/\/|\/)/i.test(text)) return text;
+      return '';
     }
 
     function channelOptions(selected) {
@@ -1212,17 +1488,92 @@
 
     function mediaToggleButton(socketId, kind, label, enabled, disabled = false) {
       const nextEnabled = !enabled;
-      const tone = enabled ? 'warn' : 'ok';
-      const suffix = enabled ? 'OFF' : 'ON';
+      const state = enabled ? 'ON' : 'OFF';
+      const action = enabled ? 'OFFにする' : 'ONにする';
       return `
         <button
-          class="mini-btn ${tone}"
+          class="media-switch ${enabled ? 'on' : 'off'}"
           data-action="media-state"
           data-socket="${escapeHtml(socketId)}"
           data-kind="${escapeHtml(kind)}"
           data-enabled="${String(nextEnabled)}"
+          title="${escapeHtml(label)}を${escapeHtml(action)}"
           ${disabled ? 'disabled' : ''}
-        >${escapeHtml(label)} ${suffix}</button>
+        >
+          <span class="switch-track" aria-hidden="true"></span>
+          <span class="switch-label">${escapeHtml(label)}</span>
+          <span class="switch-state">${state}</span>
+        </button>
+      `;
+    }
+
+    function fmtBytes(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return '-';
+      if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)}MB`;
+      if (n >= 1024) return `${Math.round(n / 1024)}KB`;
+      return `${Math.round(n)}B`;
+    }
+
+    function candidatePairText(pair) {
+      if (!pair) return '-';
+      const local = pair.local || {};
+      const remote = pair.remote || {};
+      const protocol = local.protocol || remote.protocol || '-';
+      const type = local.candidateType || '-';
+      const rtt = Number.isFinite(pair.currentRoundTripTime)
+        ? ` / ${Math.round(pair.currentRoundTripTime * 1000)}ms`
+        : '';
+      return `${protocol.toUpperCase()} ${type} ${local.address || '-'}:${local.port || '-'} -> ${remote.address || '-'}:${remote.port || '-'}${rtt}`;
+    }
+
+    function serverTransportText(item) {
+      if (!item) return '-';
+      const tuple = item.selectedTuple || {};
+      const proto = tuple.protocol ? tuple.protocol.toUpperCase() : '-';
+      const tcp = item.forceTcp ? ' TCP固定' : '';
+      return `${item.direction || '-'} ${item.iceState || '-'} / ${item.dtlsState || '-'} ${proto} ${tuple.remoteIp || '-'}:${tuple.remotePort || '-'}${tcp}`;
+    }
+
+    function rtpTotals(items, direction) {
+      const list = Array.isArray(items) ? items : [];
+      const stats = list.flatMap(item => Array.isArray(item.stats) ? item.stats : []);
+      const videoStats = stats.filter(item => (item.kind || '') === 'video');
+      const audioStats = stats.filter(item => (item.kind || '') === 'audio');
+      const sum = (rows, key) => rows.reduce((total, row) => total + (Number(row[key]) || 0), 0);
+      return {
+        videoBytes: sum(videoStats, direction === 'out' ? 'bytesSent' : 'bytesReceived'),
+        audioBytes: sum(audioStats, direction === 'out' ? 'bytesSent' : 'bytesReceived'),
+        videoFrames: sum(videoStats, direction === 'out' ? 'framesEncoded' : 'framesDecoded'),
+        lost: sum(stats, 'packetsLost'),
+      };
+    }
+
+    function diagnosticsRows(client) {
+      const transports = client.transports || {};
+      const serverTransports = Array.isArray(transports.server) ? transports.server : [];
+      const mediaStats = client.mediaStats || {};
+      const outbound = rtpTotals(mediaStats.producers, 'out');
+      const inbound = rtpTotals(mediaStats.consumers, 'in');
+      return `
+        <div>
+          <div class="section-title">ICE経路</div>
+          <div class="kv-grid">
+            <div class="kv"><span>送信候補</span><strong>${escapeHtml(candidatePairText(transports.sendSelectedCandidatePair))}</strong></div>
+            <div class="kv"><span>受信候補</span><strong>${escapeHtml(candidatePairText(transports.recvSelectedCandidatePair))}</strong></div>
+            <div class="kv"><span>SFU送信</span><strong>${escapeHtml(serverTransportText(serverTransports.find(item => item.direction === 'send')))}</strong></div>
+            <div class="kv"><span>SFU受信</span><strong>${escapeHtml(serverTransportText(serverTransports.find(item => item.direction === 'recv')))}</strong></div>
+          </div>
+        </div>
+        <div>
+          <div class="section-title">RTP実測</div>
+          <div class="kv-grid">
+            <div class="kv"><span>送信映像</span><strong>${fmtBytes(outbound.videoBytes)} / ${outbound.videoFrames || 0}f</strong></div>
+            <div class="kv"><span>送信音声</span><strong>${fmtBytes(outbound.audioBytes)}</strong></div>
+            <div class="kv"><span>受信映像</span><strong>${fmtBytes(inbound.videoBytes)} / ${inbound.videoFrames || 0}f</strong></div>
+            <div class="kv"><span>受信音声</span><strong>${fmtBytes(inbound.audioBytes)} / lost ${inbound.lost || 0}</strong></div>
+          </div>
+        </div>
       `;
     }
 
@@ -1293,28 +1644,16 @@
               <div class="kv"><span>チャンネル</span><strong>${escapeHtml(channelId)}</strong></div>
             </div>
 
-            <div>
-              <div class="section-title">メディア状態（実機反映）</div>
-              <div class="chip-row">
-                ${mediaChip(camOn ? 'カメラ ON' : 'カメラ OFF', camOn, !camOn)}
-                ${mediaChip(micOn ? 'マイク ON' : 'マイク OFF', micOn, !micOn)}
-                ${mediaChip(local.speakerMuted ? 'スピーカー OFF' : 'スピーカー ON', !local.speakerMuted, !!local.speakerMuted)}
-                ${screenOn ? mediaChip('画面共有中', true) : ''}
-                <span class="chip blue">送信 ${escapeHtml(transports.sendState || 'none')}</span>
-                <span class="chip blue">受信 ${escapeHtml(transports.recvState || 'none')}</span>
-              </div>
-            </div>
-
-            <div>
+            <div class="client-section">
               <div class="section-title">ON/OFF制御</div>
-              <div class="chip-row">
+              <div class="media-switch-grid">
                 ${mediaToggleButton(client.id, 'camera', 'カメラ', camOn, isViewer)}
                 ${mediaToggleButton(client.id, 'mic', 'マイク', micOn, isViewer)}
                 ${mediaToggleButton(client.id, 'speaker', 'スピーカー', !local.speakerMuted)}
               </div>
             </div>
 
-            <div>
+            <div class="client-section">
               <div class="section-title">デバイス選択</div>
               <div class="device-grid">
                 <div class="device-control">
@@ -1344,7 +1683,21 @@
               </div>
             </div>
 
-            <div>
+            <div class="client-section">
+              <div class="section-title">メディア状態（実機反映）</div>
+              <div class="chip-row">
+                ${mediaChip(camOn ? 'カメラ ON' : 'カメラ OFF', camOn, !camOn)}
+                ${mediaChip(micOn ? 'マイク ON' : 'マイク OFF', micOn, !micOn)}
+                ${mediaChip(local.speakerMuted ? 'スピーカー OFF' : 'スピーカー ON', !local.speakerMuted, !!local.speakerMuted)}
+                ${screenOn ? mediaChip('画面共有中', true) : ''}
+                <span class="chip blue">送信 ${escapeHtml(transports.sendState || 'none')}</span>
+                <span class="chip blue">受信 ${escapeHtml(transports.recvState || 'none')}</span>
+              </div>
+            </div>
+
+            ${diagnosticsRows(client)}
+
+            <div class="client-section">
               <div class="section-title">クライアント受信モニター</div>
               ${monitorRows(client)}
             </div>
@@ -1641,6 +1994,7 @@
         <div class="update-file-row">
           <span class="update-file-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</span>
           <span class="chip ${file.appType ? 'ok' : 'warn'}">${escapeHtml(file.appType || '判別不可')}</span>
+          <span class="chip ${file.platform ? 'ok' : 'warn'}">${escapeHtml(file.platform || 'OS不明')}</span>
           <span class="chip ${file.version ? 'blue' : 'warn'}">${escapeHtml(file.version || 'ver不明')}</span>
           <span class="chip">${fmtFileSize(file.size)}</span>
         </div>

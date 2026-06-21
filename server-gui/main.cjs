@@ -49,13 +49,34 @@ const DEFAULT_SYSTEM_SETTINGS = {
     { id: 'support', name: 'サポート' },
   ],
   latestVersions: {
-    client: '0.1.0',
-    viewer: '0.1.0',
-    'screen-share': '0.1.0',
-    server: '1.0.0',
-    'server-gui': '1.0.0',
+    client: '0.2.10',
+    viewer: '0.1.5',
+    'screen-share': '0.1.4',
+    server: '1.1.8',
+    'server-gui': '1.0.9',
   },
   updatePackages: {},
+  serverRuntime: {
+    announcedIp: '',
+    listenPort: '3000',
+    rtcMinPort: '10000',
+    rtcMaxPort: '10200',
+    stunUrls: '',
+    turnUrls: '',
+    turnUser: '',
+    turnPass: '',
+    debugLogEnabled: true,
+    debugLogDir: '',
+    statsIntervalMs: '1000',
+    vpnBandwidthMbps: '200',
+  },
+  mediaTransport: {
+    forceTcp: false,
+    videoProfile: 'vpn-balanced',
+    cameraMaxBitrateKbps: '1400',
+    cameraStartBitrateKbps: '900',
+    screenMaxBitrateKbps: '1800',
+  },
   updateFolder: '',
 };
 
@@ -66,6 +87,44 @@ const DEFAULT_SYSTEM_SETTINGS = {
 const UPDATE_FILE_EXT = /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i;
 let updateFolderWatcher = null;
 let updateFolderScanTimer = null;
+
+function normalizeUpdatePlatform(value) {
+  const raw = String(value || '').toLowerCase();
+  if (raw === 'macos' || raw === 'mac' || raw === 'darwin' || raw === 'osx') return 'darwin';
+  if (raw === 'windows' || raw === 'win' || raw === 'win32' || raw === 'win64') return 'win32';
+  if (raw === 'linux') return 'linux';
+  return '';
+}
+
+function detectPlatformFromPath(relativeName) {
+  const normalized = String(relativeName || '').replace(/\\/g, '/').toLowerCase();
+  const parts = normalized.split('/').filter(Boolean);
+  for (const part of parts) {
+    const platform = normalizeUpdatePlatform(part);
+    if (platform) return platform;
+  }
+  if (/\.(dmg|pkg)$/i.test(normalized)) return 'darwin';
+  if (/\.(exe|msi)$/i.test(normalized)) return 'win32';
+  if (/\.(appimage|deb)$/i.test(normalized)) return 'linux';
+  return '';
+}
+
+function walkUpdateFiles(dir, prefix = '') {
+  const files = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === '.DS_Store') continue;
+    const fullPath = path.join(dir, entry.name);
+    const relativeName = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      files.push(...walkUpdateFiles(fullPath, relativeName));
+      continue;
+    }
+    if (!entry.isFile() || !UPDATE_FILE_EXT.test(entry.name)) continue;
+    const stat = fs.statSync(fullPath);
+    files.push({ name: relativeName, path: fullPath, size: stat.size, mtimeMs: stat.mtimeMs });
+  }
+  return files;
+}
 
 function detectAppTypeFromFilename(name) {
   const lower = String(name || '').toLowerCase();
@@ -78,7 +137,7 @@ function detectAppTypeFromFilename(name) {
 }
 
 function detectVersionFromFilename(name) {
-  const match = String(name || '').match(/(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?)/);
+  const match = String(name || '').match(/(\d+\.\d+\.\d+)(?=[^0-9]|$)/);
   return match ? match[1] : '';
 }
 
@@ -86,37 +145,37 @@ function scanUpdateFolder(dir) {
   const result = { folder: dir || '', files: [], packages: {} };
   if (!dir || !fs.existsSync(dir)) return result;
 
-  let names = [];
+  let files = [];
   try {
-    names = fs.readdirSync(dir).filter(name => UPDATE_FILE_EXT.test(name));
+    files = walkUpdateFiles(dir);
   } catch (err) {
     safeSend('server-log', `WARN: アップデートフォルダを読み取れません: ${err.message}`);
     return result;
   }
 
-  for (const name of names) {
-    let stat;
-    try {
-      stat = fs.statSync(path.join(dir, name));
-    } catch {
-      continue;
-    }
+  for (const source of files) {
+    const name = source.name;
     const appType = detectAppTypeFromFilename(name);
     const version = detectVersionFromFilename(name);
-    const file = { name, appType, version, size: stat.size, mtimeMs: stat.mtimeMs };
+    const platform = detectPlatformFromPath(name);
+    const file = { name, appType, version, platform, size: source.size, mtimeMs: source.mtimeMs };
     result.files.push(file);
 
-    if (!appType || !version) continue;
-    const existing = result.packages[appType];
-    // 同一アプリが複数ある場合は新しい mtime を採用
-    if (!existing || stat.mtimeMs > existing.mtimeMs) {
-      result.packages[appType] = {
+    if (!appType || !version || !platform) continue;
+    const currentAppPackage = result.packages[appType] || { version, platforms: {} };
+    const existing = currentAppPackage.platforms[platform];
+    // 同一アプリ/OSが複数ある場合は新しい mtime を採用
+    if (!existing || source.mtimeMs > existing.mtimeMs) {
+      currentAppPackage.version = version;
+      currentAppPackage.platforms[platform] = {
         version,
+        platform,
         url: `/updates/${encodeURIComponent(name)}`,
         notes: `自動検出: ${name}`,
         fileName: name,
-        mtimeMs: stat.mtimeMs,
+        mtimeMs: source.mtimeMs,
       };
+      result.packages[appType] = currentAppPackage;
     }
   }
   return result;
@@ -133,8 +192,10 @@ function applyUpdateScan(dir, { announce = true } = {}) {
     settings.updatePackages[appType] = {
       ...(settings.updatePackages[appType] || {}),
       version: pkg.version,
-      url: pkg.url,
-      notes: pkg.notes,
+      platforms: {
+        ...(settings.updatePackages[appType]?.platforms || {}),
+        ...(pkg.platforms || {}),
+      },
       registeredAt: Date.now(),
     };
   }
@@ -226,19 +287,63 @@ function sanitizeSystemSettings(input = {}) {
   const updatePackages = raw.updatePackages && typeof raw.updatePackages === 'object'
     ? raw.updatePackages
     : {};
+  const rawMediaTransport = raw.mediaTransport && typeof raw.mediaTransport === 'object'
+    ? raw.mediaTransport
+    : {};
+  const rawServerRuntime = raw.serverRuntime && typeof raw.serverRuntime === 'object'
+    ? raw.serverRuntime
+    : {};
 
   return {
     channels: sanitizeChannels(raw.channels),
     updateFolder: shortText(raw.updateFolder, 1024),
     latestVersions: Object.fromEntries(Object.entries(latestVersions).map(([key, value]) => [key, shortText(value, 48)])),
+    mediaTransport: {
+      forceTcp: !!rawMediaTransport.forceTcp,
+      videoProfile: videoProfileText(rawMediaTransport.videoProfile, DEFAULT_SYSTEM_SETTINGS.mediaTransport.videoProfile),
+      cameraMaxBitrateKbps: boundedNumberText(rawMediaTransport.cameraMaxBitrateKbps, 200, 6000, DEFAULT_SYSTEM_SETTINGS.mediaTransport.cameraMaxBitrateKbps),
+      cameraStartBitrateKbps: boundedNumberText(rawMediaTransport.cameraStartBitrateKbps, 150, 4000, DEFAULT_SYSTEM_SETTINGS.mediaTransport.cameraStartBitrateKbps),
+      screenMaxBitrateKbps: boundedNumberText(rawMediaTransport.screenMaxBitrateKbps, 300, 8000, DEFAULT_SYSTEM_SETTINGS.mediaTransport.screenMaxBitrateKbps),
+    },
+    serverRuntime: {
+      announcedIp: shortText(rawServerRuntime.announcedIp, 128),
+      listenPort: portText(rawServerRuntime.listenPort, DEFAULT_SYSTEM_SETTINGS.serverRuntime.listenPort),
+      rtcMinPort: portText(rawServerRuntime.rtcMinPort, DEFAULT_SYSTEM_SETTINGS.serverRuntime.rtcMinPort),
+      rtcMaxPort: portText(rawServerRuntime.rtcMaxPort, DEFAULT_SYSTEM_SETTINGS.serverRuntime.rtcMaxPort),
+      stunUrls: csvText(rawServerRuntime.stunUrls, 2048),
+      turnUrls: csvText(rawServerRuntime.turnUrls, 2048),
+      turnUser: shortText(rawServerRuntime.turnUser, 256),
+      turnPass: shortText(rawServerRuntime.turnPass, 512),
+      debugLogEnabled: rawServerRuntime.debugLogEnabled !== false,
+      debugLogDir: shortText(rawServerRuntime.debugLogDir, 1024),
+      statsIntervalMs: boundedNumberText(rawServerRuntime.statsIntervalMs, 500, 60000, DEFAULT_SYSTEM_SETTINGS.serverRuntime.statsIntervalMs),
+      vpnBandwidthMbps: boundedNumberText(rawServerRuntime.vpnBandwidthMbps, 1, 10000, DEFAULT_SYSTEM_SETTINGS.serverRuntime.vpnBandwidthMbps),
+    },
     updatePackages: Object.fromEntries(Object.entries(updatePackages).map(([key, value]) => {
       const pkg = value && typeof value === 'object' ? value : {};
+      const platforms = {};
+      for (const [platform, platformPkg] of Object.entries(pkg.platforms && typeof pkg.platforms === 'object' ? pkg.platforms : {})) {
+        const normalizedPlatform = normalizeUpdatePlatform(platform);
+        if (!normalizedPlatform) continue;
+        const item = platformPkg && typeof platformPkg === 'object' ? platformPkg : {};
+        platforms[normalizedPlatform] = {
+          version: shortText(item.version || pkg.version || latestVersions[key] || '', 48),
+          platform: normalizedPlatform,
+          url: shortText(item.url, 1024),
+          notes: shortText(item.notes, 1000),
+          sha256: shortText(item.sha256, 128),
+          fileName: shortText(item.fileName, 512),
+          required: !!item.required,
+          registeredAt: Number.isFinite(item.registeredAt) ? item.registeredAt : Date.now(),
+        };
+      }
       return [key, {
         version: shortText(pkg.version || latestVersions[key] || '', 48),
         url: shortText(pkg.url, 1024),
         notes: shortText(pkg.notes, 1000),
         sha256: shortText(pkg.sha256, 128),
         required: !!pkg.required,
+        platforms,
         registeredAt: Number.isFinite(pkg.registeredAt) ? pkg.registeredAt : Date.now(),
       }];
     })),
@@ -262,6 +367,31 @@ function writeSystemSettings(settings) {
 
 function shortText(value, max = 256) {
   return String(value ?? '').trim().slice(0, max);
+}
+
+function portText(value, fallback) {
+  return boundedNumberText(value, 1, 65535, fallback);
+}
+
+function boundedNumberText(value, min, max, fallback) {
+  const text = String(value ?? '').trim();
+  const number = Number.parseInt(text, 10);
+  if (!Number.isInteger(number) || number < min || number > max) return String(fallback);
+  return String(number);
+}
+
+function csvText(value, max = 2048) {
+  return String(value ?? '')
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean)
+    .join(',')
+    .slice(0, max);
+}
+
+function videoProfileText(value, fallback = 'vpn-balanced') {
+  const raw = String(value || '').trim();
+  return ['stable', 'vpn-balanced', 'high', 'fhd'].includes(raw) ? raw : fallback;
 }
 
 function sanitizeRegisteredClient(input = {}) {
@@ -470,7 +600,10 @@ ipcMain.handle('get-system-settings', () => {
 
 ipcMain.handle('save-system-settings', (_event, rawSettings) => {
   const settings = writeSystemSettings(rawSettings);
-  if (serverProcess) sendSystemSettingsToServer();
+  if (serverProcess) {
+    sendSystemSettingsToServer();
+    safeSend('server-log', 'WARN: サーバー起動設定を変更した場合は、停止→起動で ANNOUNCED_IP / ポート / TURN / デバッグ設定が反映されます。');
+  }
   return settings;
 });
 
@@ -606,7 +739,7 @@ function ensureBundledServerRuntime() {
   const runtimeDir = getBundledServerRuntimeDir();
   fs.mkdirSync(runtimeDir, { recursive: true });
 
-  for (const file of ['index.js', 'config.js', 'package.json', '.env.example']) {
+  for (const file of ['index.js', 'config.js', 'debug-log.js', 'package.json', '.env.example']) {
     const src = path.join(sourceDir, file);
     if (fs.existsSync(src)) copyFileIfChanged(src, path.join(runtimeDir, file));
   }
@@ -632,6 +765,66 @@ function migrateGeneratedEnv(envPath) {
 
   fs.writeFileSync(envPath, env.replace('ANNOUNCED_IP=10.0.0.10', 'ANNOUNCED_IP='));
   safeSend('server-log', `WARN: 旧バージョンのサンプル ANNOUNCED_IP=10.0.0.10 を無効化しました。必要に応じて設定タブの .env を実際のVPN内IPに変更してください: ${envPath}`);
+}
+
+function serverRuntimeEnvFromSettings(settings = readSystemSettings()) {
+  const clean = sanitizeSystemSettings(settings);
+  const runtime = clean.serverRuntime;
+  const env = {
+    PORT: runtime.listenPort,
+    RTC_MIN_PORT: runtime.rtcMinPort,
+    RTC_MAX_PORT: runtime.rtcMaxPort,
+    FORCE_TCP_MEDIA: clean.mediaTransport.forceTcp ? 'true' : 'false',
+    STUN_URLS: runtime.stunUrls,
+    TURN_URLS: runtime.turnUrls,
+    TURN_USER: runtime.turnUser,
+    TURN_PASS: runtime.turnPass,
+    DEBUG_LOG_DISABLED: runtime.debugLogEnabled ? 'false' : 'true',
+    STATS_INTERVAL_MS: runtime.statsIntervalMs,
+    VPN_BANDWIDTH_MBPS: runtime.vpnBandwidthMbps,
+  };
+
+  if (runtime.announcedIp) env.ANNOUNCED_IP = runtime.announcedIp;
+  else env.ANNOUNCED_IP = '';
+  if (runtime.debugLogDir) env.DEBUG_LOG_DIR = runtime.debugLogDir;
+
+  return env;
+}
+
+function writeManagedEnvFile(serverDir, settings = readSystemSettings()) {
+  const envPath = path.join(serverDir, '.env');
+  const env = serverRuntimeEnvFromSettings(settings);
+  const keys = [
+    'ANNOUNCED_IP',
+    'PORT',
+    'RTC_MIN_PORT',
+    'RTC_MAX_PORT',
+    'FORCE_TCP_MEDIA',
+    'STUN_URLS',
+    'TURN_URLS',
+    'TURN_USER',
+    'TURN_PASS',
+    'DEBUG_LOG_DISABLED',
+    'DEBUG_LOG_DIR',
+    'STATS_INTERVAL_MS',
+    'VPN_BANDWIDTH_MBPS',
+  ];
+  const body = [
+    '# CHECKHOUSE Server GUI managed settings',
+    '# このブロックはサーバーGUIの設定タブから自動生成されます。',
+    ...keys.map(key => `${key}=${envValue(env[key] || '')}`),
+    '',
+  ].join('\n');
+
+  fs.mkdirSync(serverDir, { recursive: true });
+  fs.writeFileSync(envPath, body);
+  return envPath;
+}
+
+function envValue(value) {
+  const text = String(value ?? '');
+  if (!/[#\s"']/u.test(text)) return text;
+  return JSON.stringify(text);
 }
 
 function getNodePathEnv() {
@@ -689,8 +882,24 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
     safeSend('server-log', 'WARN: 内蔵 mediasoup-worker が見つかりません。mediasoup 標準パスで起動を試みます。');
   }
 
+  const systemSettings = readSystemSettings();
+  const runtimeEnv = serverRuntimeEnvFromSettings(systemSettings);
+  let envPath = path.join(serverDir, '.env');
+  try {
+    envPath = writeManagedEnvFile(serverDir, systemSettings);
+  } catch (err) {
+    safeSend('server-log', `WARN: .envを書き込めませんでした。起動時の環境変数にはGUI設定を反映します: ${err.message}`);
+  }
+  if (runtimeEnv.ANNOUNCED_IP) {
+    safeSend('server-log', `--- ANNOUNCED_IP: ${runtimeEnv.ANNOUNCED_IP} ---`);
+  } else {
+    safeSend('server-log', 'WARN: ANNOUNCED_IP が未設定です。L3/VPN拠点では設定タブで到達可能なサーバーIPを指定してください。');
+  }
+  safeSend('server-log', `--- サーバー設定: ${envPath} ---`);
+
   const env = {
     ...process.env,
+    ...runtimeEnv,
     ELECTRON_RUN_AS_NODE: '1',
     NODE_PATH: getNodePathEnv(),
   };

@@ -40,6 +40,7 @@ const mediasoup = require('mediasoup');
 const cors = require('cors');
 const config = require('./config');
 const serverPackage = require('./package.json');
+const { appendDebugLog, debugLogInfo } = require('./debug-log');
 
 const app = express();
 app.use(cors());
@@ -64,19 +65,27 @@ const DEFAULT_CHANNELS = [
   { id: 'support', name: 'サポート' },
 ];
 const APP_TYPES = ['client', 'viewer', 'screen-share', 'server', 'server-gui'];
+const APP_PLATFORMS = ['darwin', 'win32', 'linux'];
 const SERVER_APP_VERSION = serverPackage.version || '0.0.0';
 const DEFAULT_APP_VERSIONS = {
-  client: '0.2.0',
-  viewer: '0.1.1',
-  'screen-share': '0.1.0',
+  client: '0.2.10',
+  viewer: '0.1.5',
+  'screen-share': '0.1.4',
   server: SERVER_APP_VERSION,
-  'server-gui': '1.0.0',
+  'server-gui': '1.0.9',
 };
 let systemState = {
   brand: SYSTEM_NAME,
   channels: DEFAULT_CHANNELS,
   latestVersions: { ...DEFAULT_APP_VERSIONS },
   updatePackages: {},
+  mediaTransport: {
+    forceTcp: !!config.forceTcpMedia,
+    videoProfile: 'vpn-balanced',
+    cameraMaxBitrateKbps: 1400,
+    cameraStartBitrateKbps: 900,
+    screenMaxBitrateKbps: 1800,
+  },
   updatedAt: Date.now(),
 };
 
@@ -96,6 +105,108 @@ const peers = {};
 const MAX_DEVICE_LIST = 32;
 const MAX_MONITOR_PEERS = 32;
 const MAX_RTT_SAMPLES = 20;
+const REPLACED_BY_NEW_CONNECTION_REASON = 'replaced-by-new-connection';
+const METADATA_TIMEOUT_MS = 15000;
+const DEFAULT_VPN_BANDWIDTH_MBPS = Number(process.env.VPN_BANDWIDTH_MBPS) || 200;
+const STATS_INTERVAL_MS = Math.max(500, Number(process.env.STATS_INTERVAL_MS) || 1000);
+const ESTIMATED_MEDIA_BITRATES_BPS = {
+  camera: 450_000,
+  screen: 700_000,
+  microphone: 24_000,
+  'screen-audio': 32_000,
+};
+
+function compactRtpStats(items = []) {
+  return items.map(item => {
+    const first = Array.isArray(item.stats) ? item.stats[0] : null;
+    return {
+      source: item.source || '',
+      producerId: item.producerId || item.id || '',
+      consumerId: item.consumerId || item.id || '',
+      kind: item.kind || first?.kind || '',
+      error: item.error || '',
+      bytesSent: first?.bytesSent ?? null,
+      bytesReceived: first?.bytesReceived ?? null,
+      packetsSent: first?.packetsSent ?? null,
+      packetsReceived: first?.packetsReceived ?? null,
+      packetsLost: first?.packetsLost ?? null,
+      framesEncoded: first?.framesEncoded ?? null,
+      framesDecoded: first?.framesDecoded ?? null,
+      framesPerSecond: first?.framesPerSecond ?? null,
+      frameWidth: first?.frameWidth ?? null,
+      frameHeight: first?.frameHeight ?? null,
+      jitter: first?.jitter ?? null,
+    };
+  });
+}
+
+function telemetryDebugSummary(socketId, peer, payload = {}) {
+  const mediaStats = payload.mediaStats || {};
+  const outbound = compactRtpStats(mediaStats.producers || []);
+  const inbound = compactRtpStats(mediaStats.consumers || []);
+  const localMedia = payload.localMedia || {};
+  const remoteMonitor = payload.remoteMonitor || {};
+  const transports = payload.transports || {};
+  const sendPair = transports.sendSelectedCandidatePair || null;
+  const recvPair = transports.recvSelectedCandidatePair || null;
+  const flags = [];
+
+  const outboundVideo = outbound.find(item => item.kind === 'video' || item.source === 'camera');
+  const outboundAudio = outbound.find(item => item.kind === 'audio' || item.source === 'microphone');
+  const inboundVideo = inbound.find(item => item.kind === 'video');
+  const inboundAudio = inbound.find(item => item.kind === 'audio');
+
+  if (localMedia.cameraEnabled && !localMedia.video?.present) flags.push('camera-enabled-but-track-missing');
+  if (localMedia.micEnabled && !localMedia.audio?.present) flags.push('mic-enabled-but-track-missing');
+  if (localMedia.video?.readyState === 'live' && Number(outboundVideo?.bytesSent || 0) <= 0) flags.push('video-track-live-but-no-outbound-rtp');
+  if (localMedia.audio?.readyState === 'live' && Number(outboundAudio?.bytesSent || 0) <= 0) flags.push('audio-track-live-but-no-outbound-rtp');
+  if (remoteMonitor.peerCount > 0 && Number(inboundVideo?.bytesReceived || 0) <= 0) flags.push('remote-peer-present-but-no-inbound-video-rtp');
+  if (remoteMonitor.peerCount > 0 && Number(inboundAudio?.bytesReceived || 0) <= 0) flags.push('remote-peer-present-but-no-inbound-audio-rtp');
+  if (transports.socketConnected && !['connected', 'completed'].includes(String(transports.sendState || '').toLowerCase())) flags.push('socket-connected-send-transport-not-connected');
+  if (transports.socketConnected && !['connected', 'completed'].includes(String(transports.recvState || '').toLowerCase())) flags.push('socket-connected-recv-transport-not-connected');
+  if (sendPair?.local?.protocol === 'tcp' || recvPair?.local?.protocol === 'tcp') flags.push('ice-using-tcp');
+  if (sendPair?.local?.candidateType === 'relay' || recvPair?.local?.candidateType === 'relay') flags.push('ice-using-turn-relay');
+
+  return {
+    socketId,
+    locationName: peer?.locationName || payload.locationName || '',
+    appType: peer?.appType || payload.appType || '',
+    appVersion: payload.appVersion || peer?.appVersion || '',
+    channelId: peer?.channelId || payload.channelId || '',
+    status: payload.status || '',
+    clientTime: payload.clientTime || null,
+    connection: payload.connection || {},
+    transports: {
+      socketConnected: !!transports.socketConnected,
+      sendState: transports.sendState || '',
+      recvState: transports.recvState || '',
+      sendClosed: !!transports.sendClosed,
+      recvClosed: !!transports.recvClosed,
+      sendSelectedCandidatePair: sendPair,
+      recvSelectedCandidatePair: recvPair,
+    },
+    localMedia: {
+      cameraEnabled: !!localMedia.cameraEnabled,
+      micEnabled: !!localMedia.micEnabled,
+      speakerMuted: !!localMedia.speakerMuted,
+      video: localMedia.video || {},
+      audio: localMedia.audio || {},
+      error: localMedia.error || null,
+      audioProfile: localMedia.audioProfile || {},
+    },
+    remoteMonitor: {
+      peerCount: remoteMonitor.peerCount || 0,
+      receivingVideoCount: remoteMonitor.receivingVideoCount || 0,
+      receivingAudioCount: remoteMonitor.receivingAudioCount || 0,
+      peers: remoteMonitor.peers || [],
+    },
+    rtp: {
+      outbound,
+      inbound,
+    },
+    flags,
+  };
+}
 
 // アップデート配布フォルダ（server-gui から set-update-dir で指定される）
 let updateDir = process.env.UPDATE_DIR && fs.existsSync(process.env.UPDATE_DIR)
@@ -113,6 +224,7 @@ async function spawnWorker() {
   });
   worker.on('died', () => {
     console.error(`[Worker] died pid=${worker.pid}`);
+    appendDebugLog('worker.died', { workerPid: worker.pid }, 'error');
     workers = workers.filter(w => w !== worker);
     // router を載せていた worker が死んだら、メディア層を作り直してクライアントを復帰させる
     if (worker === routerWorker) {
@@ -124,6 +236,7 @@ async function spawnWorker() {
     }
   });
   console.log(`[Worker] created pid=${worker.pid}`);
+  appendDebugLog('worker.created', { workerPid: worker.pid });
   return worker;
 }
 
@@ -144,6 +257,7 @@ async function createRouter() {
   routerWorker = getWorker();
   router = await routerWorker.createRouter({ mediaCodecs: config.mediasoup.router.mediaCodecs });
   console.log(`[Router] created on worker pid=${routerWorker.pid}`);
+  appendDebugLog('router.created', { workerPid: routerWorker.pid, mediaCodecs: config.mediasoup.router.mediaCodecs });
 }
 
 async function recoverMediaLayer() {
@@ -171,14 +285,103 @@ async function recoverMediaLayer() {
   }
 }
 
+function closePeerProducer(socketId, producerId, { notify = true, closeProducer = true, reason = 'closed' } = {}) {
+  const peer = peers[socketId];
+  const entry = peer?.producers.get(producerId);
+  if (!peer || !entry) return false;
+
+  peer.producers.delete(producerId);
+  appendDebugLog('producer.closed', {
+    socketId,
+    producerId,
+    reason,
+    notify,
+    closeProducer,
+    kind: entry.kind,
+    source: entry.source || entry.appData?.source || '',
+    locationName: peer.locationName,
+    channelId: peer.channelId,
+  });
+  if (closeProducer) {
+    try { entry.producer.close(); } catch (_) {}
+  }
+  if (notify) {
+    peer.socket?.broadcast.emit('producerClosed', { producerId, socketId, reason });
+  }
+  return true;
+}
+
+function transportFromRecord(record) {
+  return record?.transport || record || null;
+}
+
 function resetPeerMedia(peer) {
   if (!peer) return;
-  for (const transport of peer.transports.values()) {
+  const socketId = peer.socket?.id;
+  if (socketId) {
+    for (const producerId of Array.from(peer.producers.keys())) {
+      closePeerProducer(socketId, producerId, { reason: 'media-reset' });
+    }
+  }
+  for (const record of peer.transports.values()) {
+    const transport = transportFromRecord(record);
     try { transport.close(); } catch (_) {}
   }
   peer.transports.clear();
   peer.producers.clear();
   peer.consumers.clear();
+}
+
+function cleanupPeer(socketId, reason = 'disconnect') {
+  const peer = peers[socketId];
+  if (!peer) return false;
+
+  if (peer.metadataTimer) clearTimeout(peer.metadataTimer);
+  finishCallsForSocket(socketId);
+  resetPeerMedia(peer);
+  delete peers[socketId];
+  io.emit('peerDisconnected', { socketId, reason });
+  broadcastViewerPresence();
+  return true;
+}
+
+function replaceExistingClientInstance(currentSocket, currentPeer) {
+  const clientInstanceId = currentPeer?.clientInstanceId;
+  if (!clientInstanceId) return;
+
+  for (const [socketId, peer] of Object.entries(peers)) {
+    if (socketId === currentSocket.id) continue;
+    if (peer.clientInstanceId !== clientInstanceId) continue;
+    if ((peer.appType || 'client') !== (currentPeer.appType || 'client')) continue;
+
+    console.warn(`[Peer] replacing stale duplicate instance=${clientInstanceId} old=${socketId} new=${currentSocket.id}`);
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      cleanupPeer(socketId, REPLACED_BY_NEW_CONNECTION_REASON);
+      try {
+        peer.socket.disconnect(true);
+      } catch (err) {
+        console.warn(`[Peer] failed to disconnect stale socket=${socketId}: ${err.message}`);
+      }
+    };
+    const timer = setTimeout(finish, 300);
+    try {
+      peer.socket.timeout(250).emit('instanceReplaced', {
+        reason: REPLACED_BY_NEW_CONNECTION_REASON,
+        replacementSocketId: currentSocket.id,
+        serverTime: Date.now(),
+      }, () => {
+        clearTimeout(timer);
+        finish();
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      console.warn(`[Peer] failed to notify stale socket=${socketId}: ${err.message}`);
+      finish();
+    }
+  }
 }
 
 function asObject(value) {
@@ -188,6 +391,21 @@ function asObject(value) {
 function shortString(value, max = 256) {
   if (value == null) return '';
   return String(value).slice(0, max);
+}
+
+function boundedNumber(value, min, max, fallback) {
+  const numeric = Number.parseInt(String(value ?? '').trim(), 10);
+  if (!Number.isInteger(numeric) || numeric < min || numeric > max) return fallback;
+  return numeric;
+}
+
+function videoProfileText(value) {
+  const raw = String(value || '').trim();
+  return ['stable', 'vpn-balanced', 'high', 'fhd'].includes(raw) ? raw : 'vpn-balanced';
+}
+
+function sanitizeClientInstanceId(value) {
+  return shortString(value, 128).trim().replace(/[^a-zA-Z0-9:_-]/g, '').slice(0, 96);
 }
 
 function stableId(value, fallback = 'general') {
@@ -245,6 +463,28 @@ function sanitizeVersionMap(input, previous = {}) {
   return next;
 }
 
+function normalizeClientPlatform(value) {
+  const raw = shortString(value, 32).trim().toLowerCase();
+  if (raw === 'mac' || raw === 'macos' || raw === 'osx') return 'darwin';
+  if (raw === 'windows' || raw === 'win' || raw === 'win64') return 'win32';
+  if (raw === 'linux') return 'linux';
+  return APP_PLATFORMS.includes(raw) ? raw : '';
+}
+
+function sanitizePackageInfo(input, fallbackVersion = '') {
+  const pkg = asObject(input);
+  return {
+    version: shortString(pkg.version || fallbackVersion || '', 48).trim(),
+    url: shortString(pkg.url, 1024).trim(),
+    notes: shortString(pkg.notes, 1000).trim(),
+    sha256: shortString(pkg.sha256, 128).trim(),
+    required: !!pkg.required,
+    fileName: shortString(pkg.fileName, 512).trim(),
+    platform: normalizeClientPlatform(pkg.platform),
+    registeredAt: Number.isFinite(pkg.registeredAt) ? pkg.registeredAt : Date.now(),
+  };
+}
+
 function sanitizeUpdatePackages(input, previous = {}) {
   const raw = asObject(input);
   const next = { ...previous };
@@ -252,17 +492,15 @@ function sanitizeUpdatePackages(input, previous = {}) {
     if (raw[appType] == null) continue;
     const pkg = asObject(raw[appType]);
     const version = shortString(pkg.version || systemState.latestVersions[appType] || '', 48).trim();
-    const url = shortString(pkg.url, 1024).trim();
-    const notes = shortString(pkg.notes, 1000).trim();
-    const sha256 = shortString(pkg.sha256, 128).trim();
-    next[appType] = {
-      version,
-      url,
-      notes,
-      sha256,
-      required: !!pkg.required,
-      registeredAt: Number.isFinite(pkg.registeredAt) ? pkg.registeredAt : Date.now(),
-    };
+    const clean = sanitizePackageInfo(pkg, version);
+    const rawPlatforms = asObject(pkg.platforms);
+    const platforms = {};
+    for (const [platform, platformPkg] of Object.entries(rawPlatforms)) {
+      const normalizedPlatform = normalizeClientPlatform(platform);
+      if (!normalizedPlatform) continue;
+      platforms[normalizedPlatform] = sanitizePackageInfo({ ...platformPkg, platform: normalizedPlatform }, version);
+    }
+    next[appType] = Object.keys(platforms).length ? { ...clean, platforms } : clean;
   }
   return next;
 }
@@ -272,12 +510,22 @@ function sanitizeSystemStatePatch(patch) {
   const channels = raw.channels == null ? systemState.channels : sanitizeChannels(raw.channels);
   const latestVersions = sanitizeVersionMap(raw.latestVersions, systemState.latestVersions);
   const updatePackages = sanitizeUpdatePackages(raw.updatePackages, systemState.updatePackages);
+  const mediaTransport = {
+    forceTcp: raw.mediaTransport == null
+      ? !!systemState.mediaTransport?.forceTcp
+      : !!asObject(raw.mediaTransport).forceTcp,
+    videoProfile: videoProfileText(asObject(raw.mediaTransport).videoProfile || systemState.mediaTransport?.videoProfile || 'vpn-balanced'),
+    cameraMaxBitrateKbps: boundedNumber(asObject(raw.mediaTransport).cameraMaxBitrateKbps, 200, 6000, systemState.mediaTransport?.cameraMaxBitrateKbps || 1400),
+    cameraStartBitrateKbps: boundedNumber(asObject(raw.mediaTransport).cameraStartBitrateKbps, 150, 4000, systemState.mediaTransport?.cameraStartBitrateKbps || 900),
+    screenMaxBitrateKbps: boundedNumber(asObject(raw.mediaTransport).screenMaxBitrateKbps, 300, 8000, systemState.mediaTransport?.screenMaxBitrateKbps || 1800),
+  };
 
   return {
     brand: SYSTEM_NAME,
     channels,
     latestVersions,
     updatePackages,
+    mediaTransport,
     updatedAt: Date.now(),
   };
 }
@@ -291,16 +539,40 @@ function resolveUpdateUrl(url) {
   return `http://${host}:${config.listenPort}${pathname}`;
 }
 
+function resolvePackageUrls(pkg) {
+  if (!pkg) return null;
+  const next = { ...pkg, url: resolveUpdateUrl(pkg.url) };
+  if (pkg.platforms && typeof pkg.platforms === 'object') {
+    next.platforms = Object.fromEntries(Object.entries(pkg.platforms).map(([platform, platformPkg]) => [
+      platform,
+      { ...platformPkg, url: resolveUpdateUrl(platformPkg.url) },
+    ]));
+  }
+  return next;
+}
+
+function packageForPlatform(appType, platform) {
+  const pkg = systemState.updatePackages[appType] || null;
+  if (!pkg) return null;
+  const normalizedPlatform = normalizeClientPlatform(platform);
+  const platformPkg = normalizedPlatform ? pkg.platforms?.[normalizedPlatform] : null;
+  return resolvePackageUrls(platformPkg || pkg);
+}
+
 function getSystemStateSnapshot() {
   const updatePackages = {};
   for (const [appType, pkg] of Object.entries(systemState.updatePackages || {})) {
-    updatePackages[appType] = { ...pkg, url: resolveUpdateUrl(pkg.url) };
+    updatePackages[appType] = resolvePackageUrls(pkg);
   }
   return {
     ...systemState,
     updatePackages,
     serverVersion: SERVER_APP_VERSION,
   };
+}
+
+function isForceTcpMediaEnabled() {
+  return !!systemState.mediaTransport?.forceTcp;
 }
 
 function broadcastSystemState() {
@@ -363,12 +635,193 @@ function publicProducer(producerId, entry) {
     kind: entry.kind,
     paused: !!entry.paused,
     source,
+    score: Array.isArray(entry.score) ? entry.score : [],
+    scoreUpdatedAt: entry.scoreUpdatedAt || null,
     appData: {
       ...(entry.appData || {}),
       source,
     },
     channelId: entry.channelId || null,
   };
+}
+
+function publicTuple(tuple) {
+  if (!tuple || typeof tuple !== 'object') return null;
+  return {
+    protocol: shortString(tuple.protocol, 16),
+    localIp: shortString(tuple.localIp, 64),
+    localPort: Number(tuple.localPort) || null,
+    remoteIp: shortString(tuple.remoteIp, 64),
+    remotePort: Number(tuple.remotePort) || null,
+  };
+}
+
+function createTransportRecord(transport, { direction = 'unknown', forceTcp = false } = {}) {
+  const record = {
+    id: transport.id,
+    transport,
+    direction: shortString(direction, 16) || 'unknown',
+    forceTcp: !!forceTcp,
+    iceState: transport.iceState || 'new',
+    dtlsState: transport.dtlsState || 'new',
+    sctpState: transport.sctpState || '',
+    selectedTuple: publicTuple(transport.iceSelectedTuple || transport.tuple),
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    closedAt: null,
+  };
+  const touch = () => { record.updatedAt = Date.now(); };
+  transport.on('icestatechange', state => {
+    record.iceState = state;
+    touch();
+    appendDebugLog('transport.ice-state', {
+      transportId: record.id,
+      direction: record.direction,
+      forceTcp: record.forceTcp,
+      iceState: state,
+      selectedTuple: record.selectedTuple,
+    }, ['failed', 'disconnected', 'closed'].includes(state) ? 'warn' : 'info');
+  });
+  transport.on('iceselectedtuplechange', tuple => {
+    record.selectedTuple = publicTuple(tuple);
+    touch();
+    appendDebugLog('transport.ice-selected-tuple', {
+      transportId: record.id,
+      direction: record.direction,
+      forceTcp: record.forceTcp,
+      selectedTuple: record.selectedTuple,
+    });
+  });
+  transport.on('dtlsstatechange', state => {
+    record.dtlsState = state;
+    touch();
+    appendDebugLog('transport.dtls-state', {
+      transportId: record.id,
+      direction: record.direction,
+      forceTcp: record.forceTcp,
+      dtlsState: state,
+      selectedTuple: record.selectedTuple,
+    }, ['failed', 'closed'].includes(state) ? 'warn' : 'info');
+    if (state === 'closed') transport.close();
+  });
+  transport.on('sctpstatechange', state => {
+    record.sctpState = state;
+    touch();
+    appendDebugLog('transport.sctp-state', {
+      transportId: record.id,
+      direction: record.direction,
+      forceTcp: record.forceTcp,
+      sctpState: state,
+    });
+  });
+  transport.on('close', () => {
+    record.closedAt = Date.now();
+    record.updatedAt = record.closedAt;
+    console.log('[Transport] closed');
+    appendDebugLog('transport.closed', {
+      transportId: record.id,
+      direction: record.direction,
+      forceTcp: record.forceTcp,
+      iceState: record.iceState,
+      dtlsState: record.dtlsState,
+      selectedTuple: record.selectedTuple,
+    });
+  });
+  return record;
+}
+
+function publicTransportRecord(record) {
+  const transport = transportFromRecord(record);
+  if (!transport) return null;
+  return {
+    id: record.id || transport.id,
+    direction: record.direction || 'unknown',
+    forceTcp: !!record.forceTcp,
+    iceState: record.iceState || transport.iceState || '',
+    dtlsState: record.dtlsState || transport.dtlsState || '',
+    sctpState: record.sctpState || transport.sctpState || '',
+    selectedTuple: record.selectedTuple || publicTuple(transport.iceSelectedTuple || transport.tuple),
+    closed: !!transport.closed,
+    createdAt: record.createdAt || null,
+    updatedAt: record.updatedAt || null,
+    closedAt: record.closedAt || null,
+  };
+}
+
+function estimatedProducerBitrate(entry) {
+  if (!entry) return 0;
+  const source = entry.source || sanitizeProducerSource(entry.kind, entry.appData);
+  if (entry.paused) return 0;
+  return ESTIMATED_MEDIA_BITRATES_BPS[source] || (entry.kind === 'video' ? ESTIMATED_MEDIA_BITRATES_BPS.camera : ESTIMATED_MEDIA_BITRATES_BPS.microphone);
+}
+
+function bandwidthEstimateSnapshot() {
+  let serverIngressBps = 0;
+  let serverEgressBps = 0;
+  let activeVideoProducers = 0;
+  let activeAudioProducers = 0;
+
+  for (const peer of Object.values(peers)) {
+    for (const entry of peer.producers.values()) {
+      const bps = estimatedProducerBitrate(entry);
+      serverIngressBps += bps;
+      if (bps > 0 && entry.kind === 'video') activeVideoProducers += 1;
+      if (bps > 0 && entry.kind === 'audio') activeAudioProducers += 1;
+    }
+    for (const consumer of peer.consumers.values()) {
+      if (consumer.paused || consumer.closed) continue;
+      const owner = findProducerOwner(consumer.producerId);
+      serverEgressBps += estimatedProducerBitrate(owner?.entry);
+    }
+  }
+
+  const vpnBudgetBps = DEFAULT_VPN_BANDWIDTH_MBPS * 1_000_000;
+  const usageRatio = vpnBudgetBps > 0 ? serverEgressBps / vpnBudgetBps : 0;
+  return {
+    vpnBudgetMbps: DEFAULT_VPN_BANDWIDTH_MBPS,
+    estimatedServerIngressMbps: Number((serverIngressBps / 1_000_000).toFixed(2)),
+    estimatedServerEgressMbps: Number((serverEgressBps / 1_000_000).toFixed(2)),
+    estimatedBudgetUsagePercent: Number((usageRatio * 100).toFixed(1)),
+    activeVideoProducers,
+    activeAudioProducers,
+    qualityMode: mediaPeerCount() >= 4 ? 'conservative' : 'balanced',
+  };
+}
+
+function mediaPeerCount() {
+  return Object.values(peers).filter(peer => peer.metadataReady && peer.appType !== 'server-gui').length;
+}
+
+function preferredConsumerLayers(entry) {
+  if (!entry || entry.kind !== 'video') return null;
+  const source = entry.source || sanitizeProducerSource(entry.kind, entry.appData);
+  const congested = mediaPeerCount() >= 4;
+  if (source === 'screen') {
+    return congested
+      ? { spatialLayer: 0, temporalLayer: 0 }
+      : { spatialLayer: 1, temporalLayer: 0 };
+  }
+  return congested
+    ? { spatialLayer: 0, temporalLayer: 0 }
+    : { spatialLayer: 1, temporalLayer: 0 };
+}
+
+async function applyConsumerReliabilityPolicy(consumer, entry) {
+  if (!consumer || !entry || entry.kind !== 'video') return;
+  try {
+    const layers = preferredConsumerLayers(entry);
+    if (layers) {
+      await consumer.setPreferredLayers(layers);
+      if (consumer.__chDiagnostics) consumer.__chDiagnostics.preferredLayers = layers;
+    }
+  } catch (err) {
+    console.warn(`[ConsumerPolicy] preferred layers skipped consumer=${consumer.id}: ${err.message}`);
+  }
+  try {
+    await consumer.setPriority((entry.source || entry.appData?.source) === 'screen' ? 2 : 1);
+  } catch {
+    // setPriority is optional depending on transport/consumer state.
+  }
 }
 
 function findProducerOwner(producerId) {
@@ -401,6 +854,29 @@ function sanitizeDeviceList(devices) {
   });
 }
 
+function sanitizeRtpStatList(items) {
+  return Array.isArray(items) ? items.slice(0, 8).map(item => asObject(item)) : [];
+}
+
+function sanitizeMediaStats(rawStats) {
+  const data = asObject(rawStats);
+  const sanitizeItems = items => (Array.isArray(items) ? items.slice(0, 48).map(raw => {
+    const item = asObject(raw);
+    return {
+      source: shortString(item.source, 32),
+      producerId: shortString(item.producerId, 128),
+      id: shortString(item.id, 128),
+      kind: shortString(item.kind, 16),
+      error: shortString(item.error, 160),
+      stats: sanitizeRtpStatList(item.stats),
+    };
+  }) : []);
+  return {
+    producers: sanitizeItems(data.producers),
+    consumers: sanitizeItems(data.consumers),
+  };
+}
+
 function sanitizeTelemetry(report) {
   const data = asObject(report);
   const devices = asObject(data.devices);
@@ -429,6 +905,7 @@ function sanitizeTelemetry(report) {
   return {
     appType: shortString(data.appType || 'client', 24),
     appVersion: shortString(data.appVersion || '', 48),
+    platform: normalizeClientPlatform(data.platform),
     locationName: shortString(data.locationName || '', 128),
     channelId: normalizeChannelId(data.channelId),
     status: shortString(data.status || '', 32),
@@ -453,6 +930,7 @@ function sanitizeTelemetry(report) {
     connection,
     transports,
     consumers: Array.isArray(data.consumers) ? data.consumers.slice(0, MAX_MONITOR_PEERS) : [],
+    mediaStats: sanitizeMediaStats(data.mediaStats),
   };
 }
 
@@ -525,7 +1003,14 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     kind: consumer.kind,
     paused: consumer.paused,
     closed: consumer.closed,
+    score: Array.isArray(consumer.__chDiagnostics?.score) ? consumer.__chDiagnostics.score : [],
+    preferredLayers: consumer.__chDiagnostics?.preferredLayers || null,
+    currentLayers: consumer.__chDiagnostics?.currentLayers || null,
+    scoreUpdatedAt: consumer.__chDiagnostics?.scoreUpdatedAt || null,
   }));
+  const serverTransportList = Array.from(peer.transports.values())
+    .map(publicTransportRecord)
+    .filter(Boolean);
   const heartbeatAgeMs = peer.lastHeartbeatAt ? now - peer.lastHeartbeatAt : null;
 
   return {
@@ -533,6 +1018,7 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     name: peer.locationName,
     appType: peer.appType || peer.telemetry?.appType || 'client',
     appVersion: peer.appVersion || peer.telemetry?.appVersion || '',
+    platform: peer.platform || peer.telemetry?.platform || '',
     channelId: peer.channelId || DEFAULT_CHANNELS[0].id,
     remoteAddress: peer.socket.handshake.address,
     connectedAt: peer.connectedAt,
@@ -551,7 +1037,11 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     remoteMonitor: peer.monitorState?.remoteMonitor || {},
     viewerPresence: !!peer.viewerPresenceActive,
     connection: peer.monitorState?.connection || {},
-    transports: peer.monitorState?.transports || {},
+    transports: {
+      ...(peer.monitorState?.transports || {}),
+      server: serverTransportList,
+    },
+    mediaStats: peer.monitorState?.mediaStats || {},
     telemetry: peer.telemetry || null,
   };
 }
@@ -600,6 +1090,7 @@ function getStatsSnapshot() {
     currentIp: config.announcedIp || serverIps[0] || config.listenIp || '',
     rtcPortRange: config.rtcPortRange,
     iceServerCount: (config.iceServers || []).length,
+    bandwidthEstimate: bandwidthEstimateSnapshot(),
     systemState: getSystemStateSnapshot(),
   };
 }
@@ -610,12 +1101,22 @@ function getStatsSnapshot() {
 function listUpdateFiles() {
   if (!updateDir || !fs.existsSync(updateDir)) return [];
   try {
-    return fs.readdirSync(updateDir)
-      .filter(name => /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i.test(name))
-      .map(name => {
-        const stat = fs.statSync(path.join(updateDir, name));
-        return { name, size: stat.size, mtimeMs: stat.mtimeMs };
-      });
+    const files = [];
+    const walk = (dir, prefix = '') => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const relativeName = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(fullPath, relativeName);
+          continue;
+        }
+        if (!entry.isFile() || !/\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i.test(entry.name)) continue;
+        const stat = fs.statSync(fullPath);
+        files.push({ name: relativeName, size: stat.size, mtimeMs: stat.mtimeMs });
+      }
+    };
+    walk(updateDir);
+    return files;
   } catch (err) {
     console.error('[Updates] list failed:', err.message);
     return [];
@@ -626,17 +1127,25 @@ app.get('/updates', (_, res) => {
   res.json({ updateDir: updateDir || null, files: listUpdateFiles() });
 });
 
-app.get('/updates/:filename', (req, res) => {
+app.get(/^\/updates\/(.+)$/, (req, res) => {
   if (!updateDir) return res.status(404).json({ error: 'update dir not configured' });
-  const fileName = path.basename(String(req.params.filename || ''));
-  const filePath = path.join(updateDir, fileName);
-  if (!fileName || !filePath.startsWith(updateDir) || !fs.existsSync(filePath)) {
+  let fileName = String(req.params[0] || '');
+  try {
+    fileName = decodeURIComponent(fileName);
+  } catch {
+    return res.status(400).json({ error: 'invalid file path' });
+  }
+  const relativePath = path.normalize(fileName).replace(/^(\.\.(\/|\\|$))+/, '');
+  const filePath = path.resolve(updateDir, relativePath);
+  const root = path.resolve(updateDir);
+  if (!relativePath || !filePath.startsWith(`${root}${path.sep}`) || !fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'file not found' });
   }
-  res.download(filePath, fileName);
+  res.download(filePath, path.basename(relativePath));
 });
 
-app.get('/health', (_, res) => res.json(getStatsSnapshot()));
+app.get('/health', (_, res) => res.json({ ...getStatsSnapshot(), debugLog: debugLogInfo() }));
+app.get('/debug/log-info', (_, res) => res.json(debugLogInfo()));
 app.get('/ready', (_, res) => {
   const ready = !!router && workers.length > 0 && !recovering;
   res.status(ready ? 200 : 503).json({ ready, recovering, workers: workers.length });
@@ -676,30 +1185,41 @@ function applySystemStatePatch(patch, source = 'server') {
   return snapshot;
 }
 
-function emitUpdateCommand(target, recipientCount, appType, { forced = false, reason = 'server-gui' } = {}) {
+function emitUpdateCommand(targetSockets, appType, { forced = false, reason = 'server-gui' } = {}) {
   const type = shortString(appType, 24);
-  const rawPackage = systemState.updatePackages[type] || null;
-  const packageInfo = rawPackage ? { ...rawPackage, url: resolveUpdateUrl(rawPackage.url) } : null;
-  const version = systemState.latestVersions[type] || packageInfo?.version || '';
-  const payload = {
-    appType: type,
-    brand: SYSTEM_NAME,
-    version,
-    packageInfo,
-    forced: !!forced,
-    reason,
-    issuedAt: Date.now(),
-  };
-
+  const sockets = Array.isArray(targetSockets) ? targetSockets : [];
+  const recipientCount = sockets.length;
   sendAdminLog(`[Admin] updateCommand requested appType=${type || 'all'} forced=${!!forced} recipients=${recipientCount}`);
   if (recipientCount === 0) return;
 
-  target.timeout(RESTART_ACK_TIMEOUT_MS).emit('updateCommand', payload, (err, responses = []) => {
-    const acknowledged = Array.isArray(responses) ? responses.length : (responses ? 1 : 0);
-    const timedOut = err ? Math.max(recipientCount - acknowledged, 0) : 0;
-    const suffix = timedOut > 0 ? ` timeout=${timedOut}` : '';
-    sendAdminLog(`[Admin] updateCommand ack=${acknowledged}/${recipientCount}${suffix}`);
-  });
+  let completed = 0;
+  let acknowledged = 0;
+  for (const socket of sockets) {
+    const peer = peers[socket.id] || {};
+    const targetAppType = type && type !== 'all' ? type : (peer.appType || type);
+    const packageInfo = packageForPlatform(targetAppType, peer.platform);
+    const version = packageInfo?.version || systemState.latestVersions[targetAppType] || '';
+    const payload = {
+      appType: targetAppType,
+      brand: SYSTEM_NAME,
+      version,
+      platform: peer.platform || '',
+      packageInfo,
+      forced: !!forced,
+      reason,
+      issuedAt: Date.now(),
+    };
+
+    socket.timeout(RESTART_ACK_TIMEOUT_MS).emit('updateCommand', payload, (err, response) => {
+      completed += 1;
+      if (!err && !response?.error) acknowledged += 1;
+      if (completed === recipientCount) {
+        const timedOut = recipientCount - acknowledged;
+        const suffix = timedOut > 0 ? ` timeout=${timedOut}` : '';
+        sendAdminLog(`[Admin] updateCommand ack=${acknowledged}/${recipientCount}${suffix}`);
+      }
+    });
+  }
 }
 
 function emitTargetCommand(socketId, eventName, payload, label) {
@@ -850,16 +1370,21 @@ viewerPresenceTimer.unref?.();
 // ── Transport ─────────────────────────────────────────────
 
 async function createWebRtcTransport(router, forceTcp = false) {
-  const { listenIps, initialAvailableOutgoingBitrate } = config.mediasoup.webRtcTransport;
+  const {
+    listenIps,
+    initialAvailableOutgoingBitrate,
+    minimumAvailableOutgoingBitrate,
+    maxSctpMessageSize,
+  } = config.mediasoup.webRtcTransport;
   const transport = await router.createWebRtcTransport({
     listenIps,
     enableUdp: !forceTcp,
     enableTcp: true,
     preferUdp: !forceTcp,
     initialAvailableOutgoingBitrate,
+    minimumAvailableOutgoingBitrate,
+    maxSctpMessageSize,
   });
-  transport.on('dtlsstatechange', state => { if (state === 'closed') transport.close(); });
-  transport.on('close', () => console.log('[Transport] closed'));
   return transport;
 }
 
@@ -867,12 +1392,20 @@ async function createWebRtcTransport(router, forceTcp = false) {
 
 io.on('connection', async socket => {
   console.log(`[+] connect  ${socket.id}`);
+  appendDebugLog('socket.connected', {
+    socketId: socket.id,
+    remoteAddress: socket.handshake.address,
+    userAgent: socket.handshake.headers?.['user-agent'] || '',
+    transport: socket.conn?.transport?.name || '',
+  });
 
   peers[socket.id] = {
     socket,
     locationName: '接続中...',
     appType: 'client',
     appVersion: '',
+    clientInstanceId: '',
+    platform: '',
     channelId: DEFAULT_CHANNELS[0].id,
     metadataReady: false,
     connectedAt: Date.now(),
@@ -886,20 +1419,50 @@ io.on('connection', async socket => {
     producers: new Map(),
     consumers: new Map(),
     viewerPresenceActive: false,
+    metadataTimer: null,
   };
+
+  peers[socket.id].metadataTimer = setTimeout(() => {
+    const peer = peers[socket.id];
+    if (!peer || peer.metadataReady) return;
+    console.warn(`[Peer] metadata timeout socket=${socket.id} remote=${socket.handshake.address}`);
+    cleanupPeer(socket.id, 'metadata-timeout');
+    try {
+      socket.disconnect(true);
+    } catch (err) {
+      console.warn(`[Peer] failed to disconnect metadata-timeout socket=${socket.id}: ${err.message}`);
+    }
+  }, METADATA_TIMEOUT_MS);
 
   // ── 拠点名の設定 ──
   socket.on('setMetadata', (metadata = {}) => {
-    const { locationName, appType, channelId, appVersion } = asObject(metadata);
+    const { locationName, appType, channelId, appVersion, clientInstanceId, platform } = asObject(metadata);
     if (peers[socket.id]) {
       const peer = peers[socket.id];
       const isFirstMetadata = !peer.metadataReady;
       peer.locationName = shortString(locationName || '不明', 128);
       if (appType) peer.appType = shortString(appType, 24);
       if (appVersion) peer.appVersion = shortString(appVersion, 48);
+      if (clientInstanceId) peer.clientInstanceId = sanitizeClientInstanceId(clientInstanceId);
+      if (platform) peer.platform = normalizeClientPlatform(platform);
       if (channelId) peer.channelId = normalizeChannelId(channelId);
+      if (peer.metadataTimer) {
+        clearTimeout(peer.metadataTimer);
+        peer.metadataTimer = null;
+      }
+      replaceExistingClientInstance(socket, peer);
       peer.metadataReady = true;
       console.log(`[Meta] ${socket.id} → "${locationName}"`);
+      appendDebugLog('peer.metadata', {
+        socketId: socket.id,
+        locationName: peer.locationName,
+        appType: peer.appType,
+        appVersion: peer.appVersion,
+        clientInstanceId: peer.clientInstanceId,
+        platform: peer.platform,
+        channelId: peer.channelId,
+        remoteAddress: socket.handshake.address,
+      });
       if (isFirstMetadata) {
         socket.broadcast.emit('peerJoined', {
           socketId: socket.id,
@@ -916,6 +1479,7 @@ io.on('connection', async socket => {
           channelId: peer.channelId,
           appType: peer.appType,
           appVersion: peer.appVersion,
+          platform: peer.platform,
         },
       });
     }
@@ -930,6 +1494,7 @@ io.on('connection', async socket => {
     peer.telemetry = clean;
     peer.appType = clean.appType || peer.appType || 'client';
     peer.appVersion = clean.appVersion || peer.appVersion || '';
+    peer.platform = clean.platform || peer.platform || '';
     peer.channelId = clean.channelId || peer.channelId || DEFAULT_CHANNELS[0].id;
     if (clean.locationName) peer.locationName = clean.locationName;
     if (Number.isFinite(clean.connection?.telemetryRttMs)) {
@@ -947,7 +1512,9 @@ io.on('connection', async socket => {
       connection: clean.connection || {},
       transports: clean.transports || {},
       consumers: clean.consumers || [],
+      mediaStats: clean.mediaStats || {},
     };
+    appendDebugLog('client.telemetry', telemetryDebugSummary(socket.id, peer, clean));
     broadcastViewerPresence();
     callback?.({ ok: true, serverTime: Date.now() });
   });
@@ -960,7 +1527,14 @@ io.on('connection', async socket => {
 
   // ── サーバー設定（ICE サーバーなど）──
   socket.on('getServerConfig', (_, callback) => {
-    safeCallback(callback, { iceServers: config.iceServers || [] });
+    safeCallback(callback, {
+      iceServers: config.iceServers || [],
+      forceTcpMedia: isForceTcpMediaEnabled(),
+      mediaTransport: {
+        ...systemState.mediaTransport,
+        forceTcp: isForceTcpMediaEnabled(),
+      },
+    });
   });
 
   socket.on('getSystemState', (_, callback) => {
@@ -1125,8 +1699,28 @@ io.on('connection', async socket => {
       if (!peer) return;
       if (!router) return safeCallback(callback, { error: 'router not ready' });
       const { forceTcp } = asObject(payload);
+      const direction = ['send', 'recv'].includes(asObject(payload).direction)
+        ? asObject(payload).direction
+        : 'unknown';
       const transport = await createWebRtcTransport(router, !!forceTcp);
-      peer.transports.set(transport.id, transport);
+      if (forceTcp) {
+        console.log(`[Transport] TCP-only media transport created socket=${socket.id} direction=${direction}`);
+      }
+      peer.transports.set(transport.id, createTransportRecord(transport, { direction, forceTcp: !!forceTcp }));
+      appendDebugLog('transport.created', {
+        socketId: socket.id,
+        locationName: peer.locationName,
+        transportId: transport.id,
+        direction,
+        forceTcp: !!forceTcp,
+        iceCandidates: transport.iceCandidates?.map(candidate => ({
+          protocol: candidate.protocol,
+          ip: candidate.ip,
+          port: candidate.port,
+          type: candidate.type,
+          tcpType: candidate.tcpType || '',
+        })) || [],
+      });
       safeCallback(callback, {
         params: {
           id:              transport.id,
@@ -1147,11 +1741,20 @@ io.on('connection', async socket => {
       const peer = getPeerForRequest(socket, callback);
       if (!peer) return;
       const { transportId, dtlsParameters } = asObject(payload);
-      const transport = peer.transports.get(transportId);
+      const transport = transportFromRecord(peer.transports.get(transportId));
       if (!transport) return safeCallback(callback, { error: 'transport not found' });
       await transport.connect({ dtlsParameters });
+      appendDebugLog('transport.connected', {
+        socketId: socket.id,
+        locationName: peer.locationName,
+        transportId,
+        dtlsState: transport.dtlsState || '',
+        iceState: transport.iceState || '',
+        selectedTuple: publicTuple(transport.iceSelectedTuple || transport.tuple),
+      });
       safeCallback(callback, {});
     } catch (err) {
+      appendDebugLog('transport.connect-error', { socketId: socket.id, error: err.message }, 'error');
       safeCallback(callback, { error: err.message });
     }
   });
@@ -1164,7 +1767,7 @@ io.on('connection', async socket => {
       const { transportId, kind, rtpParameters } = asObject(payload);
       const appData = asObject(payload.appData);
       if (!['audio', 'video'].includes(kind)) return safeCallback(callback, { error: 'invalid producer kind' });
-      const transport = peer.transports.get(transportId);
+      const transport = transportFromRecord(peer.transports.get(transportId));
       if (!transport) return safeCallback(callback, { error: 'transport not found' });
       const source = sanitizeProducerSource(kind, appData);
       const producerAppData = {
@@ -1182,14 +1785,47 @@ io.on('connection', async socket => {
         source,
         appData: producerAppData,
         channelId: peer.channelId,
+        score: [],
+        scoreUpdatedAt: null,
+      });
+      const producerEntry = peer.producers.get(producer.id);
+
+      producer.on('score', score => {
+        producerEntry.score = Array.isArray(score) ? score : [];
+        producerEntry.scoreUpdatedAt = Date.now();
+        appendDebugLog('producer.score', {
+          socketId: socket.id,
+          producerId: producer.id,
+          kind: producer.kind,
+          source,
+          score: producerEntry.score,
+        });
       });
 
       producer.on('transportclose', () => {
-        producer.close();
-        peers[socket.id]?.producers.delete(producer.id);
+        closePeerProducer(socket.id, producer.id, {
+          closeProducer: false,
+          reason: 'transportclose',
+        });
       });
 
       safeCallback(callback, { id: producer.id });
+      appendDebugLog('producer.created', {
+        socketId: socket.id,
+        locationName: peer.locationName,
+        producerId: producer.id,
+        transportId,
+        kind: producer.kind,
+        source,
+        channelId: peer.channelId,
+        paused: producer.paused,
+        rtpEncodings: rtpParameters?.encodings || [],
+        rtpCodecs: rtpParameters?.codecs?.map(codec => ({
+          mimeType: codec.mimeType,
+          clockRate: codec.clockRate,
+          channels: codec.channels,
+        })) || [],
+      });
 
       // 他の全ピアへ通知（拠点名・kind・paused 状態も含む）
       socket.broadcast.emit('newProducer', {
@@ -1206,6 +1842,7 @@ io.on('connection', async socket => {
 
     } catch (err) {
       console.error('[produce]', err);
+      appendDebugLog('producer.create-error', { socketId: socket.id, error: err.message }, 'error');
       safeCallback(callback, { error: err.message });
     }
   });
@@ -1217,7 +1854,7 @@ io.on('connection', async socket => {
       if (!peer) return;
       if (!router) return safeCallback(callback, { error: 'router not ready' });
       const { transportId, producerId, rtpCapabilities } = asObject(payload);
-      const transport = peer.transports.get(transportId);
+      const transport = transportFromRecord(peer.transports.get(transportId));
       if (!transport) return safeCallback(callback, { error: 'transport not found' });
       const owner = findProducerOwner(producerId);
       if (!owner) return safeCallback(callback, { error: 'producer not found' });
@@ -1226,6 +1863,35 @@ io.on('connection', async socket => {
         return safeCallback(callback, { error: 'cannot consume' });
       }
       const consumer = await transport.consume({ producerId, rtpCapabilities, paused: true });
+      consumer.__chDiagnostics = {
+        producerId,
+        score: [],
+        preferredLayers: null,
+        currentLayers: null,
+        scoreUpdatedAt: null,
+      };
+      consumer.on('score', score => {
+        consumer.__chDiagnostics.score = Array.isArray(score) ? score : [];
+        consumer.__chDiagnostics.scoreUpdatedAt = Date.now();
+        appendDebugLog('consumer.score', {
+          socketId: socket.id,
+          consumerId: consumer.id,
+          producerId,
+          kind: consumer.kind,
+          score: consumer.__chDiagnostics.score,
+        });
+      });
+      consumer.on('layerschange', layers => {
+        consumer.__chDiagnostics.currentLayers = layers || null;
+        appendDebugLog('consumer.layers', {
+          socketId: socket.id,
+          consumerId: consumer.id,
+          producerId,
+          kind: consumer.kind,
+          layers: layers || null,
+        });
+      });
+      await applyConsumerReliabilityPolicy(consumer, owner.entry);
 
       peer.consumers.set(consumer.id, consumer);
 
@@ -1247,8 +1913,21 @@ io.on('connection', async socket => {
           rtpParameters: consumer.rtpParameters,
         },
       });
+      appendDebugLog('consumer.created', {
+        socketId: socket.id,
+        locationName: peer.locationName,
+        consumerId: consumer.id,
+        producerId,
+        producerOwnerSocketId: owner.peerId,
+        producerOwnerName: owner.peer.locationName,
+        kind: consumer.kind,
+        source: owner.entry.source || owner.entry.appData?.source || '',
+        paused: consumer.paused,
+        transportId,
+      });
     } catch (err) {
       console.error('[consume]', err);
+      appendDebugLog('consumer.create-error', { socketId: socket.id, error: err.message }, 'error');
       safeCallback(callback, { error: err.message });
     }
   });
@@ -1262,8 +1941,16 @@ io.on('connection', async socket => {
       const consumer = peer.consumers.get(consumerId);
       if (!consumer) return safeCallback(callback, { error: 'consumer not found' });
       await consumer.resume();
+      appendDebugLog('consumer.resumed', {
+        socketId: socket.id,
+        locationName: peer.locationName,
+        consumerId,
+        producerId: consumer.producerId,
+        kind: consumer.kind,
+      });
       safeCallback(callback, {});
     } catch (err) {
+      appendDebugLog('consumer.resume-error', { socketId: socket.id, error: err.message }, 'error');
       safeCallback(callback, { error: err.message });
     }
   });
@@ -1274,11 +1961,19 @@ io.on('connection', async socket => {
       const peer = getPeerForRequest(socket, callback);
       if (!peer) return;
       const { transportId } = asObject(payload);
-      const transport = peer.transports.get(transportId);
+      const transport = transportFromRecord(peer.transports.get(transportId));
       if (!transport) return safeCallback(callback, { error: 'transport not found' });
       const iceParameters = await transport.restartIce();
+      appendDebugLog('transport.ice-restart', {
+        socketId: socket.id,
+        locationName: peer.locationName,
+        transportId,
+        iceState: transport.iceState || '',
+        dtlsState: transport.dtlsState || '',
+      });
       safeCallback(callback, { iceParameters });
     } catch (err) {
+      appendDebugLog('transport.ice-restart-error', { socketId: socket.id, error: err.message }, 'error');
       safeCallback(callback, { error: err.message });
     }
   });
@@ -1330,9 +2025,17 @@ io.on('connection', async socket => {
       if (!entry) return callback?.({ error: 'not found' });
       await entry.producer.pause();
       entry.paused = true;
+      appendDebugLog('producer.paused', {
+        socketId: socket.id,
+        locationName: peers[socket.id]?.locationName || '',
+        producerId,
+        kind: entry.kind,
+        source: entry.source || entry.appData?.source || '',
+      });
       socket.broadcast.emit('producerPaused', { producerId, socketId: socket.id });
       callback?.({});
     } catch (err) {
+      appendDebugLog('producer.pause-error', { socketId: socket.id, error: err.message }, 'error');
       callback?.({ error: err.message });
     }
   });
@@ -1345,9 +2048,17 @@ io.on('connection', async socket => {
       if (!entry) return callback?.({ error: 'not found' });
       await entry.producer.resume();
       entry.paused = false;
+      appendDebugLog('producer.resumed', {
+        socketId: socket.id,
+        locationName: peers[socket.id]?.locationName || '',
+        producerId,
+        kind: entry.kind,
+        source: entry.source || entry.appData?.source || '',
+      });
       socket.broadcast.emit('producerResumed', { producerId, socketId: socket.id });
       callback?.({});
     } catch (err) {
+      appendDebugLog('producer.resume-error', { socketId: socket.id, error: err.message }, 'error');
       callback?.({ error: err.message });
     }
   });
@@ -1356,12 +2067,9 @@ io.on('connection', async socket => {
   socket.on('closeProducer', (payload = {}, callback) => {
     try {
       const { producerId } = asObject(payload);
-      const peer = peers[socket.id];
-      const entry = peer?.producers.get(producerId);
-      if (!entry) return callback?.({ error: 'not found' });
-      try { entry.producer.close(); } catch (_) {}
-      peer.producers.delete(producerId);
-      socket.broadcast.emit('producerClosed', { producerId, socketId: socket.id });
+      if (!closePeerProducer(socket.id, producerId, { reason: 'client-close' })) {
+        return callback?.({ error: 'not found' });
+      }
       callback?.({});
     } catch (err) {
       callback?.({ error: err.message });
@@ -1374,15 +2082,18 @@ io.on('connection', async socket => {
   });
 
   // ── 切断 ──
-  socket.on('disconnect', () => {
+  socket.on('disconnect', reason => {
     console.log(`[-] disconnect ${socket.id}`);
-    finishCallsForSocket(socket.id);
-    const peer = peers[socket.id];
-    if (peer) resetPeerMedia(peer);
-    delete peers[socket.id];
-    // 全拠点に切断を通知
-    io.emit('peerDisconnected', { socketId: socket.id });
-    broadcastViewerPresence();
+    appendDebugLog('socket.disconnected', {
+      socketId: socket.id,
+      locationName: peers[socket.id]?.locationName || '',
+      appType: peers[socket.id]?.appType || '',
+      reason,
+      producers: peers[socket.id]?.producers?.size || 0,
+      consumers: peers[socket.id]?.consumers?.size || 0,
+      transports: peers[socket.id]?.transports?.size || 0,
+    });
+    cleanupPeer(socket.id);
   });
 });
 
@@ -1406,7 +2117,7 @@ if (process.send) {
       type: 'stats',
       data: { ...snapshot, cpu: cpuPercent },
     });
-  }, 250); // 監視表示のリアルタイム性向上のため毎秒4回送信
+  }, STATS_INTERVAL_MS);
 
   process.on('message', rawMessage => {
     const msg = asObject(rawMessage);
@@ -1470,10 +2181,7 @@ if (process.send) {
         if (!targetAppType || targetAppType === 'all') return true;
         return peers[targetSocket.id]?.appType === targetAppType;
       });
-      const target = targetAppType && targetAppType !== 'all'
-        ? io.to(sockets.map(targetSocket => targetSocket.id))
-        : io;
-      emitUpdateCommand(target, sockets.length, targetAppType, { forced: true, reason: 'server-gui' });
+      emitUpdateCommand(sockets, targetAppType, { forced: true, reason: 'server-gui' });
     } else if (msg.type === 'restart-all') {
       emitRestartCommand(io, io.sockets.sockets.size, 'server-gui');
     }
@@ -1486,6 +2194,7 @@ function closeAllPeers() {
 
 function shutdown(signal) {
   console.log(`[SFU] shutting down: ${signal}`);
+  appendDebugLog('server.shutdown', { signal, peers: Object.keys(peers).length }, 'warn');
   closeAllPeers();
   io.close(() => {
     server.close(() => process.exit(0));
@@ -1497,9 +2206,11 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('unhandledRejection', err => {
   console.error('[Process] unhandledRejection:', err);
+  appendDebugLog('process.unhandled-rejection', { error: err?.stack || err?.message || String(err) }, 'error');
 });
 process.on('uncaughtException', err => {
   console.error('[Process] uncaughtException:', err);
+  appendDebugLog('process.uncaught-exception', { error: err?.stack || err?.message || String(err) }, 'error');
   process.exit(1);
 });
 
@@ -1510,10 +2221,23 @@ async function run() {
   await createRouter();
   server.listen(config.listenPort, config.listenIp, () => {
     console.log(`[SFU] listening on ${config.listenIp}:${config.listenPort}`);
+    const info = debugLogInfo();
+    console.log(`[DebugLog] writing JSONL logs to ${info.file}`);
+    appendDebugLog('server.started', {
+      version: SERVER_APP_VERSION,
+      listenIp: config.listenIp,
+      listenPort: config.listenPort,
+      announcedIp: config.announcedIp,
+      rtcPortRange: config.rtcPortRange,
+      forceTcpMedia: config.forceTcpMedia,
+      iceServersConfigured: config.iceServers.length,
+      debugLog: info,
+    });
   });
 }
 
 run().catch(err => {
   console.error('[SFU] fatal:', err);
+  appendDebugLog('server.fatal', { error: err?.stack || err?.message || String(err) }, 'error');
   process.exit(1);
 });

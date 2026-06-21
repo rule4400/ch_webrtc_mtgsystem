@@ -18,7 +18,7 @@ import {
 import { WebRTCManager } from '../services/webrtc';
 import ScreenShareModal from '../components/ScreenShareModal';
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.2.10';
 const APP_TYPE = 'client';
 const CALL_RING_TIMEOUT_MS = 30000;
 const CALL_RING_INTERVAL_MS = 1500;
@@ -28,6 +28,156 @@ const DEFAULT_SYSTEM_STATE = {
   latestVersions: { [APP_TYPE]: APP_VERSION },
   updatePackages: {},
 };
+const DEFAULT_CLIENT_APP_SETTINGS = {
+  debugLogEnabled: true,
+  debugLogDir: '',
+  restartDelayMs: '0',
+  controlHost: '0.0.0.0',
+  controlPort: '39210',
+  controlToken: '',
+  notificationTone: 'glass',
+  callTone: 'signal',
+};
+
+const TONE_PRESETS = [
+  {
+    id: 'signal',
+    label: 'Signal',
+    description: '電子的な2音',
+    join: [
+      { at: 0, duration: 0.11, frequency: 880, type: 'sine', gain: 0.7 },
+      { at: 0.12, duration: 0.15, frequency: 1175, type: 'sine', gain: 0.62 },
+    ],
+    call: [
+      { at: 0, duration: 0.16, frequency: 1040, type: 'square', gain: 0.52 },
+      { at: 0.22, duration: 0.16, frequency: 780, type: 'square', gain: 0.5 },
+      { at: 0.44, duration: 0.16, frequency: 1040, type: 'square', gain: 0.52 },
+      { at: 0.66, duration: 0.16, frequency: 780, type: 'square', gain: 0.5 },
+    ],
+  },
+  {
+    id: 'glass',
+    label: 'Glass',
+    description: '澄んだチャイム',
+    join: [
+      { at: 0, duration: 0.32, frequency: 1319, type: 'sine', gain: 0.42 },
+      { at: 0.03, duration: 0.36, frequency: 1760, type: 'sine', gain: 0.24 },
+    ],
+    call: [
+      { at: 0, duration: 0.34, frequency: 659, type: 'sine', gain: 0.42 },
+      { at: 0.05, duration: 0.38, frequency: 988, type: 'sine', gain: 0.34 },
+      { at: 0.1, duration: 0.44, frequency: 1319, type: 'sine', gain: 0.28 },
+      { at: 0.54, duration: 0.36, frequency: 784, type: 'sine', gain: 0.34 },
+      { at: 0.59, duration: 0.42, frequency: 1175, type: 'sine', gain: 0.25 },
+    ],
+  },
+  {
+    id: 'chime',
+    label: 'Chime',
+    description: '短い和音',
+    join: [
+      { at: 0, duration: 0.2, frequency: 523, type: 'triangle', gain: 0.32 },
+      { at: 0.06, duration: 0.22, frequency: 659, type: 'triangle', gain: 0.28 },
+      { at: 0.12, duration: 0.26, frequency: 784, type: 'triangle', gain: 0.24 },
+    ],
+    call: [
+      { at: 0, duration: 0.18, frequency: 523, type: 'triangle', gain: 0.32 },
+      { at: 0.13, duration: 0.18, frequency: 659, type: 'triangle', gain: 0.31 },
+      { at: 0.26, duration: 0.2, frequency: 784, type: 'triangle', gain: 0.3 },
+      { at: 0.52, duration: 0.24, frequency: 1047, type: 'triangle', gain: 0.28 },
+      { at: 0.58, duration: 0.26, frequency: 1319, type: 'triangle', gain: 0.2 },
+    ],
+  },
+  {
+    id: 'marimba',
+    label: 'Marimba',
+    description: '柔らかい木琴風',
+    join: [
+      { at: 0, duration: 0.12, frequency: 440, type: 'triangle', gain: 0.38 },
+      { at: 0.1, duration: 0.13, frequency: 587, type: 'triangle', gain: 0.34 },
+      { at: 0.2, duration: 0.15, frequency: 740, type: 'triangle', gain: 0.28 },
+    ],
+    call: [
+      { at: 0, duration: 0.12, frequency: 440, type: 'triangle', gain: 0.34 },
+      { at: 0.12, duration: 0.12, frequency: 587, type: 'triangle', gain: 0.34 },
+      { at: 0.24, duration: 0.14, frequency: 740, type: 'triangle', gain: 0.32 },
+      { at: 0.48, duration: 0.13, frequency: 587, type: 'triangle', gain: 0.31 },
+      { at: 0.6, duration: 0.16, frequency: 880, type: 'triangle', gain: 0.28 },
+    ],
+  },
+  {
+    id: 'aurora',
+    label: 'Aurora',
+    description: '音楽的な上昇音',
+    join: [
+      { at: 0, duration: 0.34, frequency: [523, 880], type: 'sine', gain: 0.34 },
+      { at: 0.02, duration: 0.36, frequency: [784, 1175], type: 'sine', gain: 0.22 },
+    ],
+    call: [
+      { at: 0, duration: 0.38, frequency: [392, 659], type: 'sine', gain: 0.32 },
+      { at: 0.04, duration: 0.42, frequency: [587, 988], type: 'sine', gain: 0.26 },
+      { at: 0.52, duration: 0.4, frequency: [523, 1047], type: 'sine', gain: 0.28 },
+      { at: 0.58, duration: 0.44, frequency: [784, 1319], type: 'sine', gain: 0.2 },
+    ],
+  },
+  {
+    id: 'pulse',
+    label: 'Pulse',
+    description: '控えめな電子パルス',
+    join: [
+      { at: 0, duration: 0.08, frequency: 988, type: 'square', gain: 0.28 },
+      { at: 0.1, duration: 0.08, frequency: 1319, type: 'square', gain: 0.22 },
+    ],
+    call: [
+      { at: 0, duration: 0.09, frequency: 988, type: 'square', gain: 0.32 },
+      { at: 0.14, duration: 0.09, frequency: 988, type: 'square', gain: 0.32 },
+      { at: 0.38, duration: 0.09, frequency: 1319, type: 'square', gain: 0.26 },
+      { at: 0.52, duration: 0.09, frequency: 1319, type: 'square', gain: 0.26 },
+    ],
+  },
+];
+const TONE_PRESET_IDS = new Set(TONE_PRESETS.map(tone => tone.id));
+const TONE_PRESET_MAP = new Map(TONE_PRESETS.map(tone => [tone.id, tone]));
+
+function sanitizeToneId(value, fallback = 'glass') {
+  const toneId = String(value || '').trim();
+  return TONE_PRESET_IDS.has(toneId) ? toneId : fallback;
+}
+
+function playTonePreset(context, toneId, mode = 'join') {
+  const preset = TONE_PRESET_MAP.get(sanitizeToneId(toneId, mode === 'call' ? 'signal' : 'glass')) || TONE_PRESETS[0];
+  const notes = preset[mode] || preset.join || [];
+  if (!notes.length) return;
+
+  const now = context.currentTime + 0.01;
+  const latestEnd = notes.reduce((max, note) => Math.max(max, note.at + note.duration), 0);
+  const master = context.createGain();
+  master.gain.setValueAtTime(0.0001, now);
+  master.gain.exponentialRampToValueAtTime(mode === 'call' ? 0.36 : 0.18, now + 0.018);
+  master.gain.exponentialRampToValueAtTime(0.0001, now + latestEnd + 0.12);
+  master.connect(context.destination);
+
+  for (const note of notes) {
+    const start = now + note.at;
+    const end = start + note.duration;
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = note.type || 'sine';
+    if (Array.isArray(note.frequency)) {
+      oscillator.frequency.setValueAtTime(note.frequency[0], start);
+      oscillator.frequency.exponentialRampToValueAtTime(note.frequency[1], end);
+    } else {
+      oscillator.frequency.setValueAtTime(note.frequency, start);
+    }
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, note.gain || 0.3), start + 0.015);
+    gain.gain.exponentialRampToValueAtTime(0.0001, end);
+    oscillator.connect(gain);
+    gain.connect(master);
+    oscillator.start(start);
+    oscillator.stop(end + 0.03);
+  }
+}
 
 // ─── デバイス選択ドロップダウンボタン ────────────────────
 
@@ -305,7 +455,11 @@ async function acquireMedia({ videoId, audioId, wantVideo = true, wantAudio = tr
     return { stream: null, error: 'この環境ではカメラ/マイクAPI（getUserMedia）が利用できません。' };
   }
 
-  const videoBase = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+  const videoBase = {
+    width: { ideal: 1280, max: 1920 },
+    height: { ideal: 720, max: 1080 },
+    frameRate: { ideal: 30, max: 30 },
+  };
   const audioBase = {
     echoCancellation: { ideal: true },
     voiceIsolation: { ideal: true },
@@ -440,7 +594,7 @@ function calculateGridLayout(cellCount, width, height) {
   };
 }
 
-function useFittedVideoGrid(cellCount) {
+function useFittedVideoGrid(cellCount, layoutKey = '') {
   const gridRef = useRef(null);
   const [layout, setLayout] = useState(() => {
     const cols = getGridCols(cellCount);
@@ -484,7 +638,7 @@ function useFittedVideoGrid(cellCount) {
       cancelAnimationFrame(frame);
       window.removeEventListener('resize', update);
     };
-  }, [cellCount]);
+  }, [cellCount, layoutKey]);
 
   return { gridRef, layout };
 }
@@ -516,6 +670,26 @@ const defaultClientConfig = {
   channelId: 'general',
 };
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
+const CLIENT_INSTANCE_ID_KEY = 'sfu_client_instance_id';
+
+function createInstanceId(prefix) {
+  const random = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  return `${prefix}:${random}`;
+}
+
+function getOrCreateInstanceId(storageKey, prefix) {
+  try {
+    const saved = localStorage.getItem(storageKey);
+    if (saved) return saved;
+    const next = createInstanceId(prefix);
+    localStorage.setItem(storageKey, next);
+    return next;
+  } catch {
+    return createInstanceId(prefix);
+  }
+}
 
 async function connectWithinStartupWindow(manager, serverUrl, locationName, options = {}) {
   let timedOut = false;
@@ -537,6 +711,13 @@ async function connectWithinStartupWindow(manager, serverUrl, locationName, opti
   return Promise.race([connectPromise, timeoutPromise]);
 }
 
+function statusFromConnectionHealth(health = {}) {
+  if (health.status === 'connected') return 'connected';
+  if (health.status === 'unstable') return 'unstable';
+  if (health.status === 'connecting') return 'connecting';
+  return 'error';
+}
+
 function sanitizeClientConfig(config) {
   const raw = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
   const serverIp = String(raw.serverIp || defaultClientConfig.serverIp).trim() || defaultClientConfig.serverIp;
@@ -553,6 +734,22 @@ function sanitizeClientConfig(config) {
     serverPort,
     locationName,
     channelId,
+  };
+}
+
+function sanitizeClientAppSettings(settings) {
+  const raw = settings && typeof settings === 'object' && !Array.isArray(settings) ? settings : {};
+  const restartDelay = Number.parseInt(String(raw.restartDelayMs ?? DEFAULT_CLIENT_APP_SETTINGS.restartDelayMs).trim(), 10);
+  return {
+    debugLogEnabled: raw.debugLogEnabled !== false,
+    debugLogDir: String(raw.debugLogDir || '').trim(),
+    restartDelayMs: String(Number.isInteger(restartDelay) && restartDelay >= 0 && restartDelay <= 5000 ? restartDelay : 0),
+    controlHost: String(raw.controlHost || DEFAULT_CLIENT_APP_SETTINGS.controlHost).trim(),
+    controlPort: String(raw.controlPort || DEFAULT_CLIENT_APP_SETTINGS.controlPort).trim(),
+    controlToken: String(raw.controlToken || '').trim(),
+    notificationTone: sanitizeToneId(raw.notificationTone, DEFAULT_CLIENT_APP_SETTINGS.notificationTone),
+    callTone: sanitizeToneId(raw.callTone, DEFAULT_CLIENT_APP_SETTINGS.callTone),
+    debugLog: raw.debugLog || null,
   };
 }
 
@@ -654,9 +851,11 @@ export default function MainView() {
   const [uiResetToken, setUiResetToken] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem('sfu_config'));
   const [settingsDraft, setSettingsDraft] = useState(() => sanitizeClientConfig(loadClientConfig()));
+  const [appSettingsDraft, setAppSettingsDraft] = useState(() => sanitizeClientAppSettings(DEFAULT_CLIENT_APP_SETTINGS));
   const [systemState, setSystemState] = useState(DEFAULT_SYSTEM_STATE);
   const [channelId, setChannelId] = useState(() => sanitizeClientConfig(loadClientConfig()).channelId);
   const [updateNotice, setUpdateNotice] = useState(null);
+  const [updateDownload, setUpdateDownload] = useState(null);
   const [focusedTileId, setFocusedTileId] = useState('');
   const [peerVolumes, setPeerVolumes] = useState({});
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -693,9 +892,21 @@ export default function MainView() {
   const outgoingCallTimerRef = useRef(null);
   const callNoticeTimerRef = useRef(null);
   const screenShareRef = useRef(null);
+  const updateDownloadKeyRef = useRef('');
 
   useEffect(() => { outgoingCallRef.current = outgoingCall; }, [outgoingCall]);
   useEffect(() => { screenShareRef.current = screenShare; }, [screenShare]);
+  useEffect(() => {
+    let active = true;
+    window.electronAPI?.getClientAppSettings?.()
+      .then(settings => {
+        if (active) setAppSettingsDraft(sanitizeClientAppSettings(settings));
+      })
+      .catch(err => {
+        console.warn('[Config] client app settings unavailable:', err?.message || err);
+      });
+    return () => { active = false; };
+  }, []);
 
   const channels = useMemo(() => {
     const items = Array.isArray(systemState.channels) && systemState.channels.length
@@ -709,8 +920,10 @@ export default function MainView() {
   ), [channels, channelId]);
   const activeChannelId = activeChannel?.id || channelId || 'general';
 
-  const updatePackage = systemState.updatePackages?.[APP_TYPE] || null;
-  const latestVersion = systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
+  const currentPlatform = window.electronAPI?.platform || '';
+  const rawUpdatePackage = systemState.updatePackages?.[APP_TYPE] || null;
+  const updatePackage = rawUpdatePackage?.platforms?.[currentPlatform] || rawUpdatePackage;
+  const latestVersion = updatePackage?.version || systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
   const updateAvailable = latestVersion && latestVersion !== APP_VERSION;
   const peerEntries = useMemo(() => Array.from(peers.entries()), [peers]);
 
@@ -769,6 +982,9 @@ export default function MainView() {
     return membersByChannel;
   }, [activeChannelId, channels, micEnabled, peerEntries, selfName]);
 
+  const notificationTone = sanitizeToneId(appSettingsDraft.notificationTone, DEFAULT_CLIENT_APP_SETTINGS.notificationTone);
+  const callTone = sanitizeToneId(appSettingsDraft.callTone, DEFAULT_CLIENT_APP_SETTINGS.callTone);
+
   const playJoinTone = useCallback(() => {
     if (speakerMutedRef.current) return;
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -781,23 +997,11 @@ export default function MainView() {
       joinAudioRef.current = context;
       context.resume?.().catch(() => {});
 
-      const now = context.currentTime;
-      const gain = context.createGain();
-      const oscillator = context.createOscillator();
-      oscillator.type = 'sine';
-      oscillator.frequency.setValueAtTime(660, now);
-      oscillator.frequency.exponentialRampToValueAtTime(880, now + 0.12);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.11, now + 0.025);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
-      oscillator.connect(gain);
-      gain.connect(context.destination);
-      oscillator.start(now);
-      oscillator.stop(now + 0.28);
+      playTonePreset(context, notificationTone, 'join');
     } catch (err) {
       console.warn('[joinTone]', err.message);
     }
-  }, []);
+  }, [notificationTone]);
 
   const playCallTone = useCallback(() => {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -810,29 +1014,11 @@ export default function MainView() {
       callAudioRef.current = context;
       context.resume?.().catch(() => {});
 
-      const now = context.currentTime;
-      const master = context.createGain();
-      master.gain.setValueAtTime(0.32, now);
-      master.connect(context.destination);
-
-      for (let index = 0; index < 6; index += 1) {
-        const start = now + index * 0.22;
-        const gain = context.createGain();
-        const oscillator = context.createOscillator();
-        oscillator.type = 'square';
-        oscillator.frequency.setValueAtTime(index % 2 === 0 ? 1040 : 780, start);
-        gain.gain.setValueAtTime(0.0001, start);
-        gain.gain.exponentialRampToValueAtTime(0.85, start + 0.018);
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.17);
-        oscillator.connect(gain);
-        gain.connect(master);
-        oscillator.start(start);
-        oscillator.stop(start + 0.19);
-      }
+      playTonePreset(context, callTone, 'call');
     } catch (err) {
       console.warn('[callTone]', err.message);
     }
-  }, []);
+  }, [callTone]);
 
   // ── 呼び出し結果の一時通知（画面下部に数秒表示）──
   const showCallNotice = useCallback((text, tone = 'info') => {
@@ -1192,9 +1378,10 @@ export default function MainView() {
     rtcManager.onPeerRemoved = (socketId) => {
       setPeers(prev => { const m = new Map(prev); m.delete(socketId); return m; });
     };
-    rtcManager.onConnectionChange = (ok) => {
-      setSfuStatus(ok ? 'connected' : 'error');
-      if (!ok) setViewerPresenceActive(false);
+    rtcManager.onConnectionChange = (ok, health = {}) => {
+      const nextStatus = ok ? 'connected' : statusFromConnectionHealth(health);
+      setSfuStatus(prev => (prev === 'restarting' ? prev : nextStatus));
+      if (!ok && nextStatus === 'error') setViewerPresenceActive(false);
     };
     rtcManager.onViewerPresenceChange = setViewerPresenceActive;
     rtcManager.onSystemStateUpdated = (state = {}) => {
@@ -1281,6 +1468,8 @@ export default function MainView() {
     const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName, {
       channelId: conf.channelId,
       appVersion: APP_VERSION,
+      clientInstanceId: getOrCreateInstanceId(CLIENT_INSTANCE_ID_KEY, APP_TYPE),
+      platform: window.electronAPI?.platform || '',
     });
     setSfuStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     return { manager: rtcManager, connectionState };
@@ -1387,6 +1576,18 @@ export default function MainView() {
   useEffect(() => {
     const id = setInterval(() => {
       webrtcRef.current?.syncPeers();
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ─── 接続状態の表示同期: Socket と WebRTC transport を分けて判定 ───
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (softRestartInFlightRef.current) return;
+      const manager = webrtcRef.current;
+      if (!manager?.getConnectionHealth) return;
+      const nextStatus = statusFromConnectionHealth(manager.getConnectionHealth('ui-health-check'));
+      setSfuStatus(prev => (prev === 'restarting' || prev === nextStatus ? prev : nextStatus));
     }, 1000);
     return () => clearInterval(id);
   }, []);
@@ -1633,11 +1834,18 @@ export default function MainView() {
   const openSettingsPanel = useCallback(() => {
     const current = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
     setSettingsDraft(current);
+    window.electronAPI?.getClientAppSettings?.()
+      .then(settings => setAppSettingsDraft(sanitizeClientAppSettings(settings)))
+      .catch(() => {});
     setSettingsOpen(true);
   }, []);
 
   const updateSettingsDraft = useCallback((key, value) => {
     setSettingsDraft(prev => ({ ...prev, [key]: value }));
+  }, []);
+
+  const updateAppSettingsDraft = useCallback((key, value) => {
+    setAppSettingsDraft(prev => sanitizeClientAppSettings({ ...prev, [key]: value }));
   }, []);
 
   const saveSettingsDraft = useCallback(async () => {
@@ -1651,6 +1859,8 @@ export default function MainView() {
 
     configRef.current = next;
     localStorage.setItem('sfu_config', JSON.stringify(next));
+    const savedAppSettings = await window.electronAPI?.saveClientAppSettings?.(appSettingsDraft);
+    if (savedAppSettings) setAppSettingsDraft(sanitizeClientAppSettings(savedAppSettings));
     setSelfName(next.locationName || '自拠点');
     setChannelId(next.channelId || 'general');
     setSettingsDraft(next);
@@ -1661,7 +1871,7 @@ export default function MainView() {
     } else if (channelChanged) {
       await webrtcRef.current?.setChannel(next.channelId);
     }
-  }, [performQuickRestart, settingsDraft]);
+  }, [appSettingsDraft, performQuickRestart, settingsDraft]);
 
   const changeChannel = useCallback(async (nextChannelId) => {
     const nextId = nextChannelId || channels[0]?.id || 'general';
@@ -1880,6 +2090,10 @@ export default function MainView() {
   }, [sidebarCollapsed, sidebarWidth]);
 
   const openUpdate = useCallback(() => {
+    if (updateDownload?.path && updateDownload.status === 'ready') {
+      window.electronAPI?.openDownloadedUpdate?.(updateDownload.path);
+      return;
+    }
     let url = updateNotice?.packageInfo?.url || updatePackage?.url;
     if (!url) return;
     // サーバー配布の相対パス（/updates/...）は接続中サーバーのURLで解決する
@@ -1888,7 +2102,27 @@ export default function MainView() {
       url = `${base}${url.startsWith('/') ? '' : '/'}${url}`;
     }
     window.electronAPI?.openExternal?.(url);
-  }, [updateNotice, updatePackage]);
+  }, [updateDownload, updateNotice, updatePackage]);
+
+  useEffect(() => {
+    const packageInfo = updateNotice?.packageInfo || updatePackage;
+    if (!updateAvailable || !packageInfo?.url || !window.electronAPI?.downloadUpdatePackage) return;
+    const key = `${packageInfo.version || latestVersion}:${packageInfo.url}`;
+    if (updateDownloadKeyRef.current === key) return;
+    updateDownloadKeyRef.current = key;
+    let cancelled = false;
+    setUpdateDownload({ status: 'downloading', packageInfo });
+    window.electronAPI.downloadUpdatePackage(packageInfo)
+      .then(result => {
+        if (cancelled) return;
+        setUpdateDownload({ status: 'ready', packageInfo, ...result });
+      })
+      .catch(err => {
+        console.warn('[updateDownload]', err.message);
+        if (!cancelled) setUpdateDownload({ status: 'error', packageInfo, error: err.message });
+      });
+    return () => { cancelled = true; };
+  }, [latestVersion, updateAvailable, updateNotice, updatePackage]);
 
   // ─── 画面共有（Client内蔵）──────────────────────────────
   const stopScreenShare = useCallback(async () => {
@@ -1919,9 +2153,9 @@ export default function MainView() {
           mandatory: {
             chromeMediaSource: 'desktop',
             chromeMediaSourceId: source.id,
-            maxWidth: 1920,
-            maxHeight: 1080,
-            maxFrameRate: 15,
+            maxWidth: 1280,
+            maxHeight: 720,
+            maxFrameRate: 10,
           },
         },
       };
@@ -2120,7 +2354,13 @@ export default function MainView() {
   const visibleFocusedTileId = videoTiles.some(tile => tile.id === focusedTileId) ? focusedTileId : '';
   const focusedTile = videoTiles.find(tile => tile.id === visibleFocusedTileId) || null;
   const secondaryTiles = focusedTile ? videoTiles.filter(tile => tile.id !== focusedTile.id) : videoTiles;
-  const { gridRef, layout: gridLayout } = useFittedVideoGrid(focusedTile ? secondaryTiles.length : Math.max(1, mainTiles.length));
+  const displayMainTiles = mainTiles.length > 0 ? mainTiles : camOffDockTiles;
+  const displayDockTiles = mainTiles.length > 0 ? camOffDockTiles : [];
+  const gridTileCount = Math.max(1, displayMainTiles.length);
+  const { gridRef, layout: gridLayout } = useFittedVideoGrid(
+    focusedTile ? Math.max(1, secondaryTiles.length) : gridTileCount,
+    focusedTile ? 'focus' : 'grid'
+  );
 
   const renderVideoTile = useCallback((tile, options = {}) => {
     const volumeValue = getTileVolume(tile.id);
@@ -2335,8 +2575,8 @@ export default function MainView() {
               type="button"
               className="update-mini"
               onClick={openUpdate}
-              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url}
-              title="アップデート"
+              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url && updateDownload?.status !== 'ready'}
+              title={updateDownload?.status === 'ready' ? 'ダウンロード済みアップデートを開く' : 'アップデート'}
             >
               <Download size={14} />
               <span>v{latestVersion}</span>
@@ -2409,10 +2649,12 @@ export default function MainView() {
           background:
             sfuStatus === 'connected'  ? '#4ade80' :
             sfuStatus === 'error'      ? '#ef4444' :
+            sfuStatus === 'unstable'   ? '#f97316' :
             sfuStatus === 'restarting' ? '#60a5fa' : '#facc15',
         }} />
         {sfuStatus === 'connected'  ? `接続中 ${peers.size + 1}拠点` :
          sfuStatus === 'error'      ? 'サーバー未接続' :
+         sfuStatus === 'unstable'   ? '接続不安定' :
          sfuStatus === 'restarting' ? '再構築中...' : '接続中...'}
       </div>
 
@@ -2477,14 +2719,14 @@ export default function MainView() {
                   gridTemplateRows: `repeat(${gridLayout.rows}, minmax(0, ${gridLayout.cellHeight || 1}px))`,
                 }}
               >
-                {mainTiles.map(tile => renderVideoTile(tile))}
-                {mainTiles.length === 0 && (
+                {displayMainTiles.map(tile => renderVideoTile(tile))}
+                {displayMainTiles.length === 0 && (
                   <div className="stage-empty">カメラONの拠点はありません</div>
                 )}
               </div>
-              {camOffDockTiles.length > 0 && (
+              {displayDockTiles.length > 0 && (
                 <div className="camoff-dock" aria-label="カメラOFFの拠点">
-                  {camOffDockTiles.map(tile => renderVideoTile(tile, { mini: true }))}
+                  {displayDockTiles.map(tile => renderVideoTile(tile, { mini: true }))}
                 </div>
               )}
             </div>
@@ -2678,6 +2920,105 @@ export default function MainView() {
                     placeholder="3000"
                   />
                 </div>
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <h2>通知音</h2>
+              <div className="field">
+                <label>参加・接続通知</label>
+                <div className="tone-select-row">
+                  <select
+                    value={appSettingsDraft.notificationTone}
+                    onChange={e => updateAppSettingsDraft('notificationTone', e.target.value)}
+                  >
+                    {TONE_PRESETS.map(tone => (
+                      <option key={tone.id} value={tone.id}>{tone.label} - {tone.description}</option>
+                    ))}
+                  </select>
+                  <button type="button" className="tone-test-btn" onClick={playJoinTone}>
+                    <Bell size={15} />
+                    試聴
+                  </button>
+                </div>
+              </div>
+              <div className="field">
+                <label>着信・呼び出し</label>
+                <div className="tone-select-row">
+                  <select
+                    value={appSettingsDraft.callTone}
+                    onChange={e => updateAppSettingsDraft('callTone', e.target.value)}
+                  >
+                    {TONE_PRESETS.map(tone => (
+                      <option key={tone.id} value={tone.id}>{tone.label} - {tone.description}</option>
+                    ))}
+                  </select>
+                  <button type="button" className="tone-test-btn" onClick={playCallTone}>
+                    <BellRing size={15} />
+                    試聴
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <h2>デバッグ</h2>
+              <label className="settings-check">
+                <input
+                  type="checkbox"
+                  checked={!!appSettingsDraft.debugLogEnabled}
+                  onChange={e => updateAppSettingsDraft('debugLogEnabled', e.target.checked)}
+                />
+                <span>クライアントデバッグログを保存する</span>
+              </label>
+              <div className="field">
+                <label>ログ保存先</label>
+                <input
+                  type="text"
+                  value={appSettingsDraft.debugLogDir}
+                  onChange={e => updateAppSettingsDraft('debugLogDir', e.target.value)}
+                  placeholder={appSettingsDraft.debugLog?.dir || '標準の保存先を使用'}
+                />
+              </div>
+              <div className="field">
+                <label>再起動遅延(ms)</label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={appSettingsDraft.restartDelayMs}
+                  onChange={e => updateAppSettingsDraft('restartDelayMs', e.target.value)}
+                  placeholder="0"
+                />
+              </div>
+              <div className="server-row">
+                <div className="field">
+                  <label>管理ホスト</label>
+                  <input
+                    type="text"
+                    value={appSettingsDraft.controlHost}
+                    onChange={e => updateAppSettingsDraft('controlHost', e.target.value)}
+                    placeholder="0.0.0.0"
+                  />
+                </div>
+                <div className="field">
+                  <label>管理Port</label>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={appSettingsDraft.controlPort}
+                    onChange={e => updateAppSettingsDraft('controlPort', e.target.value)}
+                    placeholder="39210"
+                  />
+                </div>
+              </div>
+              <div className="field">
+                <label>管理トークン</label>
+                <input
+                  type="password"
+                  value={appSettingsDraft.controlToken}
+                  onChange={e => updateAppSettingsDraft('controlToken', e.target.value)}
+                  placeholder="未設定の場合はトークンなし"
+                />
               </div>
             </div>
 

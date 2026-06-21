@@ -1,10 +1,11 @@
 const { app, BrowserWindow, desktopCapturer, ipcMain, session, systemPreferences, shell } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const https = require('https');
 const http = require('http');
 const os = require('os');
 const path = require('path');
-const { pathToFileURL } = require('url');
+const { pathToFileURL, URL } = require('url');
 const { readWindowState, trackWindowState, applyWindowState } = require('./window-state.cjs');
 
 let mainWindow;
@@ -13,9 +14,21 @@ let productionIndexUrl = null;
 let controlServer = null;
 let pendingRemoteConfig = null;
 
-const CONTROL_HOST = process.env.SFU_CLIENT_CONTROL_HOST || '0.0.0.0';
-const CONTROL_PORT = Number.parseInt(process.env.SFU_CLIENT_CONTROL_PORT || '39210', 10);
-const CONTROL_TOKEN = process.env.SFU_CLIENT_CONTROL_TOKEN || '';
+const CLIENT_APP_SETTINGS_FILE = 'client-app-settings.json';
+const DEFAULT_CLIENT_APP_SETTINGS = {
+  debugLogEnabled: true,
+  debugLogDir: '',
+  restartDelayMs: '0',
+  controlHost: '0.0.0.0',
+  controlPort: '39210',
+  controlToken: '',
+  notificationTone: 'glass',
+  callTone: 'signal',
+};
+const TONE_IDS = new Set(['signal', 'glass', 'chime', 'marimba', 'aurora', 'pulse']);
+const DEBUG_SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+const DEBUG_MAX_FIELD_LENGTH = 16_000;
+const DEBUG_MAX_ARRAY_LENGTH = 64;
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -25,8 +38,132 @@ function relaunchArgs() {
   return process.argv.slice(1).filter(arg => !arg.startsWith('--squirrel-'));
 }
 
+function debugDate(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+function clientAppSettingsPath() {
+  return path.join(app.getPath('userData'), CLIENT_APP_SETTINGS_FILE);
+}
+
+function sanitizeClientAppSettings(input = {}) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const restartDelay = Number.parseInt(String(raw.restartDelayMs ?? DEFAULT_CLIENT_APP_SETTINGS.restartDelayMs).trim(), 10);
+  const notificationTone = String(raw.notificationTone || '').trim();
+  const callTone = String(raw.callTone || '').trim();
+  return {
+    debugLogEnabled: raw.debugLogEnabled !== false,
+    debugLogDir: String(raw.debugLogDir || '').trim().slice(0, 1024),
+    restartDelayMs: String(Number.isInteger(restartDelay) && restartDelay >= 0 && restartDelay <= 5000 ? restartDelay : DEFAULT_CLIENT_APP_SETTINGS.restartDelayMs),
+    controlHost: String(raw.controlHost || process.env.SFU_CLIENT_CONTROL_HOST || DEFAULT_CLIENT_APP_SETTINGS.controlHost).trim().slice(0, 128) || DEFAULT_CLIENT_APP_SETTINGS.controlHost,
+    controlPort: boundedPortText(raw.controlPort || process.env.SFU_CLIENT_CONTROL_PORT || DEFAULT_CLIENT_APP_SETTINGS.controlPort, DEFAULT_CLIENT_APP_SETTINGS.controlPort),
+    controlToken: String(raw.controlToken || process.env.SFU_CLIENT_CONTROL_TOKEN || '').trim().slice(0, 512),
+    notificationTone: TONE_IDS.has(notificationTone) ? notificationTone : DEFAULT_CLIENT_APP_SETTINGS.notificationTone,
+    callTone: TONE_IDS.has(callTone) ? callTone : DEFAULT_CLIENT_APP_SETTINGS.callTone,
+  };
+}
+
+function boundedPortText(value, fallback) {
+  const port = Number.parseInt(String(value || '').trim(), 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return String(fallback);
+  return String(port);
+}
+
+function getControlSettings() {
+  const settings = readClientAppSettings();
+  return {
+    host: settings.controlHost,
+    port: Number.parseInt(settings.controlPort, 10),
+    token: settings.controlToken,
+  };
+}
+
+function readClientAppSettings() {
+  try {
+    return sanitizeClientAppSettings(JSON.parse(fs.readFileSync(clientAppSettingsPath(), 'utf8')));
+  } catch {
+    return sanitizeClientAppSettings(DEFAULT_CLIENT_APP_SETTINGS);
+  }
+}
+
+function writeClientAppSettings(settings) {
+  const clean = sanitizeClientAppSettings(settings);
+  fs.mkdirSync(path.dirname(clientAppSettingsPath()), { recursive: true });
+  fs.writeFileSync(clientAppSettingsPath(), JSON.stringify(clean, null, 2));
+  return clean;
+}
+
+function debugLogDir() {
+  const settings = readClientAppSettings();
+  return settings.debugLogDir || process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DIR || path.join(app.getPath('userData'), 'debug-logs');
+}
+
+function debugLogFilePath() {
+  return path.join(debugLogDir(), `client-debug-${debugDate()}.jsonl`);
+}
+
+function sanitizeDebugValue(value, depth = 0) {
+  if (depth > 8) return '[max-depth]';
+  if (value == null) return value;
+  if (typeof value === 'string') {
+    return value.length > DEBUG_MAX_FIELD_LENGTH ? `${value.slice(0, DEBUG_MAX_FIELD_LENGTH)}...[truncated]` : value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) return value.slice(0, DEBUG_MAX_ARRAY_LENGTH).map(item => sanitizeDebugValue(item, depth + 1));
+  if (typeof value === 'object') {
+    const output = {};
+    for (const [key, item] of Object.entries(value)) {
+      if (/fingerprint|credential|password|token|secret|authorization/i.test(key)) output[key] = '[redacted]';
+      else output[key] = sanitizeDebugValue(item, depth + 1);
+    }
+    return output;
+  }
+  return String(value);
+}
+
+function writeDebugLog(event, details = {}, severity = 'info') {
+  const settings = readClientAppSettings();
+  if (!settings.debugLogEnabled || String(process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DISABLED || '').toLowerCase() === 'true') return null;
+  const file = debugLogFilePath();
+  const entry = {
+    ts: new Date().toISOString(),
+    sessionId: DEBUG_SESSION_ID,
+    severity,
+    event,
+    pid: process.pid,
+    platform: process.platform,
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    hostname: os.hostname(),
+    uptimeSec: Number(process.uptime().toFixed(3)),
+    details: sanitizeDebugValue(details),
+  };
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.appendFile(file, `${JSON.stringify(entry)}\n`, err => {
+      if (err) console.error(`[DebugLog] append failed: ${err.message}`);
+    });
+    return file;
+  } catch (err) {
+    console.error(`[DebugLog] write failed: ${err.message}`);
+    return null;
+  }
+}
+
+function debugLogInfo() {
+  const file = debugLogFilePath();
+  const settings = readClientAppSettings();
+  return {
+    sessionId: DEBUG_SESSION_ID,
+    dir: path.dirname(file),
+    file,
+    enabled: settings.debugLogEnabled && String(process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DISABLED || '').toLowerCase() !== 'true',
+    settingsPath: clientAppSettingsPath(),
+  };
+}
+
 async function honorRestartDelay() {
-  const delayMs = Number.parseInt(process.env.SFU_RESTART_DELAY_MS || '0', 10);
+  const delayMs = Number.parseInt(readClientAppSettings().restartDelayMs || process.env.SFU_RESTART_DELAY_MS || '0', 10);
   if (Number.isFinite(delayMs) && delayMs > 0) await delay(Math.min(delayMs, 5000));
 }
 
@@ -35,6 +172,7 @@ async function ensureMacMediaAccess() {
 
   for (const mediaType of ['camera', 'microphone']) {
     const status = systemPreferences.getMediaAccessStatus(mediaType);
+    writeDebugLog('permission.status', { mediaType, status });
     if (status === 'granted') {
       console.log(`[Permission] ${mediaType}=granted`);
       continue;
@@ -42,9 +180,11 @@ async function ensureMacMediaAccess() {
     if (status === 'not-determined') {
       const granted = await systemPreferences.askForMediaAccess(mediaType);
       console.log(`[Permission] ${mediaType}=${granted ? 'granted' : 'denied'}`);
+      writeDebugLog('permission.request-result', { mediaType, granted });
       continue;
     }
     console.warn(`[Permission] ${mediaType}=${status}. macOS System Settings must be changed manually.`);
+    writeDebugLog('permission.needs-manual-change', { mediaType, status }, 'warn');
   }
 }
 
@@ -181,6 +321,124 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
+function updateCacheDir() {
+  return path.join(app.getPath('userData'), 'update-cache');
+}
+
+function safeUpdateFileName(url, fallback = 'update-package') {
+  try {
+    const parsed = new URL(url);
+    const base = path.basename(decodeURIComponent(parsed.pathname || '')) || fallback;
+    return base.replace(/[\\/:*?"<>|]/g, '_').slice(0, 180) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function downloadFile(url, destination) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const transport = parsed.protocol === 'https:' ? https : http;
+    const request = transport.get(parsed, response => {
+      if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+        response.resume();
+        const redirect = new URL(response.headers.location, parsed).toString();
+        downloadFile(redirect, destination).then(resolve, reject);
+        return;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        response.resume();
+        reject(new Error(`download failed: HTTP ${response.statusCode}`));
+        return;
+      }
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      const file = fs.createWriteStream(destination);
+      response.pipe(file);
+      file.on('finish', () => file.close(() => resolve(destination)));
+      file.on('error', reject);
+    });
+    request.on('error', reject);
+  });
+}
+
+async function downloadUpdatePackage(packageInfo = {}) {
+  const url = String(packageInfo.url || '').trim();
+  if (!/^https?:\/\//i.test(url)) throw new Error('invalid update url');
+  const fileName = safeUpdateFileName(url, packageInfo.fileName || 'update-package');
+  const destination = path.join(updateCacheDir(), fileName);
+  await downloadFile(url, destination);
+  const stat = fs.statSync(destination);
+  return { ok: true, fileName, path: destination, size: stat.size, downloadedAt: Date.now() };
+}
+
+function quoteShell(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function writeTempScript(name, content, extension = process.platform === 'win32' ? 'cmd' : 'sh') {
+  const scriptPath = path.join(app.getPath('temp'), `${name}-${Date.now()}.${extension}`);
+  fs.writeFileSync(scriptPath, content);
+  if (extension === 'sh') fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+async function installUpdatePackage(payload = {}) {
+  const installerPath = String(payload.path || payload.filePath || '').trim();
+  if (!installerPath || !fs.existsSync(installerPath)) throw new Error('update package not found');
+  const ext = path.extname(installerPath).toLowerCase();
+
+  if (process.platform === 'win32') {
+    const installerCmd = ext === '.msi'
+      ? `msiexec /i "${installerPath}" /qn`
+      : `"${installerPath}" /S`;
+    const script = writeTempScript('checkhouse-update', [
+      '@echo off',
+      'timeout /t 2 /nobreak >nul',
+      installerCmd,
+      'timeout /t 1 /nobreak >nul',
+      `start "" "${process.execPath}"`,
+    ].join('\r\n'));
+    spawn('cmd.exe', ['/c', script], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    app.exit(0);
+    return { ok: true, installing: true };
+  }
+
+  if (process.platform === 'darwin') {
+    const mountDir = path.join(app.getPath('temp'), `checkhouse-update-mount-${Date.now()}`);
+    const scriptLines = [
+      '#!/bin/sh',
+      'set -e',
+      `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
+      `mkdir -p ${quoteShell(mountDir)}`,
+    ];
+    if (ext === '.dmg') {
+      scriptLines.push(
+        `hdiutil attach ${quoteShell(installerPath)} -mountpoint ${quoteShell(mountDir)} -nobrowse -quiet`,
+        `APP_PATH=$(find ${quoteShell(mountDir)} -maxdepth 2 -name "*.app" -type d | head -n 1)`,
+        'if [ -z "$APP_PATH" ]; then hdiutil detach ' + quoteShell(mountDir) + ' -quiet || true; exit 1; fi',
+        'DEST="/Applications/$(basename "$APP_PATH")"',
+        'rm -rf "$DEST"',
+        'ditto "$APP_PATH" "$DEST"',
+        `hdiutil detach ${quoteShell(mountDir)} -quiet || true`,
+        'open "$DEST"',
+      );
+    } else if (ext === '.pkg') {
+      scriptLines.push(
+        `installer -pkg ${quoteShell(installerPath)} -target /`,
+        `open ${quoteShell(process.execPath)}`,
+      );
+    } else {
+      throw new Error(`unsupported macOS update package: ${ext}`);
+    }
+    const script = writeTempScript('checkhouse-update', scriptLines.join('\n'), 'sh');
+    spawn('/bin/sh', [script], { detached: true, stdio: 'ignore' }).unref();
+    app.exit(0);
+    return { ok: true, installing: true };
+  }
+
+  throw new Error(`unsupported update platform: ${process.platform}`);
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -208,15 +466,17 @@ function readJsonBody(req) {
 }
 
 function authorized(req) {
-  if (!CONTROL_TOKEN) return true;
+  const { token } = getControlSettings();
+  if (!token) return true;
   const auth = req.headers.authorization || '';
   const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  return req.headers['x-sfu-token'] === CONTROL_TOKEN || bearer === CONTROL_TOKEN;
+  return req.headers['x-sfu-token'] === token || bearer === token;
 }
 
 function startControlServer() {
-  if (!Number.isInteger(CONTROL_PORT) || CONTROL_PORT <= 0 || CONTROL_PORT > 65535) {
-    console.warn(`[Control] disabled: invalid SFU_CLIENT_CONTROL_PORT=${process.env.SFU_CLIENT_CONTROL_PORT}`);
+  const control = getControlSettings();
+  if (!Number.isInteger(control.port) || control.port <= 0 || control.port > 65535) {
+    console.warn(`[Control] disabled: invalid controlPort=${control.port}`);
     return;
   }
   if (controlServer) return;
@@ -235,8 +495,9 @@ function startControlServer() {
           packaged: app.isPackaged,
           configured: !!readRemoteConfig(),
           config: readRemoteConfig(),
-          control: { host: CONTROL_HOST, port: CONTROL_PORT, tokenRequired: !!CONTROL_TOKEN },
+          control: { host: control.host, port: control.port, tokenRequired: !!control.token },
           addresses: localAddresses(),
+          debugLog: debugLogInfo(),
         });
       }
 
@@ -267,8 +528,8 @@ function startControlServer() {
   controlServer.on('error', err => {
     console.error(`[Control] server error: ${err.message}`);
   });
-  controlServer.listen(CONTROL_PORT, CONTROL_HOST, () => {
-    console.log(`[Control] listening on ${CONTROL_HOST}:${CONTROL_PORT}${CONTROL_TOKEN ? ' token=required' : ' token=none'}`);
+  controlServer.listen(control.port, control.host, () => {
+    console.log(`[Control] listening on ${control.host}:${control.port}${control.token ? ' token=required' : ' token=none'}`);
   });
 }
 
@@ -360,6 +621,16 @@ function createWindow() {
 app.whenReady().then(async () => {
   await honorRestartDelay();
   await ensureMacMediaAccess();
+  const info = debugLogInfo();
+  console.log(`[DebugLog] writing client JSONL logs to ${info.file}`);
+  writeDebugLog('app.started', {
+    debugLog: info,
+    addresses: localAddresses(),
+    control: (() => {
+      const control = getControlSettings();
+      return { host: control.host, port: control.port, tokenRequired: !!control.token };
+    })(),
+  });
 
   // カメラ・マイク権限を許可
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
@@ -400,8 +671,48 @@ ipcMain.handle('open-external', async (_event, url) => {
   return true;
 });
 
+ipcMain.handle('download-update-package', async (_event, packageInfo) => {
+  return downloadUpdatePackage(packageInfo || {});
+});
+
+ipcMain.handle('open-downloaded-update', async (_event, filePath) => {
+  const target = String(filePath || '');
+  const root = updateCacheDir();
+  if (!target || !path.resolve(target).startsWith(`${root}${path.sep}`) || !fs.existsSync(target)) {
+    throw new Error('downloaded update not found');
+  }
+  await shell.openPath(target);
+  return true;
+});
+
+ipcMain.handle('install-update-package', async (_event, payload) => {
+  return installUpdatePackage(payload || {});
+});
+
 ipcMain.on('quick-restart-result', (_event, result) => {
   console.log(`[QuickRestart] renderer result ${JSON.stringify(result || {})}`);
+  writeDebugLog('quick-restart.result', result || {});
+});
+
+ipcMain.handle('write-debug-log', async (_event, payload = {}) => {
+  const event = String(payload.event || 'renderer.event').slice(0, 128);
+  const severity = ['debug', 'info', 'warn', 'error'].includes(payload.severity) ? payload.severity : 'info';
+  const file = writeDebugLog(event, payload.details || {}, severity);
+  return { ok: !!file, file, sessionId: DEBUG_SESSION_ID };
+});
+
+ipcMain.handle('get-debug-log-info', async () => debugLogInfo());
+ipcMain.handle('get-client-app-settings', async () => ({
+  ...readClientAppSettings(),
+  debugLog: debugLogInfo(),
+}));
+ipcMain.handle('save-client-app-settings', async (_event, settings = {}) => {
+  const saved = writeClientAppSettings(settings);
+  writeDebugLog('client.app-settings-saved', { settings: { ...saved, debugLogDir: saved.debugLogDir ? '[custom]' : '' } });
+  return {
+    ...saved,
+    debugLog: debugLogInfo(),
+  };
 });
 
 // ── 画面共有（Client内蔵）────────────────────────────────

@@ -29,6 +29,17 @@ if (!rawAnnouncedIp) {
 const rtcMinPort = Number(process.env.RTC_MIN_PORT) || 10000;
 const rtcMaxPort = Number(process.env.RTC_MAX_PORT) || 10200;
 
+function envFlag(name, defaultValue = false) {
+  const raw = String(process.env[name] ?? '').trim().toLowerCase();
+  if (!raw) return defaultValue;
+  return ['1', 'true', 'yes', 'on'].includes(raw);
+}
+
+const forceTcpMedia = envFlag('FORCE_TCP_MEDIA', false);
+if (forceTcpMedia) {
+  console.warn('[Config] FORCE_TCP_MEDIA=true: WebRTC media transports will use TCP only.');
+}
+
 /**
  * クライアントへ渡す ICE サーバー（STUN/TURN）。
  * 拠点間で UDP がブロックされる環境では TURN を設定すると到達性が上がる。
@@ -59,6 +70,7 @@ module.exports = {
   listenPort: Number(process.env.PORT) || 3000,
   announcedIp: localIp,
   rtcPortRange: { min: rtcMinPort, max: rtcMaxPort },
+  forceTcpMedia,
 
   // クライアントへ配布する ICE サーバー
   iceServers: buildIceServers(),
@@ -105,8 +117,8 @@ module.exports = {
           announcedIp: localIp, // LAN IPを自動検出
         },
       ],
-      initialAvailableOutgoingBitrate: 1_000_000,
-      minimumAvailableOutgoingBitrate: 600_000,
+      initialAvailableOutgoingBitrate: 600_000,
+      minimumAvailableOutgoingBitrate: 150_000,
       maxSctpMessageSize: 262144,
       enableUdp: true,
       enableTcp: true,

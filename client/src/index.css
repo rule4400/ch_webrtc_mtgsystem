@@ -1360,6 +1360,49 @@ body.resizing-sidebar {
   color: white;
 }
 
+.tone-select-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.tone-test-btn {
+  min-width: 78px;
+  padding: 0 12px;
+  border: 1px solid rgba(74,222,128,0.28);
+  border-radius: 6px;
+  background: rgba(74,222,128,0.12);
+  color: #b8f7dc;
+  font-size: 0.78rem;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.tone-test-btn:hover {
+  background: rgba(74,222,128,0.2);
+  border-color: rgba(74,222,128,0.46);
+}
+
+.settings-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.settings-check input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
 .server-row {
   display: grid;
   grid-template-columns: 1fr 100px;
@@ -1547,7 +1590,7 @@ body.resizing-sidebar {
 }
 
 /* ════════════════════════════════════════════════════════
-   v0.2.0: タイルホバー操作バー / 発信中ベル / 画面共有
+   v0.2.4: ICE/RTP診断テレメトリ追加
    ════════════════════════════════════════════════════════ */
 
 /* ── タイルホバー操作バー ──

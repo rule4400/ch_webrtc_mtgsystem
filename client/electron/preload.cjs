@@ -4,6 +4,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   platform: process.platform,
   restartApp: () => ipcRenderer.send('restart-app'),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
+  downloadUpdatePackage: (packageInfo) => ipcRenderer.invoke('download-update-package', packageInfo),
+  installUpdatePackage: (payload) => ipcRenderer.invoke('install-update-package', payload),
+  openDownloadedUpdate: (filePath) => ipcRenderer.invoke('open-downloaded-update', filePath),
+  writeDebugLog: (payload) => ipcRenderer.invoke('write-debug-log', payload || {}),
+  getDebugLogInfo: () => ipcRenderer.invoke('get-debug-log-info'),
+  getClientAppSettings: () => ipcRenderer.invoke('get-client-app-settings'),
+  saveClientAppSettings: (settings) => ipcRenderer.invoke('save-client-app-settings', settings || {}),
   onQuickRestartRequest: (callback) => {
     const listener = (_event, payload) => callback(payload);
     ipcRenderer.on('quick-restart-request', listener);
