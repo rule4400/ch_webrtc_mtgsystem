@@ -98,6 +98,12 @@ function isTransportTerminalState(state) {
   return ['failed', 'closed'].includes(String(state || '').toLowerCase());
 }
 
+const ONE_WAY_WATCHDOG = {
+  recvUnreadyMs: 8_000,
+  inboundStallMs: 12_000,
+  recoveryCooldownMs: 18_000,
+};
+
 function statsItems(stats) {
   if (!stats || typeof stats.values !== 'function') return [];
   return Array.from(stats.values());
@@ -221,6 +227,20 @@ function telemetrySummary(payload = {}) {
   };
 }
 
+function totalInboundBytes(consumers = []) {
+  let total = 0;
+  let hasStats = false;
+  for (const consumer of consumers) {
+    const stats = Array.isArray(consumer?.stats) ? consumer.stats : [];
+    for (const item of stats) {
+      if (!Number.isFinite(item?.bytesReceived)) continue;
+      hasStats = true;
+      total += item.bytesReceived;
+    }
+  }
+  return hasStats ? total : null;
+}
+
 export class WebRTCManager {
   constructor() {
     this.socket        = null;
@@ -269,6 +289,13 @@ export class WebRTCManager {
     this._sessionRebuildTimer = null;
     this._selfSocketId = '';
     this._debugSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    this._oneWayWatchdog = {
+      recvUnreadySince: null,
+      lastInboundBytes: null,
+      lastInboundAt: null,
+      lastRecoveryAt: 0,
+      lastReason: '',
+    };
 
     // コールバック
     this.onPeerUpdated      = null;  // (socketId, peer) => void
@@ -535,18 +562,18 @@ export class WebRTCManager {
     this._setupRetryTimer = null;
   }
 
-  _scheduleSessionRebuild(reason = 'transport-failure') {
+  _scheduleSessionRebuild(reason = 'transport-failure', { force = false } = {}) {
     if (this._manualDisconnect || !this.socket?.connected || this._sessionRebuildTimer) return;
     this._sessionRebuildTimer = setTimeout(async () => {
       this._sessionRebuildTimer = null;
       if (this._manualDisconnect || !this.socket?.connected) return;
       const health = this.getConnectionHealth(reason);
-      if (health.status === 'connected') {
+      if (!force && health.status === 'connected') {
         this._debugLog('session.rebuild-skipped', { reason, health });
         return;
       }
       console.warn(`[WebRTC] rebuilding media session reason=${reason}`);
-      this._debugLog('session.rebuild-start', { reason }, 'warn');
+      this._debugLog('session.rebuild-start', { reason, force }, 'warn');
       this._initialized = false;
       this.onConnectionChange?.(false, this.getConnectionHealth(`rebuilding:${reason}`));
       this._resetMediaSession({ keepPeers: true });
@@ -566,6 +593,99 @@ export class WebRTCManager {
     if (!this._sessionRebuildTimer) return;
     clearTimeout(this._sessionRebuildTimer);
     this._sessionRebuildTimer = null;
+  }
+
+  _resetOneWayWatchdog(reason = 'reset') {
+    this._oneWayWatchdog = {
+      recvUnreadySince: null,
+      lastInboundBytes: null,
+      lastInboundAt: null,
+      lastRecoveryAt: this._oneWayWatchdog?.lastRecoveryAt || 0,
+      lastReason: reason,
+    };
+  }
+
+  _requestWatchdogRecovery(reason, details = {}) {
+    const now = Date.now();
+    const elapsed = now - (this._oneWayWatchdog.lastRecoveryAt || 0);
+    if (elapsed < ONE_WAY_WATCHDOG.recoveryCooldownMs) {
+      this._debugLog('watchdog.recovery-suppressed', {
+        reason,
+        cooldownRemainingMs: ONE_WAY_WATCHDOG.recoveryCooldownMs - elapsed,
+        ...details,
+      }, 'warn');
+      return;
+    }
+
+    this._oneWayWatchdog.lastRecoveryAt = now;
+    this._oneWayWatchdog.lastReason = reason;
+    this._debugLog('watchdog.recovery-requested', { reason, ...details }, 'warn');
+    this._scheduleSessionRebuild(`watchdog:${reason}`, { force: true });
+  }
+
+  _evaluateOneWayWatchdog(payload = {}) {
+    if (this._manualDisconnect || !this.socket?.connected || !this._initialized) {
+      this._resetOneWayWatchdog('inactive');
+      return;
+    }
+
+    const now = Date.now();
+    const report = payload.remoteMonitor || {};
+    const mediaStats = payload.mediaStats || {};
+    const remotePeerCount = Number(report.peerCount || 0);
+    const expectedInbound = remotePeerCount > 0 && this.consumers.size > 0;
+    const sendState = this.sendTransport?.connectionState || 'none';
+    const recvState = this.recvTransport?.connectionState || 'none';
+    const sendReady = isTransportReadyState(sendState);
+    const recvReady = isTransportReadyState(recvState);
+
+    if (!recvReady) {
+      if (!this._oneWayWatchdog.recvUnreadySince) this._oneWayWatchdog.recvUnreadySince = now;
+      const recvUnreadyMs = now - this._oneWayWatchdog.recvUnreadySince;
+      if (sendReady && expectedInbound && recvUnreadyMs >= ONE_WAY_WATCHDOG.recvUnreadyMs) {
+        this._requestWatchdogRecovery('recv-transport-not-ready', {
+          sendState,
+          recvState,
+          recvUnreadyMs,
+          remotePeerCount,
+          consumers: this.consumers.size,
+        });
+      }
+      return;
+    }
+
+    this._oneWayWatchdog.recvUnreadySince = null;
+
+    const inboundBytes = totalInboundBytes(mediaStats.consumers || []);
+    if (!expectedInbound || inboundBytes == null) {
+      this._oneWayWatchdog.lastInboundBytes = inboundBytes;
+      this._oneWayWatchdog.lastInboundAt = now;
+      return;
+    }
+
+    const lastBytes = this._oneWayWatchdog.lastInboundBytes;
+    if (lastBytes == null || inboundBytes > lastBytes) {
+      this._oneWayWatchdog.lastInboundBytes = inboundBytes;
+      this._oneWayWatchdog.lastInboundAt = now;
+      return;
+    }
+
+    this._oneWayWatchdog.lastInboundBytes = inboundBytes;
+    const lastInboundAt = this._oneWayWatchdog.lastInboundAt || now;
+    const stalledMs = now - lastInboundAt;
+    if (sendReady && recvReady && stalledMs >= ONE_WAY_WATCHDOG.inboundStallMs) {
+      this._requestWatchdogRecovery('inbound-rtp-stalled', {
+        sendState,
+        recvState,
+        stalledMs,
+        inboundBytes,
+        remotePeerCount,
+        consumers: this.consumers.size,
+        receivingVideoCount: Number(report.receivingVideoCount || 0),
+        receivingAudioCount: Number(report.receivingAudioCount || 0),
+      });
+      this._oneWayWatchdog.lastInboundAt = now;
+    }
   }
 
   _resetMediaSession({ notifyPeers = false, keepPeers = false } = {}) {
@@ -602,6 +722,7 @@ export class WebRTCManager {
     this.audioProducer = null;
     this.screenProducer = null;
     this.screenAudioProducer = null;
+    this._resetOneWayWatchdog('media-session-reset');
 
     if (notifyPeers && !keepPeers) {
       for (const socketId of this.peers.keys()) this.onPeerRemoved?.(socketId);
@@ -1519,6 +1640,7 @@ export class WebRTCManager {
       };
 
       this._debugLog('client.telemetry', telemetrySummary(payload));
+      this._evaluateOneWayWatchdog(payload);
 
       this.socket.timeout(1500).emit('clientTelemetry', payload, (err) => {
         if (err) {
