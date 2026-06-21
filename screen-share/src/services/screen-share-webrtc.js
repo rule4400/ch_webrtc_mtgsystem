@@ -5,6 +5,24 @@ const SCREEN_SHARE_ENCODINGS = [
   { rid: 'r0', maxBitrate: 180_000, scaleResolutionDownBy: 2 },
   { rid: 'r1', maxBitrate: 700_000 },
 ];
+const SETUP_WATCHDOG_MS = 20_000;
+const HARD_RECONNECT_DELAY_MS = 1_000;
+const DIAGNOSTIC_STAT_TIMEOUT_MS = 700;
+const TELEMETRY_DIAGNOSTIC_TIMEOUT_MS = 900;
+
+function withTimeout(promise, timeoutMs, fallback = null) {
+  if (!promise || typeof promise.then !== 'function') return Promise.resolve(fallback);
+  let timer = null;
+  return new Promise(resolve => {
+    timer = setTimeout(() => resolve(fallback), timeoutMs);
+    promise
+      .then(value => resolve(value))
+      .catch(() => resolve(fallback))
+      .finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+  });
+}
 
 function statsItems(stats) {
   if (!stats || typeof stats.values !== 'function') return [];
@@ -87,6 +105,10 @@ export class ScreenShareWebRTCManager {
     this._setupInFlight = null;
     this._setupRetryTimer = null;
     this._setupRetryDelay = 1000;
+    this._setupGeneration = 0;
+    this._setupStartedAt = 0;
+    this._setupWatchdogTimer = null;
+    this._hardReconnectTimer = null;
     this._sessionRebuildTimer = null;
     this._iceRestartTimers = new Map();
 
@@ -146,8 +168,10 @@ export class ScreenShareWebRTCManager {
 
       this.socket.on('disconnect', (reason) => {
         console.warn('[ScreenShare] disconnected:', reason);
+        this._setupGeneration += 1;
         this._initialized = false;
         this._clearSetupRetry();
+        this._clearSetupWatchdog();
         this._resetMediaSession({ stopTracks: false });
         this.onConnectionChange?.(false);
         if (!this._manualDisconnect && reason === 'io server disconnect') {
@@ -172,6 +196,11 @@ export class ScreenShareWebRTCManager {
         if (!payload.appType || payload.appType === 'screen-share' || payload.appType === 'all') {
           this.onUpdateCommand?.(payload);
         }
+      });
+
+      this.socket.on('restartCommand', (payload = {}, ack) => {
+        ack?.({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
+        setTimeout(() => this._hardReconnect(payload.reason || 'server-command'), 100);
       });
 
       this.socket.on('instanceReplaced', (payload = {}, ack) => {
@@ -219,7 +248,18 @@ export class ScreenShareWebRTCManager {
   async _setupSession() {
     if (this._setupInFlight) return this._setupInFlight;
 
-    this._setupInFlight = (async () => {
+    const setupGeneration = this._setupGeneration + 1;
+    this._setupGeneration = setupGeneration;
+    this._setupStartedAt = Date.now();
+    this._armSetupWatchdog(setupGeneration);
+
+    const assertCurrent = (stage) => {
+      if (this._manualDisconnect || !this.socket?.connected || this._setupGeneration !== setupGeneration) {
+        throw new Error(`screen-share setup superseded at ${stage}`);
+      }
+    };
+
+    const setupPromise = (async () => {
       this._clearSetupRetry();
       this.socket.emit('setMetadata', {
         locationName: this._displayName,
@@ -241,15 +281,22 @@ export class ScreenShareWebRTCManager {
       this.device = new mediasoupClient.Device();
       await this.device.load({ routerRtpCapabilities: caps });
       await this._initSendTransport();
+      assertCurrent('init-send-transport');
       this._initialized = true;
       await this._reproduceScreen();
+      assertCurrent('reproduce-screen');
       this.onConnectionChange?.(true);
     })();
+    this._setupInFlight = setupPromise;
 
     try {
-      return await this._setupInFlight;
+      return await setupPromise;
     } finally {
-      this._setupInFlight = null;
+      if (this._setupInFlight === setupPromise) this._setupInFlight = null;
+      if (this._setupGeneration === setupGeneration) {
+        this._setupStartedAt = 0;
+        this._clearSetupWatchdog();
+      }
     }
   }
 
@@ -277,6 +324,49 @@ export class ScreenShareWebRTCManager {
     if (!this._setupRetryTimer) return;
     clearTimeout(this._setupRetryTimer);
     this._setupRetryTimer = null;
+  }
+
+  _armSetupWatchdog(setupGeneration) {
+    this._clearSetupWatchdog();
+    this._setupWatchdogTimer = setTimeout(() => {
+      if (
+        this._manualDisconnect ||
+        !this.socket?.connected ||
+        this._setupGeneration !== setupGeneration ||
+        !this._setupInFlight ||
+        this._initialized
+      ) return;
+      console.warn('[ScreenShare] setup watchdog fired; hard reconnecting');
+      this._hardReconnect('setup-watchdog-timeout');
+    }, SETUP_WATCHDOG_MS);
+  }
+
+  _clearSetupWatchdog() {
+    if (!this._setupWatchdogTimer) return;
+    clearTimeout(this._setupWatchdogTimer);
+    this._setupWatchdogTimer = null;
+  }
+
+  _hardReconnect(reason = 'manual-recovery') {
+    if (this._manualDisconnect || !this.socket || this._hardReconnectTimer) return;
+    console.warn(`[ScreenShare] hard reconnect requested reason=${reason}`);
+    this._setupGeneration += 1;
+    this._setupInFlight = null;
+    this._initialized = false;
+    this._clearSetupRetry();
+    this._clearSessionRebuild();
+    this._clearSetupWatchdog();
+    this._resetMediaSession({ stopTracks: false });
+    this.onConnectionChange?.(false);
+
+    const socket = this.socket;
+    try { socket.disconnect(); } catch { /* ignore disconnect errors */ }
+    this._hardReconnectTimer = setTimeout(() => {
+      this._hardReconnectTimer = null;
+      if (!this._manualDisconnect && socket === this.socket) {
+        try { this.socket.connect(); } catch { /* socket.io reconnect will keep retrying */ }
+      }
+    }, HARD_RECONNECT_DELAY_MS);
   }
 
   _scheduleSessionRebuild(reason = 'transport-failure') {
@@ -518,8 +608,9 @@ export class ScreenShareWebRTCManager {
     const producers = [];
 
     try {
-      const stats = await this.sendTransport?.getStats?.();
+      const stats = await withTimeout(this.sendTransport?.getStats?.(), DIAGNOSTIC_STAT_TIMEOUT_MS, null);
       if (stats) transports.sendSelectedCandidatePair = selectedCandidatePair(stats);
+      else if (this.sendTransport && !this.sendTransport.closed) transports.sendStatsError = 'stats timeout';
     } catch (err) {
       transports.sendStatsError = err.message;
     }
@@ -530,8 +621,13 @@ export class ScreenShareWebRTCManager {
     ]) {
       if (!producer || producer.closed) continue;
       try {
-        const stats = await producer.getStats();
-        producers.push({ source, id: producer.id, kind: producer.kind, stats: summarizeOutboundStats(stats) });
+        const stats = await withTimeout(producer.getStats(), DIAGNOSTIC_STAT_TIMEOUT_MS, null);
+        producers.push({
+          source,
+          id: producer.id,
+          kind: producer.kind,
+          ...(stats ? { stats: summarizeOutboundStats(stats) } : { error: 'stats timeout' }),
+        });
       } catch (err) {
         producers.push({ source, id: producer.id, kind: producer.kind, error: err.message });
       }
@@ -543,7 +639,10 @@ export class ScreenShareWebRTCManager {
   sendTelemetry(report = {}) {
     if (!this.socket?.connected) return;
     const sentAt = Date.now();
-    this._collectWebRtcDiagnostics().then(diagnostics => {
+    withTimeout(this._collectWebRtcDiagnostics(), TELEMETRY_DIAGNOSTIC_TIMEOUT_MS, {
+      transports: { diagnosticsError: 'diagnostics timeout' },
+      mediaStats: { producers: [], consumers: [] },
+    }).then(diagnostics => {
       if (!this.socket?.connected) return;
       this.socket.timeout(1500).emit('clientTelemetry', {
         ...report,
@@ -601,6 +700,11 @@ export class ScreenShareWebRTCManager {
     this._initialized = false;
     this._clearSetupRetry();
     this._clearSessionRebuild();
+    this._clearSetupWatchdog();
+    if (this._hardReconnectTimer) {
+      clearTimeout(this._hardReconnectTimer);
+      this._hardReconnectTimer = null;
+    }
     this.stopScreenShare().catch(() => {});
     this._resetMediaSession({ stopTracks: false });
     this.socket?.disconnect();

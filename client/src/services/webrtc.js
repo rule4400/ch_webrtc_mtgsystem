@@ -103,6 +103,24 @@ const ONE_WAY_WATCHDOG = {
   inboundStallMs: 12_000,
   recoveryCooldownMs: 18_000,
 };
+const SETUP_WATCHDOG_MS = 20_000;
+const HARD_RECONNECT_DELAY_MS = 1_000;
+const DIAGNOSTIC_STAT_TIMEOUT_MS = 700;
+const TELEMETRY_DIAGNOSTIC_TIMEOUT_MS = 900;
+
+function withTimeout(promise, timeoutMs, fallback = null) {
+  if (!promise || typeof promise.then !== 'function') return Promise.resolve(fallback);
+  let timer = null;
+  return new Promise(resolve => {
+    timer = setTimeout(() => resolve(fallback), timeoutMs);
+    promise
+      .then(value => resolve(value))
+      .catch(() => resolve(fallback))
+      .finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+  });
+}
 
 function statsItems(stats) {
   if (!stats || typeof stats.values !== 'function') return [];
@@ -286,6 +304,10 @@ export class WebRTCManager {
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
     this._connectGeneration = 0;
+    this._setupGeneration = 0;
+    this._setupStartedAt = 0;
+    this._setupWatchdogTimer = null;
+    this._hardReconnectTimer = null;
     this._sessionRebuildTimer = null;
     this._selfSocketId = '';
     this._debugSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -414,8 +436,10 @@ export class WebRTCManager {
         console.warn('[WebRTC] disconnected:', reason);
         this._debugLog('socket.disconnected', { reason }, 'warn');
         this._connectGeneration += 1;
+        this._setupGeneration += 1;
         this._initialized = false;
         this._clearSetupRetry();
+        this._clearSetupWatchdog();
         this._resetMediaSession({ notifyPeers: true, keepPeers: false });
         this.onConnectionChange?.(false, this.getConnectionHealth(`socket-disconnect:${reason}`));
         if (!this._manualDisconnect && reason === 'io server disconnect') {
@@ -495,7 +519,24 @@ export class WebRTCManager {
   /** 接続/再接続のたびに呼ぶ: device→transport→既存consume→ローカルreproduceを再構築 */
   async _setupSession() {
     if (this._setupInFlight) return this._setupInFlight;
-    this._setupInFlight = (async () => {
+    const setupGeneration = this._setupGeneration + 1;
+    const connectGeneration = this._connectGeneration;
+    this._setupGeneration = setupGeneration;
+    this._setupStartedAt = Date.now();
+    this._armSetupWatchdog(setupGeneration);
+
+    const assertCurrent = (stage) => {
+      if (
+        this._manualDisconnect ||
+        !this.socket?.connected ||
+        this._setupGeneration !== setupGeneration ||
+        this._connectGeneration !== connectGeneration
+      ) {
+        throw new Error(`setup superseded at ${stage}`);
+      }
+    };
+
+    const setupPromise = (async () => {
       this._debugLog('session.setup-start', {
         hasVideoTrack: !!this.localVideoTrack,
         hasAudioTrack: !!this.localAudioTrack,
@@ -504,19 +545,23 @@ export class WebRTCManager {
       this._clearSetupRetry();
       this._sendMetadata();
       await this._initMediasoup();
+      assertCurrent('init-mediasoup');
       this._initialized = true;
 
       // 初期化前にキューイングした newProducer を処理
       const queued = this._pendingQueue.splice(0);
       for (const p of queued) {
         await this._consumePeer(p.producerId, p.socketId, p.locationName, p.kind, p.paused, p);
+        assertCurrent('queued-consume');
       }
 
       // ローカルトラックを（再）produce
       await this._reproduceLocal();
+      assertCurrent('reproduce-local');
 
       this.onConnectionChange?.(true, this.getConnectionHealth('setup-complete'));
       await this.syncPeers();
+      assertCurrent('sync-peers');
       this._debugLog('session.setup-complete', {
         sendTransportId: this.sendTransport?.id || '',
         recvTransportId: this.recvTransport?.id || '',
@@ -526,11 +571,16 @@ export class WebRTCManager {
         peers: this.peers.size,
       });
     })();
+    this._setupInFlight = setupPromise;
 
     try {
-      return await this._setupInFlight;
+      return await setupPromise;
     } finally {
-      this._setupInFlight = null;
+      if (this._setupInFlight === setupPromise) this._setupInFlight = null;
+      if (this._setupGeneration === setupGeneration) {
+        this._setupStartedAt = 0;
+        this._clearSetupWatchdog();
+      }
     }
   }
 
@@ -560,6 +610,51 @@ export class WebRTCManager {
     if (!this._setupRetryTimer) return;
     clearTimeout(this._setupRetryTimer);
     this._setupRetryTimer = null;
+  }
+
+  _armSetupWatchdog(setupGeneration) {
+    this._clearSetupWatchdog();
+    this._setupWatchdogTimer = setTimeout(() => {
+      if (
+        this._manualDisconnect ||
+        !this.socket?.connected ||
+        this._setupGeneration !== setupGeneration ||
+        !this._setupInFlight ||
+        this._initialized
+      ) return;
+      console.warn('[WebRTC] setup watchdog fired; hard reconnecting');
+      this._debugLog('session.setup-watchdog-timeout', { setupGeneration }, 'warn');
+      this._hardReconnect('setup-watchdog-timeout');
+    }, SETUP_WATCHDOG_MS);
+  }
+
+  _clearSetupWatchdog() {
+    if (!this._setupWatchdogTimer) return;
+    clearTimeout(this._setupWatchdogTimer);
+    this._setupWatchdogTimer = null;
+  }
+
+  _hardReconnect(reason = 'manual-recovery') {
+    if (this._manualDisconnect || !this.socket || this._hardReconnectTimer) return;
+    console.warn(`[WebRTC] hard reconnect requested reason=${reason}`);
+    this._debugLog('socket.hard-reconnect-requested', { reason }, 'warn');
+    this._setupGeneration += 1;
+    this._setupInFlight = null;
+    this._initialized = false;
+    this._clearSetupRetry();
+    this._clearSessionRebuild();
+    this._clearSetupWatchdog();
+    this._resetMediaSession({ notifyPeers: true, keepPeers: false });
+    this.onConnectionChange?.(false, this.getConnectionHealth(`hard-reconnect:${reason}`));
+
+    const socket = this.socket;
+    try { socket.disconnect(); } catch { /* ignore disconnect errors */ }
+    this._hardReconnectTimer = setTimeout(() => {
+      this._hardReconnectTimer = null;
+      if (!this._manualDisconnect && socket === this.socket) {
+        try { this.socket.connect(); } catch { /* socket.io reconnect will keep retrying */ }
+      }
+    }, HARD_RECONNECT_DELAY_MS);
   }
 
   _scheduleSessionRebuild(reason = 'transport-failure', { force = false } = {}) {
@@ -1574,15 +1669,17 @@ export class WebRTCManager {
     const consumers = [];
 
     try {
-      const stats = await this.sendTransport?.getStats?.();
+      const stats = await withTimeout(this.sendTransport?.getStats?.(), DIAGNOSTIC_STAT_TIMEOUT_MS, null);
       if (stats) transports.sendSelectedCandidatePair = selectedCandidatePair(stats);
+      else if (this.sendTransport && !this.sendTransport.closed) transports.sendStatsError = 'stats timeout';
     } catch (err) {
       transports.sendStatsError = err.message;
     }
 
     try {
-      const stats = await this.recvTransport?.getStats?.();
+      const stats = await withTimeout(this.recvTransport?.getStats?.(), DIAGNOSTIC_STAT_TIMEOUT_MS, null);
       if (stats) transports.recvSelectedCandidatePair = selectedCandidatePair(stats);
+      else if (this.recvTransport && !this.recvTransport.closed) transports.recvStatsError = 'stats timeout';
     } catch (err) {
       transports.recvStatsError = err.message;
     }
@@ -1595,8 +1692,13 @@ export class WebRTCManager {
     ]) {
       if (!producer || producer.closed) continue;
       try {
-        const stats = await producer.getStats();
-        producers.push({ source, id: producer.id, kind: producer.kind, stats: summarizeRtpStats(stats, 'outbound') });
+        const stats = await withTimeout(producer.getStats(), DIAGNOSTIC_STAT_TIMEOUT_MS, null);
+        producers.push({
+          source,
+          id: producer.id,
+          kind: producer.kind,
+          ...(stats ? { stats: summarizeRtpStats(stats, 'outbound') } : { error: 'stats timeout' }),
+        });
       } catch (err) {
         producers.push({ source, id: producer.id, kind: producer.kind, error: err.message });
       }
@@ -1605,8 +1707,13 @@ export class WebRTCManager {
     for (const [producerId, consumer] of this.consumers.entries()) {
       if (!consumer || consumer.closed) continue;
       try {
-        const stats = await consumer.getStats();
-        consumers.push({ producerId, id: consumer.id, kind: consumer.kind, stats: summarizeRtpStats(stats, 'inbound') });
+        const stats = await withTimeout(consumer.getStats(), DIAGNOSTIC_STAT_TIMEOUT_MS, null);
+        consumers.push({
+          producerId,
+          id: consumer.id,
+          kind: consumer.kind,
+          ...(stats ? { stats: summarizeRtpStats(stats, 'inbound') } : { error: 'stats timeout' }),
+        });
       } catch (err) {
         consumers.push({ producerId, id: consumer.id, kind: consumer.kind, error: err.message });
       }
@@ -1618,7 +1725,10 @@ export class WebRTCManager {
   sendTelemetry(report) {
     if (!this.socket?.connected) return;
     const sentAt = Date.now();
-    this._collectWebRtcDiagnostics().then(diagnostics => {
+    withTimeout(this._collectWebRtcDiagnostics(), TELEMETRY_DIAGNOSTIC_TIMEOUT_MS, {
+      transports: { diagnosticsError: 'diagnostics timeout' },
+      mediaStats: { producers: [], consumers: [] },
+    }).then(diagnostics => {
       if (!this.socket?.connected) return;
       const payload = {
         ...report,
@@ -1758,7 +1868,14 @@ export class WebRTCManager {
       this.socket.connect();
       return;
     }
-    if (!this._initialized) this._scheduleSetupRetry();
+    if (!this._initialized) {
+      const setupAge = this._setupStartedAt ? Date.now() - this._setupStartedAt : 0;
+      if (this._setupInFlight && setupAge >= SETUP_WATCHDOG_MS) {
+        this._hardReconnect('server-probe-setup-stalled');
+        return;
+      }
+      this._scheduleSetupRetry();
+    }
   }
 
   disconnect() {
@@ -1767,6 +1884,11 @@ export class WebRTCManager {
     this._initialized = false;
     this._clearSetupRetry();
     this._clearSessionRebuild();
+    this._clearSetupWatchdog();
+    if (this._hardReconnectTimer) {
+      clearTimeout(this._hardReconnectTimer);
+      this._hardReconnectTimer = null;
+    }
     this._resetMediaSession({ notifyPeers: true, keepPeers: false });
     this.socket?.disconnect();
   }

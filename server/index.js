@@ -107,6 +107,9 @@ const MAX_MONITOR_PEERS = 32;
 const MAX_RTT_SAMPLES = 20;
 const REPLACED_BY_NEW_CONNECTION_REASON = 'replaced-by-new-connection';
 const METADATA_TIMEOUT_MS = 15000;
+const TELEMETRY_MISSING_RESTART_MS = Number(process.env.TELEMETRY_MISSING_RESTART_MS) || 25000;
+const TELEMETRY_STALE_RESTART_MS = Number(process.env.TELEMETRY_STALE_RESTART_MS) || 45000;
+const TELEMETRY_RESTART_COOLDOWN_MS = Number(process.env.TELEMETRY_RESTART_COOLDOWN_MS) || 60000;
 const DEFAULT_VPN_BANDWIDTH_MBPS = Number(process.env.VPN_BANDWIDTH_MBPS) || 200;
 const STATS_INTERVAL_MS = Math.max(500, Number(process.env.STATS_INTERVAL_MS) || 1000);
 const ESTIMATED_MEDIA_BITRATES_BPS = {
@@ -1364,8 +1367,34 @@ function broadcastViewerPresence() {
   }
 }
 
+function recoverTelemetryMissingPeers(now = Date.now()) {
+  for (const [socketId, peer] of Object.entries(peers)) {
+    const appType = peer.appType || peer.telemetry?.appType || 'client';
+    if (!['client', 'viewer', 'screen-share'].includes(appType)) continue;
+    if (!peer.socket?.connected || !peer.metadataReady) continue;
+
+    const connectedAge = now - (peer.connectedAt || now);
+    const heartbeatAge = peer.lastHeartbeatAt ? now - peer.lastHeartbeatAt : null;
+    const missingInitialTelemetry = !peer.lastHeartbeatAt && connectedAge >= TELEMETRY_MISSING_RESTART_MS;
+    const staleTelemetry = heartbeatAge != null && heartbeatAge >= TELEMETRY_STALE_RESTART_MS;
+    if (!missingInitialTelemetry && !staleTelemetry) continue;
+
+    const sinceLastRestart = now - (peer.telemetryRecoveryAt || 0);
+    if (sinceLastRestart < TELEMETRY_RESTART_COOLDOWN_MS) continue;
+
+    peer.telemetryRecoveryAt = now;
+    const reason = missingInitialTelemetry
+      ? `telemetry-missing:${socketId}`
+      : `telemetry-stale:${socketId}`;
+    sendAdminLog(`[Recovery] restartCommand ${reason} name=${peer.locationName} appType=${appType} connectedAge=${connectedAge} heartbeatAge=${heartbeatAge ?? 'none'}`);
+    emitRestartCommand(peer.socket, 1, reason);
+  }
+}
+
 const viewerPresenceTimer = setInterval(broadcastViewerPresence, 2000);
 viewerPresenceTimer.unref?.();
+const telemetryRecoveryTimer = setInterval(recoverTelemetryMissingPeers, 5000);
+telemetryRecoveryTimer.unref?.();
 
 // ── Transport ─────────────────────────────────────────────
 
@@ -1410,6 +1439,7 @@ io.on('connection', async socket => {
     metadataReady: false,
     connectedAt: Date.now(),
     lastHeartbeatAt: null,
+    telemetryRecoveryAt: 0,
     rttMs: null,
     rttHistory: [],
     telemetry: null,
