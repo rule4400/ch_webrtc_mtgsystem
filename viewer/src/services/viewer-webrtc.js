@@ -1,6 +1,9 @@
 import { io } from 'socket.io-client';
 import * as mediasoupClient from 'mediasoup-client';
 
+const SETUP_WATCHDOG_MS = 20000;
+const HARD_RECONNECT_DELAY_MS = 1000;
+
 export class ViewerWebRTCManager {
   constructor() {
     this.socket = null;
@@ -23,6 +26,10 @@ export class ViewerWebRTCManager {
     this._setupRetryDelay = 1000;
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
+    this._setupGeneration = 0;
+    this._setupStartedAt = 0;
+    this._setupWatchdogTimer = null;
+    this._hardReconnectTimer = null;
     this._sessionRebuildTimer = null;
 
     this.onPeerUpdated = null;
@@ -74,8 +81,10 @@ export class ViewerWebRTCManager {
 
       this.socket.on('disconnect', (reason) => {
         console.warn('[ViewerWebRTC] disconnected:', reason);
+        this._setupGeneration += 1;
         this._initialized = false;
         this._clearSetupRetry();
+        this._clearSetupWatchdog();
         this.onConnectionChange?.(false);
         if (!this._manualDisconnect && reason === 'io server disconnect') {
           setTimeout(() => this.socket?.connect(), 2000);
@@ -101,7 +110,18 @@ export class ViewerWebRTCManager {
   async _setupSession() {
     if (this._setupInFlight) return this._setupInFlight;
 
-    this._setupInFlight = (async () => {
+    const setupGeneration = this._setupGeneration + 1;
+    this._setupGeneration = setupGeneration;
+    this._setupStartedAt = Date.now();
+    this._armSetupWatchdog(setupGeneration);
+
+    const assertCurrent = (stage) => {
+      if (this._manualDisconnect || !this.socket?.connected || this._setupGeneration !== setupGeneration) {
+        throw new Error(`viewer setup superseded at ${stage}`);
+      }
+    };
+
+    const setupPromise = (async () => {
       this._clearSetupRetry();
       this.socket.emit('setMetadata', {
         locationName: this._viewerName,
@@ -109,20 +129,27 @@ export class ViewerWebRTCManager {
         appVersion: this._appVersion,
       });
       await this._initMediasoup();
+      assertCurrent('init-mediasoup');
       this._initialized = true;
 
       const queued = this._pendingQueue.splice(0);
       for (const producer of queued) {
         await this._consumePeer(producer.producerId, producer.socketId, producer.locationName, producer.kind, producer.paused, producer);
+        assertCurrent('queued-consume');
       }
 
       this.onConnectionChange?.(true);
     })();
+    this._setupInFlight = setupPromise;
 
     try {
-      return await this._setupInFlight;
+      return await setupPromise;
     } finally {
-      this._setupInFlight = null;
+      if (this._setupInFlight === setupPromise) this._setupInFlight = null;
+      if (this._setupGeneration === setupGeneration) {
+        this._setupStartedAt = 0;
+        this._clearSetupWatchdog();
+      }
     }
   }
 
@@ -150,6 +177,49 @@ export class ViewerWebRTCManager {
     if (!this._setupRetryTimer) return;
     clearTimeout(this._setupRetryTimer);
     this._setupRetryTimer = null;
+  }
+
+  _armSetupWatchdog(setupGeneration) {
+    this._clearSetupWatchdog();
+    this._setupWatchdogTimer = setTimeout(() => {
+      if (
+        this._manualDisconnect ||
+        !this.socket?.connected ||
+        this._setupGeneration !== setupGeneration ||
+        !this._setupInFlight ||
+        this._initialized
+      ) return;
+      console.warn('[ViewerWebRTC] setup watchdog fired; hard reconnecting');
+      this._hardReconnect('setup-watchdog-timeout');
+    }, SETUP_WATCHDOG_MS);
+  }
+
+  _clearSetupWatchdog() {
+    if (!this._setupWatchdogTimer) return;
+    clearTimeout(this._setupWatchdogTimer);
+    this._setupWatchdogTimer = null;
+  }
+
+  _hardReconnect(reason = 'manual-recovery') {
+    if (this._manualDisconnect || !this.socket || this._hardReconnectTimer) return;
+    console.warn(`[ViewerWebRTC] hard reconnect requested reason=${reason}`);
+    this._setupGeneration += 1;
+    this._setupInFlight = null;
+    this._initialized = false;
+    this._clearSetupRetry();
+    this._clearSessionRebuild();
+    this._clearSetupWatchdog();
+    this._resetMediaSession({ notifyPeers: true });
+    this.onConnectionChange?.(false);
+
+    const socket = this.socket;
+    try { socket.disconnect(); } catch { /* ignore disconnect errors */ }
+    this._hardReconnectTimer = setTimeout(() => {
+      this._hardReconnectTimer = null;
+      if (!this._manualDisconnect && socket === this.socket) {
+        try { this.socket.connect(); } catch { /* socket.io will retry */ }
+      }
+    }, HARD_RECONNECT_DELAY_MS);
   }
 
   _resetMediaSession({ notifyPeers = false } = {}) {
@@ -653,7 +723,14 @@ export class ViewerWebRTCManager {
       this.socket.connect();
       return;
     }
-    if (!this._initialized) this._scheduleSetupRetry();
+    if (!this._initialized) {
+      const setupAge = this._setupStartedAt ? Date.now() - this._setupStartedAt : 0;
+      if (this._setupInFlight && setupAge >= SETUP_WATCHDOG_MS) {
+        this._hardReconnect('server-probe-setup-stalled');
+        return;
+      }
+      this._scheduleSetupRetry();
+    }
   }
 
   disconnect() {
@@ -661,6 +738,11 @@ export class ViewerWebRTCManager {
     this._initialized = false;
     this._clearSetupRetry();
     this._clearSessionRebuild();
+    this._clearSetupWatchdog();
+    if (this._hardReconnectTimer) {
+      clearTimeout(this._hardReconnectTimer);
+      this._hardReconnectTimer = null;
+    }
     this._resetMediaSession({ notifyPeers: true });
     this.socket?.disconnect();
   }

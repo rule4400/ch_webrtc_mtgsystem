@@ -58,6 +58,9 @@ let router;
 let routerWorker;        // router が載っている worker
 let recovering = false;  // 二重リカバリ防止
 const RESTART_ACK_TIMEOUT_MS = 2500;
+const TELEMETRY_MISSING_RESTART_MS = Number(process.env.TELEMETRY_MISSING_RESTART_MS) || 25000;
+const TELEMETRY_STALE_RESTART_MS = Number(process.env.TELEMETRY_STALE_RESTART_MS) || 45000;
+const TELEMETRY_RESTART_COOLDOWN_MS = Number(process.env.TELEMETRY_RESTART_COOLDOWN_MS) || 60000;
 const SYSTEM_NAME = 'CHECKHOUSE Meeting System';
 const DEFAULT_CHANNELS = [
   { id: 'general', name: '一般' },
@@ -844,8 +847,34 @@ function broadcastViewerPresence() {
   }
 }
 
+function recoverTelemetryMissingPeers(now = Date.now()) {
+  for (const [socketId, peer] of Object.entries(peers)) {
+    const appType = peer.appType || peer.telemetry?.appType || 'client';
+    if (!['client', 'viewer', 'screen-share'].includes(appType)) continue;
+    if (!peer.socket?.connected || !peer.metadataReady) continue;
+
+    const connectedAge = now - (peer.connectedAt || now);
+    const heartbeatAge = peer.lastHeartbeatAt ? now - peer.lastHeartbeatAt : null;
+    const missingInitialTelemetry = !peer.lastHeartbeatAt && connectedAge >= TELEMETRY_MISSING_RESTART_MS;
+    const staleTelemetry = heartbeatAge != null && heartbeatAge >= TELEMETRY_STALE_RESTART_MS;
+    if (!missingInitialTelemetry && !staleTelemetry) continue;
+
+    const sinceLastRestart = now - (peer.telemetryRecoveryAt || 0);
+    if (sinceLastRestart < TELEMETRY_RESTART_COOLDOWN_MS) continue;
+
+    peer.telemetryRecoveryAt = now;
+    const reason = missingInitialTelemetry
+      ? `telemetry-missing:${socketId}`
+      : `telemetry-stale:${socketId}`;
+    sendAdminLog(`[Recovery] restartCommand ${reason} name=${peer.locationName} appType=${appType} connectedAge=${connectedAge} heartbeatAge=${heartbeatAge ?? 'none'}`);
+    emitRestartCommand(peer.socket, 1, reason);
+  }
+}
+
 const viewerPresenceTimer = setInterval(broadcastViewerPresence, 2000);
 viewerPresenceTimer.unref?.();
+const telemetryRecoveryTimer = setInterval(recoverTelemetryMissingPeers, 5000);
+telemetryRecoveryTimer.unref?.();
 
 // ── Transport ─────────────────────────────────────────────
 
@@ -877,6 +906,7 @@ io.on('connection', async socket => {
     metadataReady: false,
     connectedAt: Date.now(),
     lastHeartbeatAt: null,
+    telemetryRecoveryAt: 0,
     rttMs: null,
     rttHistory: [],
     telemetry: null,

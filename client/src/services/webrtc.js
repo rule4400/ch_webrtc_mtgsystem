@@ -13,6 +13,37 @@
 import { io } from 'socket.io-client';
 import * as mediasoupClient from 'mediasoup-client';
 
+const SETUP_WATCHDOG_MS = 20000;
+const HARD_RECONNECT_DELAY_MS = 1000;
+const INBOUND_STALL_WATCHDOG_MS = 12000;
+const WATCHDOG_RECOVERY_COOLDOWN_MS = 18000;
+const STATS_SAMPLE_TIMEOUT_MS = 600;
+
+function statsItems(stats) {
+  if (!stats || typeof stats.values !== 'function') return [];
+  return Array.from(stats.values());
+}
+
+function sumInboundBytes(stats) {
+  const items = statsItems(stats).filter(item => item.type === 'inbound-rtp' && !item.isRemote);
+  if (!items.length) return null;
+  return items.reduce((total, item) => total + (Number.isFinite(item.bytesReceived) ? item.bytesReceived : 0), 0);
+}
+
+function withTimeout(promise, timeoutMs, fallback = null) {
+  if (!promise || typeof promise.then !== 'function') return Promise.resolve(fallback);
+  let timer = null;
+  return new Promise(resolve => {
+    timer = setTimeout(() => resolve(fallback), timeoutMs);
+    promise
+      .then(value => resolve(value))
+      .catch(() => resolve(fallback))
+      .finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+  });
+}
+
 export class WebRTCManager {
   constructor() {
     this.socket        = null;
@@ -54,8 +85,18 @@ export class WebRTCManager {
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
     this._connectGeneration = 0;
+    this._setupGeneration = 0;
+    this._setupStartedAt = 0;
+    this._setupWatchdogTimer = null;
+    this._hardReconnectTimer = null;
     this._sessionRebuildTimer = null;
     this._selfSocketId = '';
+    this._receiveWatchdog = {
+      lastInboundBytes: null,
+      lastInboundAt: null,
+      lastRecoveryAt: 0,
+      sampling: false,
+    };
 
     // コールバック
     this.onPeerUpdated      = null;  // (socketId, peer) => void
@@ -133,8 +174,10 @@ export class WebRTCManager {
       this.socket.on('disconnect', (reason) => {
         console.warn('[WebRTC] disconnected:', reason);
         this._connectGeneration += 1;
+        this._setupGeneration += 1;
         this._initialized = false;
         this._clearSetupRetry();
+        this._clearSetupWatchdog();
         this._resetMediaSession({ notifyPeers: true, keepPeers: false });
         this.onConnectionChange?.(false);
         if (!this._manualDisconnect && reason === 'io server disconnect') {
@@ -157,7 +200,24 @@ export class WebRTCManager {
   /** 接続/再接続のたびに呼ぶ: device→transport→既存consume→ローカルreproduceを再構築 */
   async _setupSession() {
     if (this._setupInFlight) return this._setupInFlight;
-    this._setupInFlight = (async () => {
+    const setupGeneration = this._setupGeneration + 1;
+    const connectGeneration = this._connectGeneration;
+    this._setupGeneration = setupGeneration;
+    this._setupStartedAt = Date.now();
+    this._armSetupWatchdog(setupGeneration);
+
+    const assertCurrent = (stage) => {
+      if (
+        this._manualDisconnect ||
+        !this.socket?.connected ||
+        this._setupGeneration !== setupGeneration ||
+        this._connectGeneration !== connectGeneration
+      ) {
+        throw new Error(`setup superseded at ${stage}`);
+      }
+    };
+
+    const setupPromise = (async () => {
       this._clearSetupRetry();
       this.socket.emit('setMetadata', {
         locationName: this._locationName,
@@ -166,25 +226,34 @@ export class WebRTCManager {
         appVersion: this._appVersion,
       });
       await this._initMediasoup();
+      assertCurrent('init-mediasoup');
       this._initialized = true;
 
       // 初期化前にキューイングした newProducer を処理
       const queued = this._pendingQueue.splice(0);
       for (const p of queued) {
         await this._consumePeer(p.producerId, p.socketId, p.locationName, p.kind, p.paused, p);
+        assertCurrent('queued-consume');
       }
 
       // ローカルトラックを（再）produce
       await this._reproduceLocal();
+      assertCurrent('reproduce-local');
 
       this.onConnectionChange?.(true);
       await this.syncPeers();
+      assertCurrent('sync-peers');
     })();
+    this._setupInFlight = setupPromise;
 
     try {
-      return await this._setupInFlight;
+      return await setupPromise;
     } finally {
-      this._setupInFlight = null;
+      if (this._setupInFlight === setupPromise) this._setupInFlight = null;
+      if (this._setupGeneration === setupGeneration) {
+        this._setupStartedAt = 0;
+        this._clearSetupWatchdog();
+      }
     }
   }
 
@@ -214,6 +283,49 @@ export class WebRTCManager {
     this._setupRetryTimer = null;
   }
 
+  _armSetupWatchdog(setupGeneration) {
+    this._clearSetupWatchdog();
+    this._setupWatchdogTimer = setTimeout(() => {
+      if (
+        this._manualDisconnect ||
+        !this.socket?.connected ||
+        this._setupGeneration !== setupGeneration ||
+        !this._setupInFlight ||
+        this._initialized
+      ) return;
+      console.warn('[WebRTC] setup watchdog fired; hard reconnecting');
+      this._hardReconnect('setup-watchdog-timeout');
+    }, SETUP_WATCHDOG_MS);
+  }
+
+  _clearSetupWatchdog() {
+    if (!this._setupWatchdogTimer) return;
+    clearTimeout(this._setupWatchdogTimer);
+    this._setupWatchdogTimer = null;
+  }
+
+  _hardReconnect(reason = 'manual-recovery') {
+    if (this._manualDisconnect || !this.socket || this._hardReconnectTimer) return;
+    console.warn(`[WebRTC] hard reconnect requested reason=${reason}`);
+    this._setupGeneration += 1;
+    this._setupInFlight = null;
+    this._initialized = false;
+    this._clearSetupRetry();
+    this._clearSessionRebuild();
+    this._clearSetupWatchdog();
+    this._resetMediaSession({ notifyPeers: true, keepPeers: false });
+    this.onConnectionChange?.(false);
+
+    const socket = this.socket;
+    try { socket.disconnect(); } catch { /* ignore disconnect errors */ }
+    this._hardReconnectTimer = setTimeout(() => {
+      this._hardReconnectTimer = null;
+      if (!this._manualDisconnect && socket === this.socket) {
+        try { this.socket.connect(); } catch { /* reconnect will retry through socket.io */ }
+      }
+    }, HARD_RECONNECT_DELAY_MS);
+  }
+
   _scheduleSessionRebuild(reason = 'transport-failure') {
     if (this._manualDisconnect || !this.socket?.connected || this._sessionRebuildTimer) return;
     this._sessionRebuildTimer = setTimeout(async () => {
@@ -239,6 +351,53 @@ export class WebRTCManager {
     this._sessionRebuildTimer = null;
   }
 
+  async _sampleInboundBytes() {
+    const consumers = Array.from(this.consumers.values()).filter(consumer => consumer && !consumer.closed);
+    if (!consumers.length) return null;
+    const values = await Promise.all(consumers.map(async (consumer) => {
+      const stats = await withTimeout(consumer.getStats?.(), STATS_SAMPLE_TIMEOUT_MS, null);
+      return sumInboundBytes(stats);
+    }));
+    const numeric = values.filter(value => Number.isFinite(value));
+    if (!numeric.length) return null;
+    return numeric.reduce((total, value) => total + value, 0);
+  }
+
+  _evaluateReceiveWatchdog(report = {}) {
+    if (this._receiveWatchdog.sampling || this._manualDisconnect || !this.socket?.connected || !this._initialized) return;
+    const remotePeerCount = Number(report.remoteMonitor?.peerCount || 0);
+    if (remotePeerCount <= 0 || this.consumers.size <= 0) {
+      this._receiveWatchdog.lastInboundBytes = null;
+      this._receiveWatchdog.lastInboundAt = null;
+      return;
+    }
+
+    this._receiveWatchdog.sampling = true;
+    this._sampleInboundBytes()
+      .then(inboundBytes => {
+        const now = Date.now();
+        if (inboundBytes == null) return;
+        const lastBytes = this._receiveWatchdog.lastInboundBytes;
+        if (lastBytes == null || inboundBytes > lastBytes) {
+          this._receiveWatchdog.lastInboundBytes = inboundBytes;
+          this._receiveWatchdog.lastInboundAt = now;
+          return;
+        }
+
+        const stalledFor = now - (this._receiveWatchdog.lastInboundAt || now);
+        const sinceRecovery = now - (this._receiveWatchdog.lastRecoveryAt || 0);
+        this._receiveWatchdog.lastInboundBytes = inboundBytes;
+        if (stalledFor >= INBOUND_STALL_WATCHDOG_MS && sinceRecovery >= WATCHDOG_RECOVERY_COOLDOWN_MS) {
+          this._receiveWatchdog.lastRecoveryAt = now;
+          console.warn(`[WebRTC] inbound RTP stalled for ${stalledFor}ms; rebuilding session`);
+          this._scheduleSessionRebuild('inbound-rtp-stalled');
+        }
+      })
+      .finally(() => {
+        this._receiveWatchdog.sampling = false;
+      });
+  }
+
   _resetMediaSession({ notifyPeers = false, keepPeers = false } = {}) {
     try { this.videoProducer?.close(); } catch { /* ignore close errors */ }
     try { this.audioProducer?.close(); } catch { /* ignore close errors */ }
@@ -261,6 +420,9 @@ export class WebRTCManager {
     this.audioProducer = null;
     this.screenProducer = null;
     this.screenAudioProducer = null;
+    this._receiveWatchdog.lastInboundBytes = null;
+    this._receiveWatchdog.lastInboundAt = null;
+    this._receiveWatchdog.sampling = false;
 
     if (notifyPeers && !keepPeers) {
       for (const socketId of this.peers.keys()) this.onPeerRemoved?.(socketId);
@@ -963,6 +1125,8 @@ export class WebRTCManager {
       consumers: this.getConsumerReport(),
     };
 
+    this._evaluateReceiveWatchdog(payload);
+
     this.socket.timeout(1500).emit('clientTelemetry', payload, (err) => {
       if (err) return;
       this._lastTelemetryRtt = Date.now() - sentAt;
@@ -1025,7 +1189,14 @@ export class WebRTCManager {
       this.socket.connect();
       return;
     }
-    if (!this._initialized) this._scheduleSetupRetry();
+    if (!this._initialized) {
+      const setupAge = this._setupStartedAt ? Date.now() - this._setupStartedAt : 0;
+      if (this._setupInFlight && setupAge >= SETUP_WATCHDOG_MS) {
+        this._hardReconnect('server-probe-setup-stalled');
+        return;
+      }
+      this._scheduleSetupRetry();
+    }
   }
 
   disconnect() {
@@ -1033,6 +1204,11 @@ export class WebRTCManager {
     this._initialized = false;
     this._clearSetupRetry();
     this._clearSessionRebuild();
+    this._clearSetupWatchdog();
+    if (this._hardReconnectTimer) {
+      clearTimeout(this._hardReconnectTimer);
+      this._hardReconnectTimer = null;
+    }
     this._resetMediaSession({ notifyPeers: true, keepPeers: false });
     this.socket?.disconnect();
   }
