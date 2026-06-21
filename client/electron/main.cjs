@@ -14,9 +14,18 @@ let productionIndexUrl = null;
 let controlServer = null;
 let pendingRemoteConfig = null;
 
-const CONTROL_HOST = process.env.SFU_CLIENT_CONTROL_HOST || '0.0.0.0';
-const CONTROL_PORT = Number.parseInt(process.env.SFU_CLIENT_CONTROL_PORT || '39210', 10);
-const CONTROL_TOKEN = process.env.SFU_CLIENT_CONTROL_TOKEN || '';
+const CLIENT_APP_SETTINGS_FILE = 'client-app-settings.json';
+const DEFAULT_CLIENT_APP_SETTINGS = {
+  debugLogEnabled: true,
+  debugLogDir: '',
+  restartDelayMs: '0',
+  controlHost: '0.0.0.0',
+  controlPort: '39210',
+  controlToken: '',
+  notificationTone: 'glass',
+  callTone: 'signal',
+};
+const TONE_IDS = new Set(['signal', 'glass', 'chime', 'marimba', 'aurora', 'pulse']);
 const DEBUG_SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 const DEBUG_MAX_FIELD_LENGTH = 16_000;
 const DEBUG_MAX_ARRAY_LENGTH = 64;
@@ -33,8 +42,60 @@ function debugDate(date = new Date()) {
   return date.toISOString().slice(0, 10);
 }
 
+function clientAppSettingsPath() {
+  return path.join(app.getPath('userData'), CLIENT_APP_SETTINGS_FILE);
+}
+
+function sanitizeClientAppSettings(input = {}) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const restartDelay = Number.parseInt(String(raw.restartDelayMs ?? DEFAULT_CLIENT_APP_SETTINGS.restartDelayMs).trim(), 10);
+  const notificationTone = String(raw.notificationTone || '').trim();
+  const callTone = String(raw.callTone || '').trim();
+  return {
+    debugLogEnabled: raw.debugLogEnabled !== false,
+    debugLogDir: String(raw.debugLogDir || '').trim().slice(0, 1024),
+    restartDelayMs: String(Number.isInteger(restartDelay) && restartDelay >= 0 && restartDelay <= 5000 ? restartDelay : DEFAULT_CLIENT_APP_SETTINGS.restartDelayMs),
+    controlHost: String(raw.controlHost || process.env.SFU_CLIENT_CONTROL_HOST || DEFAULT_CLIENT_APP_SETTINGS.controlHost).trim().slice(0, 128) || DEFAULT_CLIENT_APP_SETTINGS.controlHost,
+    controlPort: boundedPortText(raw.controlPort || process.env.SFU_CLIENT_CONTROL_PORT || DEFAULT_CLIENT_APP_SETTINGS.controlPort, DEFAULT_CLIENT_APP_SETTINGS.controlPort),
+    controlToken: String(raw.controlToken || process.env.SFU_CLIENT_CONTROL_TOKEN || '').trim().slice(0, 512),
+    notificationTone: TONE_IDS.has(notificationTone) ? notificationTone : DEFAULT_CLIENT_APP_SETTINGS.notificationTone,
+    callTone: TONE_IDS.has(callTone) ? callTone : DEFAULT_CLIENT_APP_SETTINGS.callTone,
+  };
+}
+
+function boundedPortText(value, fallback) {
+  const port = Number.parseInt(String(value || '').trim(), 10);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return String(fallback);
+  return String(port);
+}
+
+function getControlSettings() {
+  const settings = readClientAppSettings();
+  return {
+    host: settings.controlHost,
+    port: Number.parseInt(settings.controlPort, 10),
+    token: settings.controlToken,
+  };
+}
+
+function readClientAppSettings() {
+  try {
+    return sanitizeClientAppSettings(JSON.parse(fs.readFileSync(clientAppSettingsPath(), 'utf8')));
+  } catch {
+    return sanitizeClientAppSettings(DEFAULT_CLIENT_APP_SETTINGS);
+  }
+}
+
+function writeClientAppSettings(settings) {
+  const clean = sanitizeClientAppSettings(settings);
+  fs.mkdirSync(path.dirname(clientAppSettingsPath()), { recursive: true });
+  fs.writeFileSync(clientAppSettingsPath(), JSON.stringify(clean, null, 2));
+  return clean;
+}
+
 function debugLogDir() {
-  return process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DIR || path.join(app.getPath('userData'), 'debug-logs');
+  const settings = readClientAppSettings();
+  return settings.debugLogDir || process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DIR || path.join(app.getPath('userData'), 'debug-logs');
 }
 
 function debugLogFilePath() {
@@ -61,7 +122,8 @@ function sanitizeDebugValue(value, depth = 0) {
 }
 
 function writeDebugLog(event, details = {}, severity = 'info') {
-  if (String(process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DISABLED || '').toLowerCase() === 'true') return null;
+  const settings = readClientAppSettings();
+  if (!settings.debugLogEnabled || String(process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DISABLED || '').toLowerCase() === 'true') return null;
   const file = debugLogFilePath();
   const entry = {
     ts: new Date().toISOString(),
@@ -90,16 +152,18 @@ function writeDebugLog(event, details = {}, severity = 'info') {
 
 function debugLogInfo() {
   const file = debugLogFilePath();
+  const settings = readClientAppSettings();
   return {
     sessionId: DEBUG_SESSION_ID,
     dir: path.dirname(file),
     file,
-    enabled: String(process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DISABLED || '').toLowerCase() !== 'true',
+    enabled: settings.debugLogEnabled && String(process.env.CHECKHOUSE_CLIENT_DEBUG_LOG_DISABLED || '').toLowerCase() !== 'true',
+    settingsPath: clientAppSettingsPath(),
   };
 }
 
 async function honorRestartDelay() {
-  const delayMs = Number.parseInt(process.env.SFU_RESTART_DELAY_MS || '0', 10);
+  const delayMs = Number.parseInt(readClientAppSettings().restartDelayMs || process.env.SFU_RESTART_DELAY_MS || '0', 10);
   if (Number.isFinite(delayMs) && delayMs > 0) await delay(Math.min(delayMs, 5000));
 }
 
@@ -402,15 +466,17 @@ function readJsonBody(req) {
 }
 
 function authorized(req) {
-  if (!CONTROL_TOKEN) return true;
+  const { token } = getControlSettings();
+  if (!token) return true;
   const auth = req.headers.authorization || '';
   const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  return req.headers['x-sfu-token'] === CONTROL_TOKEN || bearer === CONTROL_TOKEN;
+  return req.headers['x-sfu-token'] === token || bearer === token;
 }
 
 function startControlServer() {
-  if (!Number.isInteger(CONTROL_PORT) || CONTROL_PORT <= 0 || CONTROL_PORT > 65535) {
-    console.warn(`[Control] disabled: invalid SFU_CLIENT_CONTROL_PORT=${process.env.SFU_CLIENT_CONTROL_PORT}`);
+  const control = getControlSettings();
+  if (!Number.isInteger(control.port) || control.port <= 0 || control.port > 65535) {
+    console.warn(`[Control] disabled: invalid controlPort=${control.port}`);
     return;
   }
   if (controlServer) return;
@@ -429,7 +495,7 @@ function startControlServer() {
           packaged: app.isPackaged,
           configured: !!readRemoteConfig(),
           config: readRemoteConfig(),
-          control: { host: CONTROL_HOST, port: CONTROL_PORT, tokenRequired: !!CONTROL_TOKEN },
+          control: { host: control.host, port: control.port, tokenRequired: !!control.token },
           addresses: localAddresses(),
           debugLog: debugLogInfo(),
         });
@@ -462,8 +528,8 @@ function startControlServer() {
   controlServer.on('error', err => {
     console.error(`[Control] server error: ${err.message}`);
   });
-  controlServer.listen(CONTROL_PORT, CONTROL_HOST, () => {
-    console.log(`[Control] listening on ${CONTROL_HOST}:${CONTROL_PORT}${CONTROL_TOKEN ? ' token=required' : ' token=none'}`);
+  controlServer.listen(control.port, control.host, () => {
+    console.log(`[Control] listening on ${control.host}:${control.port}${control.token ? ' token=required' : ' token=none'}`);
   });
 }
 
@@ -560,7 +626,10 @@ app.whenReady().then(async () => {
   writeDebugLog('app.started', {
     debugLog: info,
     addresses: localAddresses(),
-    control: { host: CONTROL_HOST, port: CONTROL_PORT, tokenRequired: !!CONTROL_TOKEN },
+    control: (() => {
+      const control = getControlSettings();
+      return { host: control.host, port: control.port, tokenRequired: !!control.token };
+    })(),
   });
 
   // カメラ・マイク権限を許可
@@ -633,6 +702,18 @@ ipcMain.handle('write-debug-log', async (_event, payload = {}) => {
 });
 
 ipcMain.handle('get-debug-log-info', async () => debugLogInfo());
+ipcMain.handle('get-client-app-settings', async () => ({
+  ...readClientAppSettings(),
+  debugLog: debugLogInfo(),
+}));
+ipcMain.handle('save-client-app-settings', async (_event, settings = {}) => {
+  const saved = writeClientAppSettings(settings);
+  writeDebugLog('client.app-settings-saved', { settings: { ...saved, debugLogDir: saved.debugLogDir ? '[custom]' : '' } });
+  return {
+    ...saved,
+    debugLog: debugLogInfo(),
+  };
+});
 
 // ── 画面共有（Client内蔵）────────────────────────────────
 // screen-share 専用アプリと同じ仕組み: desktopCapturer で一覧を取得し、

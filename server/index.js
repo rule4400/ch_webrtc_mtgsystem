@@ -68,11 +68,11 @@ const APP_TYPES = ['client', 'viewer', 'screen-share', 'server', 'server-gui'];
 const APP_PLATFORMS = ['darwin', 'win32', 'linux'];
 const SERVER_APP_VERSION = serverPackage.version || '0.0.0';
 const DEFAULT_APP_VERSIONS = {
-  client: '0.2.5',
+  client: '0.2.10',
   viewer: '0.1.5',
   'screen-share': '0.1.4',
   server: SERVER_APP_VERSION,
-  'server-gui': '1.0.5',
+  'server-gui': '1.0.9',
 };
 let systemState = {
   brand: SYSTEM_NAME,
@@ -81,6 +81,10 @@ let systemState = {
   updatePackages: {},
   mediaTransport: {
     forceTcp: !!config.forceTcpMedia,
+    videoProfile: 'vpn-balanced',
+    cameraMaxBitrateKbps: 1400,
+    cameraStartBitrateKbps: 900,
+    screenMaxBitrateKbps: 1800,
   },
   updatedAt: Date.now(),
 };
@@ -389,6 +393,17 @@ function shortString(value, max = 256) {
   return String(value).slice(0, max);
 }
 
+function boundedNumber(value, min, max, fallback) {
+  const numeric = Number.parseInt(String(value ?? '').trim(), 10);
+  if (!Number.isInteger(numeric) || numeric < min || numeric > max) return fallback;
+  return numeric;
+}
+
+function videoProfileText(value) {
+  const raw = String(value || '').trim();
+  return ['stable', 'vpn-balanced', 'high', 'fhd'].includes(raw) ? raw : 'vpn-balanced';
+}
+
 function sanitizeClientInstanceId(value) {
   return shortString(value, 128).trim().replace(/[^a-zA-Z0-9:_-]/g, '').slice(0, 96);
 }
@@ -499,6 +514,10 @@ function sanitizeSystemStatePatch(patch) {
     forceTcp: raw.mediaTransport == null
       ? !!systemState.mediaTransport?.forceTcp
       : !!asObject(raw.mediaTransport).forceTcp,
+    videoProfile: videoProfileText(asObject(raw.mediaTransport).videoProfile || systemState.mediaTransport?.videoProfile || 'vpn-balanced'),
+    cameraMaxBitrateKbps: boundedNumber(asObject(raw.mediaTransport).cameraMaxBitrateKbps, 200, 6000, systemState.mediaTransport?.cameraMaxBitrateKbps || 1400),
+    cameraStartBitrateKbps: boundedNumber(asObject(raw.mediaTransport).cameraStartBitrateKbps, 150, 4000, systemState.mediaTransport?.cameraStartBitrateKbps || 900),
+    screenMaxBitrateKbps: boundedNumber(asObject(raw.mediaTransport).screenMaxBitrateKbps, 300, 8000, systemState.mediaTransport?.screenMaxBitrateKbps || 1800),
   };
 
   return {
@@ -1511,6 +1530,10 @@ io.on('connection', async socket => {
     safeCallback(callback, {
       iceServers: config.iceServers || [],
       forceTcpMedia: isForceTcpMediaEnabled(),
+      mediaTransport: {
+        ...systemState.mediaTransport,
+        forceTcp: isForceTcpMediaEnabled(),
+      },
     });
   });
 

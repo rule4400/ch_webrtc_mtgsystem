@@ -1,0 +1,10 @@
+{
+  "name": "checkhouse-meeting-system",
+  "private": true,
+  "version": "1.0.9",
+  "scripts": {
+    "package:mac": "node tools/package-all.cjs mac",
+    "package:win": "node tools/package-all.cjs win",
+    "package:all": "node tools/package-all.cjs all"
+  }
+}

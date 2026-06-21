@@ -1,7 +1,10 @@
 const { app, BrowserWindow, ipcMain, session, shell } = require('electron');
 const { spawn } = require('child_process');
+const fs = require('fs');
+const http = require('http');
+const https = require('https');
 const path = require('path');
-const { pathToFileURL } = require('url');
+const { pathToFileURL, URL } = require('url');
 const { readWindowState, trackWindowState, applyWindowState } = require('./window-state.cjs');
 
 let mainWindow;
@@ -56,6 +59,124 @@ function loadProductionApp() {
   const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
   productionIndexUrl = pathToFileURL(indexPath).toString();
   return mainWindow.loadURL(productionIndexUrl);
+}
+
+function updateCacheDir() {
+  return path.join(app.getPath('userData'), 'update-cache');
+}
+
+function safeUpdateFileName(url, fallback = 'update-package') {
+  try {
+    const parsed = new URL(url);
+    const base = path.basename(decodeURIComponent(parsed.pathname || '')) || fallback;
+    return base.replace(/[\\/:*?"<>|]/g, '_').slice(0, 180) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function downloadFile(url, destination) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const transport = parsed.protocol === 'https:' ? https : http;
+    const request = transport.get(parsed, response => {
+      if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+        response.resume();
+        const redirect = new URL(response.headers.location, parsed).toString();
+        downloadFile(redirect, destination).then(resolve, reject);
+        return;
+      }
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        response.resume();
+        reject(new Error(`download failed: HTTP ${response.statusCode}`));
+        return;
+      }
+      fs.mkdirSync(path.dirname(destination), { recursive: true });
+      const file = fs.createWriteStream(destination);
+      response.pipe(file);
+      file.on('finish', () => file.close(() => resolve(destination)));
+      file.on('error', reject);
+    });
+    request.on('error', reject);
+  });
+}
+
+async function downloadUpdatePackage(packageInfo = {}) {
+  const url = String(packageInfo.url || '').trim();
+  if (!/^https?:\/\//i.test(url)) throw new Error('invalid update url');
+  const fileName = safeUpdateFileName(url, packageInfo.fileName || 'update-package');
+  const destination = path.join(updateCacheDir(), fileName);
+  await downloadFile(url, destination);
+  const stat = fs.statSync(destination);
+  return { ok: true, fileName, path: destination, size: stat.size, downloadedAt: Date.now() };
+}
+
+function quoteShell(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function writeTempScript(name, content, extension = process.platform === 'win32' ? 'cmd' : 'sh') {
+  const scriptPath = path.join(app.getPath('temp'), `${name}-${Date.now()}.${extension}`);
+  fs.writeFileSync(scriptPath, content);
+  if (extension === 'sh') fs.chmodSync(scriptPath, 0o755);
+  return scriptPath;
+}
+
+async function installUpdatePackage(payload = {}) {
+  const installerPath = String(payload.path || payload.filePath || '').trim();
+  if (!installerPath || !fs.existsSync(installerPath)) throw new Error('update package not found');
+  const ext = path.extname(installerPath).toLowerCase();
+
+  if (process.platform === 'win32') {
+    const installerCmd = ext === '.msi'
+      ? `msiexec /i "${installerPath}" /qn`
+      : `"${installerPath}" /S`;
+    const script = writeTempScript('checkhouse-update', [
+      '@echo off',
+      'timeout /t 2 /nobreak >nul',
+      installerCmd,
+      'timeout /t 1 /nobreak >nul',
+      `start "" "${process.execPath}"`,
+    ].join('\r\n'));
+    spawn('cmd.exe', ['/c', script], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    app.exit(0);
+    return { ok: true, installing: true };
+  }
+
+  if (process.platform === 'darwin') {
+    const mountDir = path.join(app.getPath('temp'), `checkhouse-update-mount-${Date.now()}`);
+    const scriptLines = [
+      '#!/bin/sh',
+      'set -e',
+      `while kill -0 ${process.pid} 2>/dev/null; do sleep 1; done`,
+      `mkdir -p ${quoteShell(mountDir)}`,
+    ];
+    if (ext === '.dmg') {
+      scriptLines.push(
+        `hdiutil attach ${quoteShell(installerPath)} -mountpoint ${quoteShell(mountDir)} -nobrowse -quiet`,
+        `APP_PATH=$(find ${quoteShell(mountDir)} -maxdepth 2 -name "*.app" -type d | head -n 1)`,
+        'if [ -z "$APP_PATH" ]; then hdiutil detach ' + quoteShell(mountDir) + ' -quiet || true; exit 1; fi',
+        'DEST="/Applications/$(basename "$APP_PATH")"',
+        'rm -rf "$DEST"',
+        'ditto "$APP_PATH" "$DEST"',
+        `hdiutil detach ${quoteShell(mountDir)} -quiet || true`,
+        'open "$DEST"',
+      );
+    } else if (ext === '.pkg') {
+      scriptLines.push(
+        `installer -pkg ${quoteShell(installerPath)} -target /`,
+        `open ${quoteShell(process.execPath)}`,
+      );
+    } else {
+      throw new Error(`unsupported macOS update package: ${ext}`);
+    }
+    const script = writeTempScript('checkhouse-update', scriptLines.join('\n'), 'sh');
+    spawn('/bin/sh', [script], { detached: true, stdio: 'ignore' }).unref();
+    app.exit(0);
+    return { ok: true, installing: true };
+  }
+
+  throw new Error(`unsupported update platform: ${process.platform}`);
 }
 
 function createWindow() {
@@ -156,6 +277,24 @@ ipcMain.handle('open-external', async (_event, url) => {
   if (!/^https?:\/\//i.test(target)) throw new Error('invalid update url');
   await shell.openExternal(target);
   return true;
+});
+
+ipcMain.handle('download-update-package', async (_event, packageInfo) => {
+  return downloadUpdatePackage(packageInfo || {});
+});
+
+ipcMain.handle('open-downloaded-update', async (_event, filePath) => {
+  const target = String(filePath || '');
+  const root = updateCacheDir();
+  if (!target || !path.resolve(target).startsWith(`${root}${path.sep}`) || !fs.existsSync(target)) {
+    throw new Error('downloaded update not found');
+  }
+  await shell.openPath(target);
+  return true;
+});
+
+ipcMain.handle('install-update-package', async (_event, payload) => {
+  return installUpdatePackage(payload || {});
 });
 
 ipcMain.on('quick-restart-result', (_event, result) => {

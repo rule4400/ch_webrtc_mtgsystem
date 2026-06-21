@@ -2,19 +2,39 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Download, Monitor, MonitorUp, RefreshCw, Settings, Square, Volume2, X } from 'lucide-react';
 import { ScreenShareWebRTCManager } from './services/screen-share-webrtc';
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.1.4';
 const APP_TYPE = 'screen-share';
 const DEFAULT_CONFIG = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
   displayName: '画面共有',
 };
+const SCREEN_SHARE_INSTANCE_ID_KEY = 'sfu_screen_share_instance_id';
 const DEFAULT_SYSTEM_STATE = {
   brand: 'CHECKHOUSE Meeting System',
   channels: [{ id: 'general', name: '一般' }],
   latestVersions: { [APP_TYPE]: APP_VERSION },
   updatePackages: {},
 };
+
+function createInstanceId(prefix) {
+  const random = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  return `${prefix}:${random}`;
+}
+
+function getOrCreateInstanceId(storageKey, prefix) {
+  try {
+    const saved = localStorage.getItem(storageKey);
+    if (saved) return saved;
+    const next = createInstanceId(prefix);
+    localStorage.setItem(storageKey, next);
+    return next;
+  } catch {
+    return createInstanceId(prefix);
+  }
+}
 
 function sanitizeConfig(input) {
   const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
@@ -102,9 +122,9 @@ async function getDisplayStream(source, withAudio) {
   return navigator.mediaDevices.getDisplayMedia({
     audio: !!withAudio,
     video: {
-      frameRate: { ideal: 30, max: 30 },
-      width: { ideal: 1920, max: 1920 },
-      height: { ideal: 1080, max: 1080 },
+      frameRate: { ideal: 10, max: 10 },
+      width: { ideal: 1280, max: 1280 },
+      height: { ideal: 720, max: 720 },
     },
   });
 }
@@ -126,15 +146,19 @@ export default function App() {
   const [sharing, setSharing] = useState(false);
   const [systemState, setSystemState] = useState(DEFAULT_SYSTEM_STATE);
   const [updateNotice, setUpdateNotice] = useState(null);
+  const [updateDownload, setUpdateDownload] = useState(null);
 
   const managerRef = useRef(null);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const stateRef = useRef({});
   const refreshInFlightRef = useRef(null);
+  const updateDownloadKeyRef = useRef('');
 
-  const updatePackage = systemState.updatePackages?.[APP_TYPE] || null;
-  const latestVersion = systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
+  const currentPlatform = window.electronAPI?.platform || '';
+  const rawUpdatePackage = systemState.updatePackages?.[APP_TYPE] || null;
+  const updatePackage = rawUpdatePackage?.platforms?.[currentPlatform] || rawUpdatePackage;
+  const latestVersion = updatePackage?.version || systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
   const updateAvailable = latestVersion && latestVersion !== APP_VERSION;
   const selectedSource = useMemo(() => sources.find(source => source.id === selectedSourceId) || sources[0] || null, [sources, selectedSourceId]);
 
@@ -280,7 +304,11 @@ export default function App() {
     manager.onSystemStateUpdated = state => setSystemState({ ...DEFAULT_SYSTEM_STATE, ...state });
     manager.onUpdateCommand = payload => setUpdateNotice(payload);
 
-    await manager.connect(serverUrl(nextConfig), nextConfig.displayName, { appVersion: APP_VERSION });
+    await manager.connect(serverUrl(nextConfig), nextConfig.displayName, {
+      appVersion: APP_VERSION,
+      clientInstanceId: getOrCreateInstanceId(SCREEN_SHARE_INSTANCE_ID_KEY, APP_TYPE),
+      platform: window.electronAPI?.platform || '',
+    });
     setStatus('connected');
   }, [config, releaseRuntime]);
 
@@ -360,10 +388,34 @@ export default function App() {
   }, [connect, settingsDraft]);
 
   const openUpdate = useCallback(() => {
+    if (updateDownload?.path && updateDownload.status === 'ready') {
+      window.electronAPI?.openDownloadedUpdate?.(updateDownload.path);
+      return;
+    }
     const url = updateNotice?.packageInfo?.url || updatePackage?.url;
     if (!url) return;
     window.electronAPI?.openExternal?.(url);
-  }, [updateNotice, updatePackage]);
+  }, [updateDownload, updateNotice, updatePackage]);
+
+  useEffect(() => {
+    const packageInfo = updateNotice?.packageInfo || updatePackage;
+    if (!updateAvailable || !packageInfo?.url || !window.electronAPI?.downloadUpdatePackage) return;
+    const key = `${packageInfo.version || latestVersion}:${packageInfo.url}`;
+    if (updateDownloadKeyRef.current === key) return;
+    updateDownloadKeyRef.current = key;
+    let cancelled = false;
+    setUpdateDownload({ status: 'downloading', packageInfo });
+    window.electronAPI.downloadUpdatePackage(packageInfo)
+      .then(result => {
+        if (cancelled) return;
+        setUpdateDownload({ status: 'ready', packageInfo, ...result });
+      })
+      .catch(err => {
+        console.warn('[updateDownload]', err.message);
+        if (!cancelled) setUpdateDownload({ status: 'error', packageInfo, error: err.message });
+      });
+    return () => { cancelled = true; };
+  }, [latestVersion, updateAvailable, updateNotice, updatePackage]);
 
   useEffect(() => {
     const sendTelemetry = () => {
@@ -447,7 +499,12 @@ export default function App() {
 
         <div className="sidebar-bottom">
           {updateAvailable && (
-            <button className="update-btn" onClick={openUpdate} disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url}>
+            <button
+              className="update-btn"
+              onClick={openUpdate}
+              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url && updateDownload?.status !== 'ready'}
+              title={updateDownload?.status === 'ready' ? 'ダウンロード済みアップデートを開く' : 'アップデート'}
+            >
               <Download size={15} />
               <span>v{latestVersion}</span>
             </button>

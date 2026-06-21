@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Download, Hash, MicOff, MonitorPlay, Settings, Volume2, VolumeX, VideoOff } from 'lucide-react';
 import { ViewerWebRTCManager } from '../services/viewer-webrtc';
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.1.5';
 const APP_TYPE = 'viewer';
 const DEFAULT_SYSTEM_STATE = {
   brand: 'CHECKHOUSE Meeting System',
@@ -44,6 +44,26 @@ const defaultViewerConfig = {
   viewerName: '閲覧端末',
 };
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
+const VIEWER_INSTANCE_ID_KEY = 'sfu_viewer_instance_id';
+
+function createInstanceId(prefix) {
+  const random = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  return `${prefix}:${random}`;
+}
+
+function getOrCreateInstanceId(storageKey, prefix) {
+  try {
+    const saved = localStorage.getItem(storageKey);
+    if (saved) return saved;
+    const next = createInstanceId(prefix);
+    localStorage.setItem(storageKey, next);
+    return next;
+  } catch {
+    return createInstanceId(prefix);
+  }
+}
 
 async function connectWithinStartupWindow(manager, serverUrl, viewerName, options = {}) {
   let timedOut = false;
@@ -219,6 +239,7 @@ export default function ViewerView() {
   const [settingsDraft, setSettingsDraft] = useState(() => sanitizeViewerConfig(loadViewerConfig()));
   const [systemState, setSystemState] = useState(DEFAULT_SYSTEM_STATE);
   const [updateNotice, setUpdateNotice] = useState(null);
+  const [updateDownload, setUpdateDownload] = useState(null);
 
   const managerRef = useRef(null);
   const configRef = useRef({});
@@ -228,12 +249,15 @@ export default function ViewerView() {
   const quickRestartInFlightRef = useRef(false);
   const quickRestartHandlerRef = useRef(null);
   const serverProbeInFlightRef = useRef(false);
+  const updateDownloadKeyRef = useRef('');
 
   const channels = Array.isArray(systemState.channels) && systemState.channels.length
     ? systemState.channels
     : DEFAULT_SYSTEM_STATE.channels;
-  const updatePackage = systemState.updatePackages?.[APP_TYPE] || null;
-  const latestVersion = systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
+  const currentPlatform = window.electronAPI?.platform || '';
+  const rawUpdatePackage = systemState.updatePackages?.[APP_TYPE] || null;
+  const updatePackage = rawUpdatePackage?.platforms?.[currentPlatform] || rawUpdatePackage;
+  const latestVersion = updatePackage?.version || systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
   const updateAvailable = latestVersion && latestVersion !== APP_VERSION;
 
   const refreshAudioOutputs = useCallback(async (preferredId = null) => {
@@ -340,6 +364,8 @@ export default function ViewerView() {
     const serverUrl = serverUrlFromViewerConfig(config);
     const connectionState = await connectWithinStartupWindow(manager, serverUrl, config.viewerName, {
       appVersion: APP_VERSION,
+      clientInstanceId: getOrCreateInstanceId(VIEWER_INSTANCE_ID_KEY, APP_TYPE),
+      platform: window.electronAPI?.platform || '',
     });
     setStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     setError(null);
@@ -491,10 +517,34 @@ export default function ViewerView() {
   }, [settingsDraft]);
 
   const openUpdate = useCallback(() => {
+    if (updateDownload?.path && updateDownload.status === 'ready') {
+      window.electronAPI?.openDownloadedUpdate?.(updateDownload.path);
+      return;
+    }
     const url = updateNotice?.packageInfo?.url || updatePackage?.url;
     if (!url) return;
     window.electronAPI?.openExternal?.(url);
-  }, [updateNotice, updatePackage]);
+  }, [updateDownload, updateNotice, updatePackage]);
+
+  useEffect(() => {
+    const packageInfo = updateNotice?.packageInfo || updatePackage;
+    if (!updateAvailable || !packageInfo?.url || !window.electronAPI?.downloadUpdatePackage) return;
+    const key = `${packageInfo.version || latestVersion}:${packageInfo.url}`;
+    if (updateDownloadKeyRef.current === key) return;
+    updateDownloadKeyRef.current = key;
+    let cancelled = false;
+    setUpdateDownload({ status: 'downloading', packageInfo });
+    window.electronAPI.downloadUpdatePackage(packageInfo)
+      .then(result => {
+        if (cancelled) return;
+        setUpdateDownload({ status: 'ready', packageInfo, ...result });
+      })
+      .catch(err => {
+        console.warn('[updateDownload]', err.message);
+        if (!cancelled) setUpdateDownload({ status: 'error', packageInfo, error: err.message });
+      });
+    return () => { cancelled = true; };
+  }, [latestVersion, updateAvailable, updateNotice, updatePackage]);
 
   useEffect(() => {
     adminHandlersRef.current = {
@@ -621,8 +671,8 @@ export default function ViewerView() {
               type="button"
               className="update-mini"
               onClick={openUpdate}
-              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url}
-              title="アップデート"
+              disabled={!updatePackage?.url && !updateNotice?.packageInfo?.url && updateDownload?.status !== 'ready'}
+              title={updateDownload?.status === 'ready' ? 'ダウンロード済みアップデートを開く' : 'アップデート'}
             >
               <Download size={14} />
               <span>v{latestVersion}</span>

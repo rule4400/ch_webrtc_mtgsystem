@@ -1,6 +1,6 @@
 {
   "name": "checkhouse-meeting-server-gui",
-  "version": "1.0.5",
+  "version": "1.0.9",
   "description": "CHECKHOUSE Meeting System server controller",
   "main": "main.cjs",
   "scripts": {

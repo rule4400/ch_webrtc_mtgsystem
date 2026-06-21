@@ -13,15 +13,90 @@
 import { io } from 'socket.io-client';
 import * as mediasoupClient from 'mediasoup-client';
 
-const CAMERA_ENCODINGS = [
-  { rid: 'r0', maxBitrate: 80_000, scaleResolutionDownBy: 4 },
-  { rid: 'r1', maxBitrate: 220_000, scaleResolutionDownBy: 2 },
-  { rid: 'r2', maxBitrate: 450_000 },
-];
-const SCREEN_SHARE_ENCODINGS = [
-  { rid: 'r0', maxBitrate: 180_000, scaleResolutionDownBy: 2 },
-  { rid: 'r1', maxBitrate: 700_000 },
-];
+const MEDIA_QUALITY_PROFILES = {
+  stable: {
+    width: 640,
+    height: 360,
+    frameRate: 15,
+    cameraMaxBitrate: 650_000,
+    cameraStartBitrate: 450,
+    screenMaxBitrate: 900_000,
+  },
+  'vpn-balanced': {
+    width: 960,
+    height: 540,
+    frameRate: 24,
+    cameraMaxBitrate: 1_400_000,
+    cameraStartBitrate: 900,
+    screenMaxBitrate: 1_800_000,
+  },
+  high: {
+    width: 1280,
+    height: 720,
+    frameRate: 30,
+    cameraMaxBitrate: 2_500_000,
+    cameraStartBitrate: 1200,
+    screenMaxBitrate: 3_000_000,
+  },
+  fhd: {
+    width: 1920,
+    height: 1080,
+    frameRate: 30,
+    cameraMaxBitrate: 4_500_000,
+    cameraStartBitrate: 1800,
+    screenMaxBitrate: 5_000_000,
+  },
+};
+
+function clampNumber(value, min, max, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function normalizeMediaQuality(config = {}) {
+  const raw = config?.mediaTransport && typeof config.mediaTransport === 'object'
+    ? config.mediaTransport
+    : {};
+  const profileName = ['stable', 'vpn-balanced', 'high', 'fhd'].includes(raw.videoProfile)
+    ? raw.videoProfile
+    : 'vpn-balanced';
+  const profile = MEDIA_QUALITY_PROFILES[profileName];
+  return {
+    profile: profileName,
+    width: profile.width,
+    height: profile.height,
+    frameRate: profile.frameRate,
+    cameraMaxBitrate: Math.round(clampNumber(raw.cameraMaxBitrateKbps, 200, 6000, profile.cameraMaxBitrate / 1000) * 1000),
+    cameraStartBitrate: Math.round(clampNumber(raw.cameraStartBitrateKbps, 150, 4000, profile.cameraStartBitrate)),
+    screenMaxBitrate: Math.round(clampNumber(raw.screenMaxBitrateKbps, 300, 8000, profile.screenMaxBitrate / 1000) * 1000),
+  };
+}
+
+function cameraEncodingsForQuality(quality) {
+  const max = quality.cameraMaxBitrate;
+  return [
+    { rid: 'r0', maxBitrate: Math.round(max * 0.18), scaleResolutionDownBy: 4 },
+    { rid: 'r1', maxBitrate: Math.round(max * 0.45), scaleResolutionDownBy: 2 },
+    { rid: 'r2', maxBitrate: max },
+  ];
+}
+
+function screenEncodingsForQuality(quality) {
+  const max = quality.screenMaxBitrate;
+  return [
+    { rid: 'r0', maxBitrate: Math.round(max * 0.35), scaleResolutionDownBy: 2 },
+    { rid: 'r1', maxBitrate: max },
+  ];
+}
+
+function isTransportReadyState(state) {
+  return ['connected', 'completed'].includes(String(state || '').toLowerCase());
+}
+
+function isTransportTerminalState(state) {
+  return ['failed', 'closed'].includes(String(state || '').toLowerCase());
+}
 
 function statsItems(stats) {
   if (!stats || typeof stats.values !== 'function') return [];
@@ -174,11 +249,12 @@ export class WebRTCManager {
 
     this.iceServers      = [];     // サーバーから取得
     this.forceTcpMedia   = false;
+    this.mediaQuality    = normalizeMediaQuality();
     this._initialized    = false;
     this._pendingQueue   = [];     // 初期化前に届いた newProducer
     this._locationName   = '';
     this._channelId      = 'general';
-    this._appVersion     = '0.2.5';
+    this._appVersion     = '0.2.10';
     this._clientInstanceId = '';
     this._platform       = '';
     this._manualDisconnect = false;
@@ -201,7 +277,7 @@ export class WebRTCManager {
     this.onAdminSetDevice   = null;  // ({ kind, deviceId }) => Promise
     this.onAdminSetMediaState = null; // ({ kind, enabled }) => Promise
     this.onAdminRefreshDevices = null; // () => Promise
-    this.onConnectionChange = null;  // (connected: bool) => void
+    this.onConnectionChange = null;  // (connected: bool, health?: object) => void
     this.onViewerPresenceChange = null; // (active: bool) => void
     this.onSystemStateUpdated = null; // (state) => void
     this.onPeerChannelChanged = null; // (payload) => void
@@ -242,7 +318,7 @@ export class WebRTCManager {
   connect(serverUrl, locationName, options = {}) {
     this._locationName = locationName;
     this._channelId = options.channelId || this._channelId || 'general';
-    this._appVersion = options.appVersion || this._appVersion || '0.2.5';
+    this._appVersion = options.appVersion || this._appVersion || '0.2.10';
     this._clientInstanceId = options.clientInstanceId || this._clientInstanceId || '';
     this._platform = options.platform || this._platform || '';
     this._manualDisconnect = false;
@@ -294,7 +370,7 @@ export class WebRTCManager {
         } catch (err) {
           console.error('[WebRTC] connect setup failed', err);
           this._debugLog('session.setup-error', { error: err.message, stack: err.stack }, 'error');
-          this.onConnectionChange?.(false);
+          this.onConnectionChange?.(false, this.getConnectionHealth('setup-error'));
           this._scheduleSetupRetry();
           rejectOnce(err);
         }
@@ -304,7 +380,7 @@ export class WebRTCManager {
         console.warn('[WebRTC] connect_error:', err.message);
         this._debugLog('socket.connect-error', { error: err.message, stack: err.stack }, 'error');
         this._initialized = false;
-        this.onConnectionChange?.(false);
+        this.onConnectionChange?.(false, this.getConnectionHealth('socket-connect-error'));
       });
 
       this.socket.on('disconnect', (reason) => {
@@ -314,7 +390,7 @@ export class WebRTCManager {
         this._initialized = false;
         this._clearSetupRetry();
         this._resetMediaSession({ notifyPeers: true, keepPeers: false });
-        this.onConnectionChange?.(false);
+        this.onConnectionChange?.(false, this.getConnectionHealth(`socket-disconnect:${reason}`));
         if (!this._manualDisconnect && reason === 'io server disconnect') {
           setTimeout(() => this.socket?.connect(), 2000);
         }
@@ -322,7 +398,7 @@ export class WebRTCManager {
 
       this.socket.io.on('reconnect_attempt', () => {
         this._debugLog('socket.reconnect-attempt', {});
-        if (!this._manualDisconnect) this.onConnectionChange?.(false);
+        if (!this._manualDisconnect) this.onConnectionChange?.(false, this.getConnectionHealth('socket-reconnect-attempt'));
       });
 
       this.socket.io.on('reconnect', () => {
@@ -354,10 +430,39 @@ export class WebRTCManager {
 
   _applyMediaTransportConfig(config, reason = 'server-config') {
     const nextForceTcp = this._extractForceTcpMedia(config);
-    if (nextForceTcp == null || nextForceTcp === this.forceTcpMedia) return false;
-    this.forceTcpMedia = nextForceTcp;
-    console.warn(`[WebRTC] media transport mode changed reason=${reason} forceTcp=${this.forceTcpMedia}`);
-    return true;
+    let changed = false;
+    if (nextForceTcp != null && nextForceTcp !== this.forceTcpMedia) {
+      this.forceTcpMedia = nextForceTcp;
+      console.warn(`[WebRTC] media transport mode changed reason=${reason} forceTcp=${this.forceTcpMedia}`);
+      changed = true;
+    }
+    const nextQuality = normalizeMediaQuality(config);
+    const previousQuality = this.mediaQuality || normalizeMediaQuality();
+    const qualityChanged = JSON.stringify(nextQuality) !== JSON.stringify(previousQuality);
+    if (qualityChanged) {
+      this.mediaQuality = nextQuality;
+      this._applyLocalVideoQuality(reason).catch(err => {
+        this._debugLog('media-quality.apply-error', { reason, error: err.message }, 'warn');
+      });
+      changed = true;
+    }
+    return changed;
+  }
+
+  async _applyLocalVideoQuality(reason = 'quality-config') {
+    const track = this.localVideoTrack;
+    if (!track || track.readyState !== 'live') return;
+    const quality = this.mediaQuality || normalizeMediaQuality();
+    try {
+      await track.applyConstraints({
+        width: { ideal: quality.width, max: quality.width },
+        height: { ideal: quality.height, max: quality.height },
+        frameRate: { ideal: quality.frameRate, max: quality.frameRate },
+      });
+      this._debugLog('media-quality.track-constraints-applied', { reason, quality });
+    } catch (err) {
+      this._debugLog('media-quality.track-constraints-failed', { reason, quality, error: err.message }, 'warn');
+    }
   }
 
   /** 接続/再接続のたびに呼ぶ: device→transport→既存consume→ローカルreproduceを再構築 */
@@ -383,7 +488,7 @@ export class WebRTCManager {
       // ローカルトラックを（再）produce
       await this._reproduceLocal();
 
-      this.onConnectionChange?.(true);
+      this.onConnectionChange?.(true, this.getConnectionHealth('setup-complete'));
       await this.syncPeers();
       this._debugLog('session.setup-complete', {
         sendTransportId: this.sendTransport?.id || '',
@@ -418,7 +523,7 @@ export class WebRTCManager {
       } catch (err) {
         console.error('[WebRTC] setup retry failed', err);
         this._debugLog('session.setup-retry-error', { error: err.message, stack: err.stack }, 'error');
-        this.onConnectionChange?.(false);
+        this.onConnectionChange?.(false, this.getConnectionHealth('setup-retry-error'));
         this._scheduleSetupRetry();
       }
     }, delay);
@@ -435,9 +540,15 @@ export class WebRTCManager {
     this._sessionRebuildTimer = setTimeout(async () => {
       this._sessionRebuildTimer = null;
       if (this._manualDisconnect || !this.socket?.connected) return;
+      const health = this.getConnectionHealth(reason);
+      if (health.status === 'connected') {
+        this._debugLog('session.rebuild-skipped', { reason, health });
+        return;
+      }
       console.warn(`[WebRTC] rebuilding media session reason=${reason}`);
       this._debugLog('session.rebuild-start', { reason }, 'warn');
       this._initialized = false;
+      this.onConnectionChange?.(false, this.getConnectionHealth(`rebuilding:${reason}`));
       this._resetMediaSession({ keepPeers: true });
       try {
         await this._setupSession();
@@ -445,7 +556,7 @@ export class WebRTCManager {
       } catch (err) {
         console.error('[WebRTC] session rebuild failed', err);
         this._debugLog('session.rebuild-error', { reason, error: err.message, stack: err.stack }, 'error');
-        this.onConnectionChange?.(false);
+        this.onConnectionChange?.(false, this.getConnectionHealth(`rebuild-error:${reason}`));
         this._scheduleSetupRetry();
       }
     }, 2500);
@@ -584,7 +695,7 @@ export class WebRTCManager {
       this._clearSetupRetry();
       this._clearSessionRebuild();
       this._resetMediaSession({ notifyPeers: true, keepPeers: false });
-      this.onConnectionChange?.(false);
+      this.onConnectionChange?.(false, this.getConnectionHealth('instance-replaced'));
       this.socket?.disconnect();
     });
 
@@ -651,7 +762,7 @@ export class WebRTCManager {
         this._setupRetryDelay = 1000;
       } catch (err) {
         console.error('[WebRTC] media layer rebuild failed', err);
-        this.onConnectionChange?.(false);
+        this.onConnectionChange?.(false, this.getConnectionHealth('media-layer-rebuild-error'));
         this._scheduleSetupRetry();
       }
     });
@@ -690,6 +801,7 @@ export class WebRTCManager {
       this._debugLog('server.config', {
         iceServersConfigured: this.iceServers.length,
         forceTcpMedia: this.forceTcpMedia,
+        mediaQuality: this.mediaQuality,
       });
     } catch {
       // Older server versions did not expose this optional event.
@@ -806,11 +918,22 @@ export class WebRTCManager {
 
     const timer = setTimeout(() => {
       this._iceRestartTimers.delete(transport.id);
+      if (this._manualDisconnect || !this.socket?.connected) return;
+      if (transport.closed || isTransportReadyState(transport.connectionState)) {
+        this._debugLog('transport.ice-restart-skipped', {
+          label,
+          transportId: transport.id,
+          state: transport.connectionState,
+        });
+        return;
+      }
       this._debugLog('transport.ice-restart-start', { label, transportId: transport.id, delayMs: delay }, 'warn');
       this._restartTransportIce(transport).catch(err => {
         console.warn(`[${label} restartIce]`, err.message);
         this._debugLog('transport.ice-restart-error', { label, transportId: transport.id, error: err.message }, 'error');
-        this._scheduleSessionRebuild(`${label}-ice-restart-failed`);
+        if (!isTransportReadyState(transport.connectionState)) {
+          this._scheduleSessionRebuild(`${label}-ice-restart-failed`);
+        }
       });
     }, delay);
     this._iceRestartTimers.set(transport.id, timer);
@@ -834,6 +957,7 @@ export class WebRTCManager {
   async _reproduceLocal() {
     if (!this.sendTransport) return;
     if (this.localVideoTrack) {
+      await this._applyLocalVideoQuality('before-produce');
       this.videoProducer = await this._produceTrack(this.localVideoTrack, 'video');
       if (!this.camEnabled) await this._pauseProducer(this.videoProducer);
     }
@@ -858,8 +982,9 @@ export class WebRTCManager {
       },
     };
     if (kind === 'video') {
-      params.encodings = CAMERA_ENCODINGS;
-      params.codecOptions = { videoGoogleStartBitrate: 250 };
+      params.encodings = cameraEncodingsForQuality(this.mediaQuality);
+      params.codecOptions = { videoGoogleStartBitrate: this.mediaQuality.cameraStartBitrate };
+      params.degradationPreference = 'maintain-framerate';
     } else if (kind === 'audio') {
       params.codecOptions = {
         opusStereo: false,
@@ -1004,8 +1129,9 @@ export class WebRTCManager {
         label: this.screenLabel || '画面共有',
         channelId: this._channelId,
       },
-      encodings: SCREEN_SHARE_ENCODINGS,
-      codecOptions: { videoGoogleStartBitrate: 500 },
+      encodings: screenEncodingsForQuality(this.mediaQuality),
+      codecOptions: { videoGoogleStartBitrate: Math.max(500, Math.round(this.mediaQuality.cameraStartBitrate * 0.8)) },
+      degradationPreference: 'maintain-resolution',
     });
     this.screenProducer.on('transportclose', () => { this.screenProducer = null; });
     this.screenProducer.on('trackended', () => {
@@ -1413,6 +1539,39 @@ export class WebRTCManager {
       sendClosed: !!this.sendTransport?.closed,
       recvClosed: !!this.recvTransport?.closed,
     };
+  }
+
+  getConnectionHealth(reason = '') {
+    const socketConnected = !!this.socket?.connected;
+    const sendState = this.sendTransport?.connectionState || 'none';
+    const recvState = this.recvTransport?.connectionState || 'none';
+    const sendClosed = !!this.sendTransport?.closed;
+    const recvClosed = !!this.recvTransport?.closed;
+    const initialized = !!this._initialized;
+    const socketId = this.socket?.id || this._selfSocketId || '';
+    const base = {
+      reason,
+      socketConnected,
+      initialized,
+      socketId,
+      sendState,
+      recvState,
+      sendClosed,
+      recvClosed,
+      setupInFlight: !!this._setupInFlight,
+      setupRetryPending: !!this._setupRetryTimer,
+      sessionRebuildPending: !!this._sessionRebuildTimer,
+    };
+
+    if (!socketConnected) return { ...base, status: 'disconnected' };
+    if (!initialized || this._setupInFlight || this._setupRetryTimer) return { ...base, status: 'connecting' };
+    if (sendClosed || recvClosed || isTransportTerminalState(sendState) || isTransportTerminalState(recvState)) {
+      return { ...base, status: 'unstable' };
+    }
+    if (!isTransportReadyState(sendState) || !isTransportReadyState(recvState)) {
+      return { ...base, status: 'unstable' };
+    }
+    return { ...base, status: 'connected' };
   }
 
   getConsumerReport() {

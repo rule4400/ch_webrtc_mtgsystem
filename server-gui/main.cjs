@@ -49,15 +49,33 @@ const DEFAULT_SYSTEM_SETTINGS = {
     { id: 'support', name: 'サポート' },
   ],
   latestVersions: {
-    client: '0.2.5',
+    client: '0.2.10',
     viewer: '0.1.5',
     'screen-share': '0.1.4',
-    server: '1.1.5',
-    'server-gui': '1.0.5',
+    server: '1.1.8',
+    'server-gui': '1.0.9',
   },
   updatePackages: {},
+  serverRuntime: {
+    announcedIp: '',
+    listenPort: '3000',
+    rtcMinPort: '10000',
+    rtcMaxPort: '10200',
+    stunUrls: '',
+    turnUrls: '',
+    turnUser: '',
+    turnPass: '',
+    debugLogEnabled: true,
+    debugLogDir: '',
+    statsIntervalMs: '1000',
+    vpnBandwidthMbps: '200',
+  },
   mediaTransport: {
     forceTcp: false,
+    videoProfile: 'vpn-balanced',
+    cameraMaxBitrateKbps: '1400',
+    cameraStartBitrateKbps: '900',
+    screenMaxBitrateKbps: '1800',
   },
   updateFolder: '',
 };
@@ -272,6 +290,9 @@ function sanitizeSystemSettings(input = {}) {
   const rawMediaTransport = raw.mediaTransport && typeof raw.mediaTransport === 'object'
     ? raw.mediaTransport
     : {};
+  const rawServerRuntime = raw.serverRuntime && typeof raw.serverRuntime === 'object'
+    ? raw.serverRuntime
+    : {};
 
   return {
     channels: sanitizeChannels(raw.channels),
@@ -279,6 +300,24 @@ function sanitizeSystemSettings(input = {}) {
     latestVersions: Object.fromEntries(Object.entries(latestVersions).map(([key, value]) => [key, shortText(value, 48)])),
     mediaTransport: {
       forceTcp: !!rawMediaTransport.forceTcp,
+      videoProfile: videoProfileText(rawMediaTransport.videoProfile, DEFAULT_SYSTEM_SETTINGS.mediaTransport.videoProfile),
+      cameraMaxBitrateKbps: boundedNumberText(rawMediaTransport.cameraMaxBitrateKbps, 200, 6000, DEFAULT_SYSTEM_SETTINGS.mediaTransport.cameraMaxBitrateKbps),
+      cameraStartBitrateKbps: boundedNumberText(rawMediaTransport.cameraStartBitrateKbps, 150, 4000, DEFAULT_SYSTEM_SETTINGS.mediaTransport.cameraStartBitrateKbps),
+      screenMaxBitrateKbps: boundedNumberText(rawMediaTransport.screenMaxBitrateKbps, 300, 8000, DEFAULT_SYSTEM_SETTINGS.mediaTransport.screenMaxBitrateKbps),
+    },
+    serverRuntime: {
+      announcedIp: shortText(rawServerRuntime.announcedIp, 128),
+      listenPort: portText(rawServerRuntime.listenPort, DEFAULT_SYSTEM_SETTINGS.serverRuntime.listenPort),
+      rtcMinPort: portText(rawServerRuntime.rtcMinPort, DEFAULT_SYSTEM_SETTINGS.serverRuntime.rtcMinPort),
+      rtcMaxPort: portText(rawServerRuntime.rtcMaxPort, DEFAULT_SYSTEM_SETTINGS.serverRuntime.rtcMaxPort),
+      stunUrls: csvText(rawServerRuntime.stunUrls, 2048),
+      turnUrls: csvText(rawServerRuntime.turnUrls, 2048),
+      turnUser: shortText(rawServerRuntime.turnUser, 256),
+      turnPass: shortText(rawServerRuntime.turnPass, 512),
+      debugLogEnabled: rawServerRuntime.debugLogEnabled !== false,
+      debugLogDir: shortText(rawServerRuntime.debugLogDir, 1024),
+      statsIntervalMs: boundedNumberText(rawServerRuntime.statsIntervalMs, 500, 60000, DEFAULT_SYSTEM_SETTINGS.serverRuntime.statsIntervalMs),
+      vpnBandwidthMbps: boundedNumberText(rawServerRuntime.vpnBandwidthMbps, 1, 10000, DEFAULT_SYSTEM_SETTINGS.serverRuntime.vpnBandwidthMbps),
     },
     updatePackages: Object.fromEntries(Object.entries(updatePackages).map(([key, value]) => {
       const pkg = value && typeof value === 'object' ? value : {};
@@ -328,6 +367,31 @@ function writeSystemSettings(settings) {
 
 function shortText(value, max = 256) {
   return String(value ?? '').trim().slice(0, max);
+}
+
+function portText(value, fallback) {
+  return boundedNumberText(value, 1, 65535, fallback);
+}
+
+function boundedNumberText(value, min, max, fallback) {
+  const text = String(value ?? '').trim();
+  const number = Number.parseInt(text, 10);
+  if (!Number.isInteger(number) || number < min || number > max) return String(fallback);
+  return String(number);
+}
+
+function csvText(value, max = 2048) {
+  return String(value ?? '')
+    .split(',')
+    .map(item => item.trim())
+    .filter(Boolean)
+    .join(',')
+    .slice(0, max);
+}
+
+function videoProfileText(value, fallback = 'vpn-balanced') {
+  const raw = String(value || '').trim();
+  return ['stable', 'vpn-balanced', 'high', 'fhd'].includes(raw) ? raw : fallback;
 }
 
 function sanitizeRegisteredClient(input = {}) {
@@ -536,7 +600,10 @@ ipcMain.handle('get-system-settings', () => {
 
 ipcMain.handle('save-system-settings', (_event, rawSettings) => {
   const settings = writeSystemSettings(rawSettings);
-  if (serverProcess) sendSystemSettingsToServer();
+  if (serverProcess) {
+    sendSystemSettingsToServer();
+    safeSend('server-log', 'WARN: サーバー起動設定を変更した場合は、停止→起動で ANNOUNCED_IP / ポート / TURN / デバッグ設定が反映されます。');
+  }
   return settings;
 });
 
@@ -700,6 +767,66 @@ function migrateGeneratedEnv(envPath) {
   safeSend('server-log', `WARN: 旧バージョンのサンプル ANNOUNCED_IP=10.0.0.10 を無効化しました。必要に応じて設定タブの .env を実際のVPN内IPに変更してください: ${envPath}`);
 }
 
+function serverRuntimeEnvFromSettings(settings = readSystemSettings()) {
+  const clean = sanitizeSystemSettings(settings);
+  const runtime = clean.serverRuntime;
+  const env = {
+    PORT: runtime.listenPort,
+    RTC_MIN_PORT: runtime.rtcMinPort,
+    RTC_MAX_PORT: runtime.rtcMaxPort,
+    FORCE_TCP_MEDIA: clean.mediaTransport.forceTcp ? 'true' : 'false',
+    STUN_URLS: runtime.stunUrls,
+    TURN_URLS: runtime.turnUrls,
+    TURN_USER: runtime.turnUser,
+    TURN_PASS: runtime.turnPass,
+    DEBUG_LOG_DISABLED: runtime.debugLogEnabled ? 'false' : 'true',
+    STATS_INTERVAL_MS: runtime.statsIntervalMs,
+    VPN_BANDWIDTH_MBPS: runtime.vpnBandwidthMbps,
+  };
+
+  if (runtime.announcedIp) env.ANNOUNCED_IP = runtime.announcedIp;
+  else env.ANNOUNCED_IP = '';
+  if (runtime.debugLogDir) env.DEBUG_LOG_DIR = runtime.debugLogDir;
+
+  return env;
+}
+
+function writeManagedEnvFile(serverDir, settings = readSystemSettings()) {
+  const envPath = path.join(serverDir, '.env');
+  const env = serverRuntimeEnvFromSettings(settings);
+  const keys = [
+    'ANNOUNCED_IP',
+    'PORT',
+    'RTC_MIN_PORT',
+    'RTC_MAX_PORT',
+    'FORCE_TCP_MEDIA',
+    'STUN_URLS',
+    'TURN_URLS',
+    'TURN_USER',
+    'TURN_PASS',
+    'DEBUG_LOG_DISABLED',
+    'DEBUG_LOG_DIR',
+    'STATS_INTERVAL_MS',
+    'VPN_BANDWIDTH_MBPS',
+  ];
+  const body = [
+    '# CHECKHOUSE Server GUI managed settings',
+    '# このブロックはサーバーGUIの設定タブから自動生成されます。',
+    ...keys.map(key => `${key}=${envValue(env[key] || '')}`),
+    '',
+  ].join('\n');
+
+  fs.mkdirSync(serverDir, { recursive: true });
+  fs.writeFileSync(envPath, body);
+  return envPath;
+}
+
+function envValue(value) {
+  const text = String(value ?? '');
+  if (!/[#\s"']/u.test(text)) return text;
+  return JSON.stringify(text);
+}
+
 function getNodePathEnv() {
   const paths = [
     path.join(app.getAppPath(), 'node_modules'),
@@ -755,8 +882,24 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
     safeSend('server-log', 'WARN: 内蔵 mediasoup-worker が見つかりません。mediasoup 標準パスで起動を試みます。');
   }
 
+  const systemSettings = readSystemSettings();
+  const runtimeEnv = serverRuntimeEnvFromSettings(systemSettings);
+  let envPath = path.join(serverDir, '.env');
+  try {
+    envPath = writeManagedEnvFile(serverDir, systemSettings);
+  } catch (err) {
+    safeSend('server-log', `WARN: .envを書き込めませんでした。起動時の環境変数にはGUI設定を反映します: ${err.message}`);
+  }
+  if (runtimeEnv.ANNOUNCED_IP) {
+    safeSend('server-log', `--- ANNOUNCED_IP: ${runtimeEnv.ANNOUNCED_IP} ---`);
+  } else {
+    safeSend('server-log', 'WARN: ANNOUNCED_IP が未設定です。L3/VPN拠点では設定タブで到達可能なサーバーIPを指定してください。');
+  }
+  safeSend('server-log', `--- サーバー設定: ${envPath} ---`);
+
   const env = {
     ...process.env,
+    ...runtimeEnv,
     ELECTRON_RUN_AS_NODE: '1',
     NODE_PATH: getNodePathEnv(),
   };

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 const { fork } = require('child_process');
+const fs = require('fs');
 const net = require('net');
+const os = require('os');
 const path = require('path');
 
 const { io } = require(path.resolve(__dirname, '..', '..', 'client', 'node_modules', 'socket.io-client'));
@@ -71,6 +73,9 @@ async function run() {
 
   let socket;
   let viewerSocket;
+  let staleSocketA;
+  let staleSocketB;
+  let tempUpdateDir;
   const adminLogs = [];
   const stats = [];
 
@@ -96,6 +101,46 @@ async function run() {
       }),
     ]);
 
+    tempUpdateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'checkhouse-updates-'));
+    fs.mkdirSync(path.join(tempUpdateDir, 'macOS', 'client'), { recursive: true });
+    fs.writeFileSync(path.join(tempUpdateDir, 'macOS', 'client', 'dummy-client-0.1.1.dmg'), 'dummy-update');
+    child.send({ type: 'set-update-dir', dir: tempUpdateDir });
+    await wait(100);
+    const updateResponse = await fetch(`http://127.0.0.1:${httpPort}/updates/${encodeURIComponent('macOS/client/dummy-client-0.1.1.dmg')}`);
+    if (!updateResponse.ok || await updateResponse.text() !== 'dummy-update') {
+      throw new Error('nested update file was not served');
+    }
+
+    const duplicateInstanceId = 'client:smoke-duplicate-instance';
+    staleSocketA = io(`http://127.0.0.1:${httpPort}`, { transports: ['websocket'], timeout: 3000 });
+    await onceWithTimeout(staleSocketA, 'connect', 5000);
+    staleSocketA.emit('setMetadata', {
+      locationName: 'duplicate-smoke',
+      appType: 'client',
+      appVersion: '0.1.0',
+      clientInstanceId: duplicateInstanceId,
+    });
+    await wait(100);
+
+    staleSocketB = io(`http://127.0.0.1:${httpPort}`, { transports: ['websocket'], timeout: 3000 });
+    await onceWithTimeout(staleSocketB, 'connect', 5000);
+    const staleDisconnect = onceWithTimeout(staleSocketA, 'disconnect', 3000);
+    staleSocketB.emit('setMetadata', {
+      locationName: 'duplicate-smoke',
+      appType: 'client',
+      appVersion: '0.1.0',
+      clientInstanceId: duplicateInstanceId,
+    });
+    await staleDisconnect;
+    const duplicatePeers = await emitAck(staleSocketB, 'getPeers', {});
+    const duplicateMatches = duplicatePeers.filter(peer => peer.locationName === 'duplicate-smoke');
+    if (duplicateMatches.length !== 1 || duplicateMatches[0].socketId !== staleSocketB.id) {
+      throw new Error('duplicate client instance was not replaced by newest connection');
+    }
+    staleSocketB.disconnect();
+    staleSocketA = null;
+    staleSocketB = null;
+
     socket = io(`http://127.0.0.1:${httpPort}`, { transports: ['websocket'], timeout: 3000 });
     await onceWithTimeout(socket, 'connect', 5000);
 
@@ -104,7 +149,7 @@ async function run() {
     const peerChannelEvents = [];
     socket.on('peerChannelChanged', payload => peerChannelEvents.push(payload));
 
-    socket.emit('setMetadata', { locationName: 'smoke-client', appType: 'client', appVersion: '0.1.0', channelId: 'general' });
+    socket.emit('setMetadata', { locationName: 'smoke-client', appType: 'client', appVersion: '0.1.0', channelId: 'general', platform: 'win32' });
     const viewerPresenceEvents = [];
     socket.on('viewerPresence', payload => viewerPresenceEvents.push(payload));
 
@@ -118,7 +163,15 @@ async function run() {
       state: {
         channels: [{ id: 'general', name: '一般' }, { id: 'ops', name: 'Ops' }],
         latestVersions: { client: '0.1.1' },
-        updatePackages: { client: { version: '0.1.1', url: 'https://example.com/client' } },
+        updatePackages: {
+          client: {
+            version: '0.1.1',
+            platforms: {
+              win32: { version: '0.1.1', url: 'https://example.com/client-win.exe' },
+              darwin: { version: '0.1.1', url: 'https://example.com/client-mac.dmg' },
+            },
+          },
+        },
       },
     });
     await wait(250);
@@ -267,7 +320,11 @@ async function run() {
 
     let updateOk = false;
     socket.on('updateCommand', (payload, ack) => {
-      updateOk = payload.appType === 'client' && payload.version === '0.1.1';
+      updateOk =
+        payload.appType === 'client' &&
+        payload.version === '0.1.1' &&
+        payload.platform === 'win32' &&
+        payload.packageInfo?.url === 'https://example.com/client-win.exe';
       ack?.({ ok: true, socketId: socket.id, receivedAt: Date.now() });
     });
     child.send({ type: 'force-update', appType: 'client' });
@@ -298,9 +355,12 @@ async function run() {
 
     console.log('[smoke] signaling, telemetry, admin commands ok');
   } finally {
+    staleSocketB?.disconnect();
+    staleSocketA?.disconnect();
     viewerSocket?.disconnect();
     socket?.disconnect();
     child.kill('SIGTERM');
+    if (tempUpdateDir) fs.rmSync(tempUpdateDir, { recursive: true, force: true });
     await wait(300);
   }
 }

@@ -14,17 +14,24 @@ Macに加えて、Windows向けの実行ファイル（`.exe`）も同時にビ�
 
 ビルド（コンパイル）によって、それぞれのOS向けのアプリケーションが生成されています。
 
+> まとめ用の配布先は `release/macOS/` と `release/Windows/` に統一しました。各アプリはその下の個別フォルダに、インストーラー本体だけがまとまります。
+> ルートからは `npm run package:mac` または `npm run package:win` で、それぞれのOS向け成果物をまとめて再生成できます。
+
 ### クライアント (MeetingClient)
-- **Mac用**: `client/release/mac-arm64/MeetingClient.app` または `release/MeetingClient-0.0.0-arm64.dmg`
-- **Windows用**: `client/release/MeetingClient Setup 0.0.0.exe` (インストーラー)
+- **Mac用**: `release/macOS/client/`
+- **Windows用**: `release/Windows/client/`
 
 ### 閲覧専用クライアント (MeetingViewer)
-- **Mac用**: `viewer/release/mac-arm64/MeetingViewer.app` または `release/MeetingViewer-0.1.0-arm64.dmg`
-- **Windows用**: `viewer/release/MeetingViewer Setup 0.1.0.exe` (インストーラー)
+- **Mac用**: `release/macOS/viewer/`
+- **Windows用**: `release/Windows/viewer/`
 
 ### サーバーGUI (SFU Server GUI)
-- **Mac用**: `server-gui/release/mac-arm64/SFU Server GUI.app`
-- **Windows用**: `server-gui/release/SFU Server GUI Setup 1.0.0.exe` (インストーラー)
+- **Mac用**: `release/macOS/server-gui/`
+- **Windows用**: `release/Windows/server-gui/`
+
+### 画面共有アプリ
+- **Mac用**: `release/macOS/screen-share/`
+- **Windows用**: `release/Windows/screen-share/`
 
 ## Windows環境での利用手順
 
