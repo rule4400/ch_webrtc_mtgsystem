@@ -95,7 +95,7 @@ export class ViewerWebRTCManager {
     this._initialized = false;
     this._pendingQueue = [];
     this._viewerName = '';
-    this._appVersion = '0.1.6';
+    this._appVersion = '0.1.7';
     this._clientInstanceId = '';
     this._platform = '';
     this._manualDisconnect = false;
@@ -126,7 +126,7 @@ export class ViewerWebRTCManager {
 
   connect(serverUrl, viewerName, options = {}) {
     this._viewerName = viewerName || '閲覧端末';
-    this._appVersion = options.appVersion || this._appVersion || '0.1.6';
+    this._appVersion = options.appVersion || this._appVersion || '0.1.7';
     this._clientInstanceId = options.clientInstanceId || this._clientInstanceId || '';
     this._platform = options.platform || this._platform || '';
     this._manualDisconnect = false;

@@ -1070,17 +1070,17 @@
             <div class="update-grid">
               <div class="update-row">
                 <span>クライアント</span>
-                <input id="verClient" placeholder="0.2.11">
+                <input id="verClient" placeholder="0.2.12">
                 <input id="urlClient" placeholder="https://...">
               </div>
               <div class="update-row">
                 <span>閲覧用</span>
-                <input id="verViewer" placeholder="0.1.6">
+                <input id="verViewer" placeholder="0.1.7">
                 <input id="urlViewer" placeholder="https://...">
               </div>
               <div class="update-row">
                 <span>画面共有用</span>
-                <input id="verScreenShare" placeholder="0.1.5">
+                <input id="verScreenShare" placeholder="0.1.6">
                 <input id="urlScreenShare" placeholder="https://...">
               </div>
             </div>
@@ -1164,7 +1164,7 @@
     const expandedClientIds = new Set();
     let systemSettings = {
       channels: [{ id: 'general', name: '一般' }],
-        latestVersions: { client: '0.2.11', viewer: '0.1.6', 'screen-share': '0.1.5' },
+        latestVersions: { client: '0.2.12', viewer: '0.1.7', 'screen-share': '0.1.6' },
       updatePackages: {},
       serverRuntime: {
         announcedIp: '',
@@ -1373,9 +1373,9 @@
         },
         latestVersions: {
           ...(systemSettings.latestVersions || {}),
-          client: verClient.value.trim() || '0.2.11',
-          viewer: verViewer.value.trim() || '0.1.6',
-          'screen-share': verScreenShare.value.trim() || '0.1.5',
+          client: verClient.value.trim() || '0.2.12',
+          viewer: verViewer.value.trim() || '0.1.7',
+          'screen-share': verScreenShare.value.trim() || '0.1.6',
         },
         updatePackages: {
           ...(systemSettings.updatePackages || {}),

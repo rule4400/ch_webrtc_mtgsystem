@@ -49,11 +49,11 @@ const DEFAULT_SYSTEM_SETTINGS = {
     { id: 'support', name: 'サポート' },
   ],
   latestVersions: {
-    client: '0.2.11',
-    viewer: '0.1.6',
-    'screen-share': '0.1.5',
-    server: '1.1.9',
-    'server-gui': '1.0.10',
+    client: '0.2.12',
+    viewer: '0.1.7',
+    'screen-share': '0.1.6',
+    server: '1.1.10',
+    'server-gui': '1.0.11',
   },
   updatePackages: {},
   serverRuntime: {

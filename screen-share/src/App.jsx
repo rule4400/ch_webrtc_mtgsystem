@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Download, Monitor, MonitorUp, RefreshCw, Settings, Square, Volume2, X } from 'lucide-react';
 import { ScreenShareWebRTCManager } from './services/screen-share-webrtc';
 
-const APP_VERSION = '0.1.5';
+const APP_VERSION = '0.1.6';
 const APP_TYPE = 'screen-share';
 const DEFAULT_CONFIG = {
   serverIp: '127.0.0.1',

@@ -97,7 +97,7 @@ export class ScreenShareWebRTCManager {
     this._initialized = false;
     this._manualDisconnect = false;
     this._displayName = '画面共有';
-    this._appVersion = '0.1.5';
+    this._appVersion = '0.1.6';
     this._clientInstanceId = '';
     this._platform = '';
     this._lastTelemetryRtt = null;

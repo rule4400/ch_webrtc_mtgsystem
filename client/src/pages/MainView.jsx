@@ -18,7 +18,7 @@ import {
 import { WebRTCManager } from '../services/webrtc';
 import ScreenShareModal from '../components/ScreenShareModal';
 
-const APP_VERSION = '0.2.11';
+const APP_VERSION = '0.2.12';
 const APP_TYPE = 'client';
 const CALL_RING_TIMEOUT_MS = 30000;
 const CALL_RING_INTERVAL_MS = 1500;
