@@ -68,11 +68,11 @@ const APP_TYPES = ['client', 'viewer', 'screen-share', 'server', 'server-gui'];
 const APP_PLATFORMS = ['darwin', 'win32', 'linux'];
 const SERVER_APP_VERSION = serverPackage.version || '0.0.0';
 const DEFAULT_APP_VERSIONS = {
-  client: '0.2.10',
-  viewer: '0.1.5',
-  'screen-share': '0.1.4',
+  client: '0.2.11',
+  viewer: '0.1.6',
+  'screen-share': '0.1.5',
   server: SERVER_APP_VERSION,
-  'server-gui': '1.0.9',
+  'server-gui': '1.0.10',
 };
 let systemState = {
   brand: SYSTEM_NAME,

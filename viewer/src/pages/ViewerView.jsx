@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Download, Hash, MicOff, MonitorPlay, Settings, Volume2, VolumeX, VideoOff } from 'lucide-react';
 import { ViewerWebRTCManager } from '../services/viewer-webrtc';
 
-const APP_VERSION = '0.1.5';
+const APP_VERSION = '0.1.6';
 const APP_TYPE = 'viewer';
 const DEFAULT_SYSTEM_STATE = {
   brand: 'CHECKHOUSE Meeting System',

@@ -292,7 +292,7 @@ export class WebRTCManager {
     this._pendingQueue   = [];     // 初期化前に届いた newProducer
     this._locationName   = '';
     this._channelId      = 'general';
-    this._appVersion     = '0.2.10';
+    this._appVersion     = '0.2.11';
     this._clientInstanceId = '';
     this._platform       = '';
     this._manualDisconnect = false;
@@ -367,7 +367,7 @@ export class WebRTCManager {
   connect(serverUrl, locationName, options = {}) {
     this._locationName = locationName;
     this._channelId = options.channelId || this._channelId || 'general';
-    this._appVersion = options.appVersion || this._appVersion || '0.2.10';
+    this._appVersion = options.appVersion || this._appVersion || '0.2.11';
     this._clientInstanceId = options.clientInstanceId || this._clientInstanceId || '';
     this._platform = options.platform || this._platform || '';
     this._manualDisconnect = false;
