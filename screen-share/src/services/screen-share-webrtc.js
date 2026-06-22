@@ -203,6 +203,17 @@ export class ScreenShareWebRTCManager {
         setTimeout(() => this._hardReconnect(payload.reason || 'server-command'), 100);
       });
 
+      this.socket.on('mediaPathRecovery', (payload = {}, ack) => {
+        ack?.({
+          ok: true,
+          socketId: this.socket.id,
+          receivedAt: Date.now(),
+          initialized: this._initialized,
+        });
+        console.warn('[ScreenShare] media path recovery requested:', payload.reason || 'media-path');
+        this._scheduleSessionRebuild(payload.reason || 'media-path');
+      });
+
       this.socket.on('instanceReplaced', (payload = {}, ack) => {
         ack?.({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
         console.warn('[ScreenShare] instance replaced by newer connection:', payload.replacementSocketId || 'unknown');

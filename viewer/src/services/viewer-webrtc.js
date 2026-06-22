@@ -444,6 +444,17 @@ export class ViewerWebRTCManager {
       setTimeout(() => this.onRestartCommand?.(payload), 100);
     });
 
+    this.socket.on('mediaPathRecovery', (payload = {}, ack) => {
+      ack?.({
+        ok: true,
+        socketId: this.socket.id,
+        receivedAt: Date.now(),
+        initialized: this._initialized,
+      });
+      console.warn('[ViewerWebRTC] media path recovery requested:', payload.reason || 'media-path');
+      this._scheduleSessionRebuild(payload.reason || 'media-path');
+    });
+
     this.socket.on('adminSetDevice', async (payload, ack) => {
       try {
         if (!this.onAdminSetDevice) throw new Error('device control is not ready');

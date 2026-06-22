@@ -110,6 +110,10 @@ const METADATA_TIMEOUT_MS = 15000;
 const TELEMETRY_MISSING_RESTART_MS = Number(process.env.TELEMETRY_MISSING_RESTART_MS) || 25000;
 const TELEMETRY_STALE_RESTART_MS = Number(process.env.TELEMETRY_STALE_RESTART_MS) || 45000;
 const TELEMETRY_RESTART_COOLDOWN_MS = Number(process.env.TELEMETRY_RESTART_COOLDOWN_MS) || 60000;
+const MEDIA_PATH_CHECK_INTERVAL_MS = Math.max(1000, Number(process.env.MEDIA_PATH_CHECK_INTERVAL_MS) || 3000);
+const MEDIA_PATH_GRACE_MS = Math.max(3000, Number(process.env.MEDIA_PATH_GRACE_MS) || 10000);
+const MEDIA_PATH_STALL_MS = Math.max(5000, Number(process.env.MEDIA_PATH_STALL_MS) || 15000);
+const MEDIA_PATH_RECOVERY_COOLDOWN_MS = Math.max(10000, Number(process.env.MEDIA_PATH_RECOVERY_COOLDOWN_MS) || 30000);
 const DEFAULT_VPN_BANDWIDTH_MBPS = Number(process.env.VPN_BANDWIDTH_MBPS) || 200;
 const STATS_INTERVAL_MS = Math.max(500, Number(process.env.STATS_INTERVAL_MS) || 1000);
 const ESTIMATED_MEDIA_BITRATES_BPS = {
@@ -955,6 +959,290 @@ function healthStatus(peer, now = Date.now()) {
   return 'stale';
 }
 
+function initMediaPathState() {
+  return {
+    status: 'warming',
+    issues: [],
+    issueSince: new Map(),
+    inboundBytes: new Map(),
+    outboundBytes: new Map(),
+    lastRecoveryAt: 0,
+    lastRecoveryReason: '',
+    checkedAt: null,
+  };
+}
+
+function firstRtpStat(item = {}) {
+  return Array.isArray(item.stats) ? (item.stats[0] || null) : null;
+}
+
+function mediaStatBytes(item = {}, direction = 'inbound') {
+  const stat = firstRtpStat(item);
+  const field = direction === 'outbound' ? 'bytesSent' : 'bytesReceived';
+  const value = stat?.[field];
+  return Number.isFinite(value) ? value : null;
+}
+
+function findMediaStatByProducer(items = [], producerId = '', source = '') {
+  return (Array.isArray(items) ? items : []).find(item => (
+    item.producerId === producerId ||
+    item.id === producerId ||
+    (source && item.source === source)
+  )) || null;
+}
+
+function isMediaTransportReady(state) {
+  return ['connected', 'completed'].includes(String(state || '').toLowerCase());
+}
+
+function hasLiveTelemetry(peer, now = Date.now()) {
+  return !!peer?.lastHeartbeatAt && now - peer.lastHeartbeatAt <= 10000;
+}
+
+function peerConsumerForProducer(peer, producerId) {
+  if (!peer?.consumers) return null;
+  for (const consumer of peer.consumers.values()) {
+    if (consumer.producerId === producerId) return consumer;
+  }
+  return null;
+}
+
+function expectedConsumerForReceiver(receiver, owner, entry) {
+  if (!receiver || !owner || !entry || entry.paused) return false;
+  const receiverType = receiver.appType || receiver.telemetry?.appType || 'client';
+  if (!['client', 'viewer'].includes(receiverType)) return false;
+
+  const source = entry.source || sanitizeProducerSource(entry.kind, entry.appData);
+  if (source === 'camera' || source === 'screen') return true;
+  if (source === 'microphone') {
+    return normalizeChannelId(receiver.channelId) === normalizeChannelId(owner.channelId);
+  }
+  if (source === 'screen-audio') return true;
+  return false;
+}
+
+function mediaPathIssueKey(issue) {
+  return [
+    issue.type,
+    issue.ownerSocketId || '',
+    issue.producerId || '',
+    issue.direction || '',
+  ].join(':');
+}
+
+function finalizeMediaPathIssues(state, issues, now) {
+  const activeKeys = new Set();
+  const enriched = issues.map(issue => {
+    const key = mediaPathIssueKey(issue);
+    activeKeys.add(key);
+    const since = state.issueSince.get(key) || now;
+    state.issueSince.set(key, since);
+    return {
+      ...issue,
+      key,
+      since,
+      ageMs: now - since,
+      recoverable: issue.recoverable !== false,
+    };
+  });
+
+  for (const key of Array.from(state.issueSince.keys())) {
+    if (!activeKeys.has(key)) state.issueSince.delete(key);
+  }
+  return enriched;
+}
+
+function evaluateMediaPathForPeer(socketId, peer, now = Date.now()) {
+  if (!peer.mediaPathState) peer.mediaPathState = initMediaPathState();
+  const state = peer.mediaPathState;
+  state.checkedAt = now;
+
+  const appType = peer.appType || peer.telemetry?.appType || 'client';
+  if (!['client', 'viewer', 'screen-share'].includes(appType)) {
+    state.status = 'ignored';
+    state.issues = [];
+    return state;
+  }
+
+  if (!peer.metadataReady || !hasLiveTelemetry(peer, now)) {
+    state.status = 'warming';
+    state.issues = [];
+    return state;
+  }
+
+  const issues = [];
+  const monitorState = peer.monitorState || {};
+  const mediaStats = monitorState.mediaStats || {};
+  const consumerStats = Array.isArray(mediaStats.consumers) ? mediaStats.consumers : [];
+  const producerStats = Array.isArray(mediaStats.producers) ? mediaStats.producers : [];
+  const transports = monitorState.transports || {};
+  const hasExpectedInbound = ['client', 'viewer'].includes(appType) && Object.entries(peers).some(([ownerId, owner]) => {
+    if (ownerId === socketId || !owner.metadataReady) return false;
+    for (const entry of owner.producers.values()) {
+      if (expectedConsumerForReceiver(peer, owner, entry)) return true;
+    }
+    return false;
+  });
+  const hasOutboundProducers = peer.producers.size > 0;
+
+  if (hasExpectedInbound && !isMediaTransportReady(transports.recvState)) {
+    issues.push({
+      type: 'recv-transport-not-ready',
+      direction: 'recv',
+      recvState: transports.recvState || '',
+      expectedInbound: true,
+    });
+  }
+  if (hasOutboundProducers && appType !== 'viewer' && !isMediaTransportReady(transports.sendState)) {
+    issues.push({
+      type: 'send-transport-not-ready',
+      direction: 'send',
+      sendState: transports.sendState || '',
+      expectedOutbound: true,
+    });
+  }
+
+  if (['client', 'viewer'].includes(appType)) {
+    for (const [ownerSocketId, owner] of Object.entries(peers)) {
+      if (ownerSocketId === socketId || !owner.metadataReady) continue;
+      for (const [producerId, entry] of owner.producers.entries()) {
+        if (!expectedConsumerForReceiver(peer, owner, entry)) continue;
+        const source = entry.source || sanitizeProducerSource(entry.kind, entry.appData);
+        const consumer = peerConsumerForProducer(peer, producerId);
+        if (!consumer || consumer.closed) {
+          issues.push({
+            type: 'missing-consumer',
+            direction: 'recv',
+            ownerSocketId,
+            ownerName: owner.locationName,
+            producerId,
+            kind: entry.kind,
+            source,
+          });
+          continue;
+        }
+        if (consumer.paused && !entry.paused) {
+          issues.push({
+            type: 'consumer-paused-while-producer-active',
+            direction: 'recv',
+            ownerSocketId,
+            ownerName: owner.locationName,
+            producerId,
+            kind: entry.kind,
+            source,
+          });
+        }
+
+        if (entry.kind !== 'video') continue;
+        const bytes = mediaStatBytes(findMediaStatByProducer(consumerStats, producerId, source), 'inbound');
+        if (bytes == null) continue;
+        const previous = state.inboundBytes.get(producerId);
+        if (!previous || bytes > previous.bytes) {
+          state.inboundBytes.set(producerId, { bytes, changedAt: now });
+          continue;
+        }
+        const stalledMs = now - previous.changedAt;
+        if (stalledMs >= MEDIA_PATH_STALL_MS) {
+          issues.push({
+            type: 'inbound-video-stalled',
+            direction: 'recv',
+            ownerSocketId,
+            ownerName: owner.locationName,
+            producerId,
+            kind: entry.kind,
+            source,
+            bytesReceived: bytes,
+            stalledMs,
+          });
+        }
+      }
+    }
+  }
+
+  for (const [producerId, entry] of peer.producers.entries()) {
+    if (entry.paused || entry.kind !== 'video') continue;
+    const source = entry.source || sanitizeProducerSource(entry.kind, entry.appData);
+    const bytes = mediaStatBytes(findMediaStatByProducer(producerStats, producerId, source), 'outbound');
+    if (bytes == null) continue;
+    const previous = state.outboundBytes.get(producerId);
+    if (!previous || bytes > previous.bytes) {
+      state.outboundBytes.set(producerId, { bytes, changedAt: now });
+      continue;
+    }
+    const stalledMs = now - previous.changedAt;
+    if (stalledMs >= MEDIA_PATH_STALL_MS) {
+      issues.push({
+        type: 'outbound-video-stalled',
+        direction: 'send',
+        producerId,
+        kind: entry.kind,
+        source,
+        bytesSent: bytes,
+        stalledMs,
+      });
+    }
+  }
+
+  state.issues = finalizeMediaPathIssues(state, issues, now);
+  if (!state.issues.length) state.status = 'healthy';
+  else if (state.issues.some(issue => issue.ageMs >= MEDIA_PATH_GRACE_MS)) state.status = 'recovering';
+  else state.status = 'degraded';
+  return state;
+}
+
+function emitMediaPathRecovery(socketId, peer, issues, now = Date.now()) {
+  const recoverable = issues.filter(issue => issue.recoverable && issue.ageMs >= MEDIA_PATH_GRACE_MS);
+  if (!recoverable.length) return;
+  const state = peer.mediaPathState || initMediaPathState();
+  if (now - (state.lastRecoveryAt || 0) < MEDIA_PATH_RECOVERY_COOLDOWN_MS) return;
+
+  state.lastRecoveryAt = now;
+  state.lastRecoveryReason = recoverable[0].type;
+  const payload = {
+    reason: `media-path:${recoverable[0].type}`,
+    action: 'rebuild-media-session',
+    issuedAt: now,
+    cooldownMs: MEDIA_PATH_RECOVERY_COOLDOWN_MS,
+    issues: recoverable.slice(0, 8).map(issue => ({
+      type: issue.type,
+      direction: issue.direction || '',
+      ownerSocketId: issue.ownerSocketId || '',
+      ownerName: issue.ownerName || '',
+      producerId: issue.producerId || '',
+      kind: issue.kind || '',
+      source: issue.source || '',
+      ageMs: issue.ageMs,
+      stalledMs: issue.stalledMs || null,
+    })),
+  };
+
+  appendDebugLog('media-path.recovery-command', {
+    socketId,
+    locationName: peer.locationName,
+    appType: peer.appType,
+    reason: payload.reason,
+    issues: payload.issues,
+  }, 'warn');
+  sendAdminLog(`[Recovery] mediaPathRecovery socket=${socketId} name=${peer.locationName} reason=${payload.reason} issues=${payload.issues.length}`);
+
+  try {
+    peer.socket.timeout(RESTART_ACK_TIMEOUT_MS).emit('mediaPathRecovery', payload, (err, response) => {
+      if (err || response?.error) {
+        sendAdminLog(`[Recovery] mediaPathRecovery ack failed socket=${socketId} error=${response?.error || err.message}`);
+      }
+    });
+  } catch (err) {
+    sendAdminLog(`[Recovery] mediaPathRecovery emit failed socket=${socketId} error=${err.message}`);
+  }
+}
+
+function evaluateMediaPaths(now = Date.now()) {
+  for (const [socketId, peer] of Object.entries(peers)) {
+    const state = evaluateMediaPathForPeer(socketId, peer, now);
+    if (state.status === 'recovering') emitMediaPathRecovery(socketId, peer, state.issues, now);
+  }
+}
+
 /** telemetry RTT の履歴から平均・ジッタ・安定度を算出する */
 function connectionQuality(peer) {
   const samples = Array.isArray(peer.rttHistory) ? peer.rttHistory : [];
@@ -1040,6 +1328,23 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     remoteMonitor: peer.monitorState?.remoteMonitor || {},
     viewerPresence: !!peer.viewerPresenceActive,
     connection: peer.monitorState?.connection || {},
+    mediaPath: {
+      status: peer.mediaPathState?.status || 'unknown',
+      checkedAt: peer.mediaPathState?.checkedAt || null,
+      lastRecoveryAt: peer.mediaPathState?.lastRecoveryAt || null,
+      lastRecoveryReason: peer.mediaPathState?.lastRecoveryReason || '',
+      issues: (peer.mediaPathState?.issues || []).slice(0, 8).map(issue => ({
+        type: issue.type,
+        direction: issue.direction || '',
+        ownerSocketId: issue.ownerSocketId || '',
+        ownerName: issue.ownerName || '',
+        producerId: issue.producerId || '',
+        kind: issue.kind || '',
+        source: issue.source || '',
+        ageMs: issue.ageMs || 0,
+        stalledMs: issue.stalledMs || null,
+      })),
+    },
     transports: {
       ...(peer.monitorState?.transports || {}),
       server: serverTransportList,
@@ -1395,6 +1700,8 @@ const viewerPresenceTimer = setInterval(broadcastViewerPresence, 2000);
 viewerPresenceTimer.unref?.();
 const telemetryRecoveryTimer = setInterval(recoverTelemetryMissingPeers, 5000);
 telemetryRecoveryTimer.unref?.();
+const mediaPathTimer = setInterval(() => evaluateMediaPaths(), MEDIA_PATH_CHECK_INTERVAL_MS);
+mediaPathTimer.unref?.();
 
 // ── Transport ─────────────────────────────────────────────
 
@@ -1445,6 +1752,7 @@ io.on('connection', async socket => {
     telemetry: null,
     deviceState: { devices: { video: [], audioInput: [], audioOutput: [] }, selectedDevices: {} },
     monitorState: {},
+    mediaPathState: initMediaPathState(),
     transports: new Map(),
     producers: new Map(),
     consumers: new Map(),
@@ -1545,6 +1853,10 @@ io.on('connection', async socket => {
       mediaStats: clean.mediaStats || {},
     };
     appendDebugLog('client.telemetry', telemetryDebugSummary(socket.id, peer, clean));
+    const mediaPath = evaluateMediaPathForPeer(socket.id, peer);
+    if (mediaPath.status === 'recovering') {
+      emitMediaPathRecovery(socket.id, peer, mediaPath.issues);
+    }
     broadcastViewerPresence();
     callback?.({ ok: true, serverTime: Date.now() });
   });
