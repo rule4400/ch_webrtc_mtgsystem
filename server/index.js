@@ -58,9 +58,34 @@ let router;
 let routerWorker;        // router が載っている worker
 let recovering = false;  // 二重リカバリ防止
 const RESTART_ACK_TIMEOUT_MS = 2500;
-const TELEMETRY_MISSING_RESTART_MS = Number(process.env.TELEMETRY_MISSING_RESTART_MS) || 25000;
-const TELEMETRY_STALE_RESTART_MS = Number(process.env.TELEMETRY_STALE_RESTART_MS) || 45000;
-const TELEMETRY_RESTART_COOLDOWN_MS = Number(process.env.TELEMETRY_RESTART_COOLDOWN_MS) || 60000;
+// テレメトリ断を理由にクライアントを丸ごと再起動させる復旧機構。
+// 不安定なVPN経路ではテレメトリのACK(1.5秒)が落ちやすく、誤発火すると
+// 「接続→数十秒で再起動」のループに陥り、かえって常時接続を妨げる。
+// そのため既定の閾値を大きく取り、クールダウンも延ばして暴発を防ぐ。
+// TELEMETRY_AUTO_RESTART=0 で完全停止も可能（ネットワーク調査時に有用）。
+const TELEMETRY_AUTO_RESTART = !/^(0|false|no|off)$/i.test(process.env.TELEMETRY_AUTO_RESTART || '');
+const TELEMETRY_MISSING_RESTART_MS = Number(process.env.TELEMETRY_MISSING_RESTART_MS) || 45000;
+const TELEMETRY_STALE_RESTART_MS = Number(process.env.TELEMETRY_STALE_RESTART_MS) || 90000;
+const TELEMETRY_RESTART_COOLDOWN_MS = Number(process.env.TELEMETRY_RESTART_COOLDOWN_MS) || 180000;
+// ICEが disconnected のまま復帰しない transport を強制的に閉じるまでの猶予。
+// 劣化VPN経路では close_notify が届かず dtlsstatechange も発火しないまま
+// transport が残り続け、RTCポート範囲/mediasoup-worker のネイティブリソースを
+// 長時間稼働で消費し続ける（サーバーOSフリーズの一因）。バックストップとして回収する。
+const ICE_DISCONNECTED_CLOSE_MS = Number(process.env.ICE_DISCONNECTED_CLOSE_MS) || 20000;
+// メディアフロー監視: producer(サーバーが受信する上り映像/音声)の実RTP受信量
+// (byteCount)を周期サンプリングし、「シグナリングは繋がっているのにUDPメディアが
+// 届いていない」状態を検出する。announcedIp不一致・UDP遮断・VPN経路劣化などでは
+// DTLS/ICEが生きたまま映像だけ止まるため、接続状態の監視だけでは検出できない。
+// 停滞を検出したら当該ピアのメディアを破棄して mediaLayerRestarted でセッションを
+// 作り直させ、それでも復旧しない場合は restartCommand へエスカレーションする。
+// MEDIA_STALL_RECOVERY=0 で無効化可能。
+const MEDIA_STALL_RECOVERY = !/^(0|false|no|off)$/i.test(process.env.MEDIA_STALL_RECOVERY || '');
+const MEDIA_STALL_CHECK_MS = Number(process.env.MEDIA_STALL_CHECK_MS) || 5000;
+const MEDIA_STALL_RESTART_MS = Number(process.env.MEDIA_STALL_RESTART_MS) || 15000;
+const MEDIA_STALL_COOLDOWN_MS = Number(process.env.MEDIA_STALL_COOLDOWN_MS) || 60000;
+// 連続してこの回数セッション再構築しても止まったままなら、クライアント本体の
+// クイック再起動(restartCommand)へ切り替える
+const MEDIA_STALL_ESCALATE_STRIKES = Number(process.env.MEDIA_STALL_ESCALATE_STRIKES) || 3;
 const SYSTEM_NAME = 'CHECKHOUSE Meeting System';
 const DEFAULT_CHANNELS = [
   { id: 'general', name: '一般' },
@@ -69,11 +94,11 @@ const DEFAULT_CHANNELS = [
 const APP_TYPES = ['client', 'viewer', 'screen-share', 'server', 'server-gui'];
 const SERVER_APP_VERSION = serverPackage.version || '0.0.0';
 const DEFAULT_APP_VERSIONS = {
-  client: '0.2.0',
+  client: '0.3.1',
   viewer: '0.1.1',
   'screen-share': '0.1.0',
   server: SERVER_APP_VERSION,
-  'server-gui': '1.0.0',
+  'server-gui': '1.1.1',
 };
 let systemState = {
   brand: SYSTEM_NAME,
@@ -371,6 +396,8 @@ function publicProducer(producerId, entry) {
       source,
     },
     channelId: entry.channelId || null,
+    // サーバーが実RTP受信を確認できているか（監視GUI向け。停滞中は true）
+    flowStalled: !!entry.flowStalled,
   };
 }
 
@@ -599,6 +626,7 @@ function getStatsSnapshot() {
     listenIp: config.listenIp,
     listenPort: config.listenPort,
     announcedIp: config.announcedIp,
+    announcedIps: config.announcedIps || [config.announcedIp],
     serverIps,
     currentIp: config.announcedIp || serverIps[0] || config.listenIp || '',
     rtcPortRange: config.rtcPortRange,
@@ -848,6 +876,7 @@ function broadcastViewerPresence() {
 }
 
 function recoverTelemetryMissingPeers(now = Date.now()) {
+  if (!TELEMETRY_AUTO_RESTART) return;
   for (const [socketId, peer] of Object.entries(peers)) {
     const appType = peer.appType || peer.telemetry?.appType || 'client';
     if (!['client', 'viewer', 'screen-share'].includes(appType)) continue;
@@ -876,9 +905,91 @@ viewerPresenceTimer.unref?.();
 const telemetryRecoveryTimer = setInterval(recoverTelemetryMissingPeers, 5000);
 telemetryRecoveryTimer.unref?.();
 
+// ── メディアフロー監視（上りRTPが実際に届いているかの確認と自動復旧）─────────
+
+async function sampleProducerInboundBytes(producer) {
+  const stats = await producer.getStats();
+  let bytes = 0;
+  for (const item of stats) {
+    if (item.type === 'inbound-rtp') bytes += Number(item.byteCount) || 0;
+  }
+  return bytes;
+}
+
+let mediaFlowCheckRunning = false;
+async function checkMediaFlow(now = Date.now()) {
+  if (!MEDIA_STALL_RECOVERY || recovering || mediaFlowCheckRunning) return;
+  mediaFlowCheckRunning = true;
+  try {
+    for (const [socketId, peer] of Object.entries(peers)) {
+      if (!peer.socket?.connected || !peer.metadataReady) continue;
+
+      const stalledKinds = [];
+      for (const entry of peer.producers.values()) {
+        const producer = entry.producer;
+        // paused(ミュート等)や閉じた producer はRTPが止まるのが正常。
+        // 追跡をリセットしておき、resume 後に停滞時計がゼロから始まるようにする。
+        if (!producer || producer.closed || entry.paused || producer.paused) {
+          entry.flowBytes = null;
+          entry.flowAt = null;
+          entry.flowStalled = false;
+          continue;
+        }
+        let bytes;
+        try {
+          bytes = await sampleProducerInboundBytes(producer);
+        } catch {
+          continue; // 取得失敗はスキップ（次周期で再試行）
+        }
+        if (entry.flowBytes == null || bytes > entry.flowBytes) {
+          entry.flowBytes = bytes;
+          entry.flowAt = now;
+          entry.flowStalled = false;
+          continue;
+        }
+        const stalledFor = now - (entry.flowAt || now);
+        if (stalledFor >= MEDIA_STALL_RESTART_MS) {
+          entry.flowStalled = true;
+          stalledKinds.push(`${entry.source || entry.kind}:${Math.round(stalledFor / 1000)}s`);
+        }
+      }
+
+      if (!stalledKinds.length) {
+        if (peer.producers.size > 0) peer.mediaStallStrikes = 0;
+        continue;
+      }
+      if (now - (peer.mediaStallRecoveryAt || 0) < MEDIA_STALL_COOLDOWN_MS) continue;
+      peer.mediaStallRecoveryAt = now;
+      peer.mediaStallStrikes = (peer.mediaStallStrikes || 0) + 1;
+
+      if (peer.mediaStallStrikes >= MEDIA_STALL_ESCALATE_STRIKES) {
+        // セッション再構築を繰り返しても届かない → クライアント側の
+        // ネットワークスタック/アプリごと再起動させる方が復旧確率が高い。
+        peer.mediaStallStrikes = 0;
+        sendAdminLog(`[Recovery] media-stalled escalation name=${peer.locationName} kinds=${stalledKinds.join(',')} → restartCommand`);
+        emitRestartCommand(peer.socket, 1, `media-stalled:${socketId}`);
+        continue;
+      }
+
+      sendAdminLog(`[Recovery] media-stalled name=${peer.locationName} kinds=${stalledKinds.join(',')} strike=${peer.mediaStallStrikes} → session rebuild`);
+      // サーバー側の古い transport/producer を破棄してから作り直させる。
+      // 生かしたままだとクライアントの再構築後も停滞した経路が残り続ける。
+      resetPeerMedia(peer);
+      peer.socket.emit('mediaLayerRestarted');
+    }
+  } finally {
+    mediaFlowCheckRunning = false;
+  }
+}
+
+const mediaFlowTimer = setInterval(() => {
+  checkMediaFlow().catch(err => console.error('[MediaFlow]', err));
+}, MEDIA_STALL_CHECK_MS);
+mediaFlowTimer.unref?.();
+
 // ── Transport ─────────────────────────────────────────────
 
-async function createWebRtcTransport(router, forceTcp = false) {
+async function createWebRtcTransport(router, forceTcp = false, peer = null) {
   const { listenIps, initialAvailableOutgoingBitrate } = config.mediasoup.webRtcTransport;
   const transport = await router.createWebRtcTransport({
     listenIps,
@@ -888,7 +999,29 @@ async function createWebRtcTransport(router, forceTcp = false) {
     initialAvailableOutgoingBitrate,
   });
   transport.on('dtlsstatechange', state => { if (state === 'closed') transport.close(); });
-  transport.on('close', () => console.log('[Transport] closed'));
+
+  // ICEが disconnected のまま一定時間復帰しなければ強制クローズする。
+  // クライアントの再接続/自己回復に任せることで、劣化経路で残り続ける
+  // transport によるポート/メモリの永久占有を防ぐ。
+  let iceDisconnectTimer = null;
+  transport.on('icestatechange', state => {
+    if (state === 'disconnected') {
+      if (iceDisconnectTimer) return;
+      iceDisconnectTimer = setTimeout(() => {
+        iceDisconnectTimer = null;
+        if (!transport.closed) transport.close();
+      }, ICE_DISCONNECTED_CLOSE_MS);
+    } else if (iceDisconnectTimer) {
+      clearTimeout(iceDisconnectTimer);
+      iceDisconnectTimer = null;
+    }
+  });
+
+  transport.on('close', () => {
+    if (iceDisconnectTimer) { clearTimeout(iceDisconnectTimer); iceDisconnectTimer = null; }
+    peer?.transports.delete(transport.id);
+    console.log('[Transport] closed');
+  });
   return transport;
 }
 
@@ -904,9 +1037,12 @@ io.on('connection', async socket => {
     appVersion: '',
     channelId: DEFAULT_CHANNELS[0].id,
     metadataReady: false,
+    instanceId: '',
     connectedAt: Date.now(),
     lastHeartbeatAt: null,
     telemetryRecoveryAt: 0,
+    mediaStallRecoveryAt: 0,
+    mediaStallStrikes: 0,
     rttMs: null,
     rttHistory: [],
     telemetry: null,
@@ -920,7 +1056,7 @@ io.on('connection', async socket => {
 
   // ── 拠点名の設定 ──
   socket.on('setMetadata', (metadata = {}) => {
-    const { locationName, appType, channelId, appVersion } = asObject(metadata);
+    const { locationName, appType, channelId, appVersion, instanceId } = asObject(metadata);
     if (peers[socket.id]) {
       const peer = peers[socket.id];
       const isFirstMetadata = !peer.metadataReady;
@@ -928,6 +1064,21 @@ io.on('connection', async socket => {
       if (appType) peer.appType = shortString(appType, 24);
       if (appVersion) peer.appVersion = shortString(appVersion, 48);
       if (channelId) peer.channelId = normalizeChannelId(channelId);
+
+      // 同一クライアントインスタンス(端末)からの重複セッションを排除する。
+      // レンダラークラッシュや瞬断後の再接続では、古いソケットがpingタイムアウト
+      // まで生き残り「同じ拠点が二重にいる」状態になる。instanceId はクライアント
+      // 端末ごとに永続で、同じIDの古いセッションは新しい接続で即時置き換える。
+      const cleanInstanceId = shortString(instanceId || '', 64);
+      if (cleanInstanceId) {
+        peer.instanceId = cleanInstanceId;
+        for (const [otherId, other] of Object.entries(peers)) {
+          if (otherId === socket.id || other.instanceId !== cleanInstanceId) continue;
+          sendAdminLog(`[Session] duplicate instance replaced name=${other.locationName} old=${otherId} new=${socket.id}`);
+          try { other.socket.disconnect(true); } catch (_) { /* 切断済みなら無視 */ }
+        }
+      }
+
       peer.metadataReady = true;
       console.log(`[Meta] ${socket.id} → "${locationName}"`);
       if (isFirstMetadata) {
@@ -1155,7 +1306,7 @@ io.on('connection', async socket => {
       if (!peer) return;
       if (!router) return safeCallback(callback, { error: 'router not ready' });
       const { forceTcp } = asObject(payload);
-      const transport = await createWebRtcTransport(router, !!forceTcp);
+      const transport = await createWebRtcTransport(router, !!forceTcp, peer);
       peer.transports.set(transport.id, transport);
       safeCallback(callback, {
         params: {
@@ -1169,6 +1320,22 @@ io.on('connection', async socket => {
       console.error('[createWebRtcTransport]', err);
       safeCallback(callback, { error: err.message });
     }
+  });
+
+  // ── Transport 明示クローズ ──
+  // クライアントが再接続/セッション再構築で古い transport を破棄したことを通知する。
+  // ソケット接続を維持したまま transport だけ作り直すケース（_scheduleSetupRetry 等）では
+  // 切断イベントでは回収されないため、これが無いと peer.transports にゴミが残り続ける。
+  socket.on('closeTransport', (payload = {}, callback) => {
+    const peer = getPeerForRequest(socket, callback);
+    if (!peer) return;
+    const { transportId } = asObject(payload);
+    const transport = peer.transports.get(transportId);
+    if (transport) {
+      try { transport.close(); } catch (_) {}
+      peer.transports.delete(transportId);
+    }
+    safeCallback(callback, { ok: true });
   });
 
   // ── Transport 接続 ──
@@ -1212,6 +1379,10 @@ io.on('connection', async socket => {
         source,
         appData: producerAppData,
         channelId: peer.channelId,
+        // メディアフロー監視用（checkMediaFlow が更新する）
+        flowBytes: null,
+        flowAt: null,
+        flowStalled: false,
       });
 
       producer.on('transportclose', () => {

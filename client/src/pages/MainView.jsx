@@ -18,7 +18,7 @@ import {
 import { WebRTCManager } from '../services/webrtc';
 import ScreenShareModal from '../components/ScreenShareModal';
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.3.1';
 const APP_TYPE = 'client';
 const CALL_RING_TIMEOUT_MS = 30000;
 const CALL_RING_INTERVAL_MS = 1500;
@@ -76,6 +76,41 @@ function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, on
   );
 }
 
+// ─── ショートカットキー入力欄（キーを押して登録） ────────────────
+
+const SHORTCUT_KEY_LABELS = { ' ': 'Space' };
+const SHORTCUT_IGNORED_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta', 'Tab', 'CapsLock']);
+
+function formatShortcutKey(key) {
+  if (!key) return '未設定';
+  if (SHORTCUT_KEY_LABELS[key]) return SHORTCUT_KEY_LABELS[key];
+  return key.length === 1 ? key.toUpperCase() : key;
+}
+
+function ShortcutKeyField({ label, value, onChange }) {
+  const [capturing, setCapturing] = useState(false);
+  return (
+    <div className="field">
+      <label>{label}</label>
+      <input
+        type="text"
+        readOnly
+        className="shortcut-key-input"
+        value={capturing ? 'キーを押してください…' : formatShortcutKey(value)}
+        onFocus={() => setCapturing(true)}
+        onBlur={() => setCapturing(false)}
+        onKeyDown={(event) => {
+          event.preventDefault();
+          if (SHORTCUT_IGNORED_KEYS.has(event.key)) return;
+          if (event.key === 'Escape') { event.target.blur(); return; }
+          onChange(event.key.length === 1 ? event.key.toLowerCase() : event.key);
+          event.target.blur();
+        }}
+      />
+    </div>
+  );
+}
+
 // ─── ビデオセル ───────────────────────────────────────────
 
 const VideoCell = React.memo(function VideoCell({
@@ -85,6 +120,7 @@ const VideoCell = React.memo(function VideoCell({
   isScreen = false,
   videoPaused,
   audioPaused,
+  highlightMuted = false,
   speakerDeviceId,
   speakerMuted,
   volume = 1,
@@ -161,11 +197,12 @@ const VideoCell = React.memo(function VideoCell({
   }, [speakerDeviceId, isSelf]);
 
   const cameraOff = !!videoPaused;
+  const selfMutedHighlight = isSelf && !!audioPaused && highlightMuted;
 
   return (
     <div
       className={`video-cell ${focused ? 'focused' : ''} ${compact ? 'compact' : ''} ${mini ? 'mini' : ''} ${dimmed ? 'dimmed' : ''}`}
-      style={{ outline: isSelf ? '2px solid #4ade80' : '2px solid rgba(255,255,255,0.08)' }}
+      style={{ outline: selfMutedHighlight ? '2px solid #ef4444' : (isSelf ? '2px solid #4ade80' : '2px solid rgba(255,255,255,0.08)') }}
       onDoubleClick={() => canFocus && onFocus?.(tileId)}
       onContextMenu={(event) => {
         if (!canControlVolume) return;
@@ -509,13 +546,26 @@ function trackReport(track) {
   };
 }
 
+// キーボードショートカット既定値（設定画面で変更可）。数字キー1-9によるチャンネル
+// 移動はチャンネル一覧の並び順に固定で紐づくため、ここでは対象外。
+const defaultShortcuts = {
+  micToggle: 'm',
+  speakerToggle: 's',
+  cameraToggle: 'c',
+};
 const defaultClientConfig = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
   locationName: '自拠点',
   channelId: 'general',
+  shortcuts: { ...defaultShortcuts },
+  autoUnmuteOnCallAnswer: true,
+  highlightSelfMuted: true,
 };
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
+// 直前の再起動からこの時間内に届いた「健全なセッションへの」再起動要求は無視する。
+// 復旧機構（サーバーrestartCommand/クライアント自己復旧）の多重発火を吸収する。
+const QUICK_RESTART_COOLDOWN_MS = 10000;
 
 async function connectWithinStartupWindow(manager, serverUrl, locationName, options = {}) {
   let timedOut = false;
@@ -537,6 +587,16 @@ async function connectWithinStartupWindow(manager, serverUrl, locationName, opti
   return Promise.race([connectPromise, timeoutPromise]);
 }
 
+function sanitizeShortcuts(raw) {
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const clean = {};
+  for (const action of Object.keys(defaultShortcuts)) {
+    const value = src[action];
+    clean[action] = (typeof value === 'string' && value.length > 0) ? value : defaultShortcuts[action];
+  }
+  return clean;
+}
+
 function sanitizeClientConfig(config) {
   const raw = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
   const serverIp = String(raw.serverIp || defaultClientConfig.serverIp).trim() || defaultClientConfig.serverIp;
@@ -546,6 +606,10 @@ function sanitizeClientConfig(config) {
     : defaultClientConfig.serverPort;
   const locationName = String(raw.locationName || defaultClientConfig.locationName).trim() || defaultClientConfig.locationName;
   const channelId = String(raw.channelId || defaultClientConfig.channelId).trim() || defaultClientConfig.channelId;
+  const shortcuts = sanitizeShortcuts(raw.shortcuts);
+  // 明示的に false が保存されていない限り既定オン（後から追加した設定のため）。
+  const autoUnmuteOnCallAnswer = raw.autoUnmuteOnCallAnswer !== false;
+  const highlightSelfMuted = raw.highlightSelfMuted !== false;
 
   return {
     ...raw,
@@ -553,6 +617,9 @@ function sanitizeClientConfig(config) {
     serverPort,
     locationName,
     channelId,
+    shortcuts,
+    autoUnmuteOnCallAnswer,
+    highlightSelfMuted,
   };
 }
 
@@ -651,11 +718,11 @@ export default function MainView() {
   const [camError,   setCamError]   = useState(null);
   const [viewerPresenceActive, setViewerPresenceActive] = useState(false);
   const [localSpeaking, setLocalSpeaking] = useState(false);
-  const [uiResetToken, setUiResetToken] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(() => !localStorage.getItem('sfu_config'));
   const [settingsDraft, setSettingsDraft] = useState(() => sanitizeClientConfig(loadClientConfig()));
   const [systemState, setSystemState] = useState(DEFAULT_SYSTEM_STATE);
   const [channelId, setChannelId] = useState(() => sanitizeClientConfig(loadClientConfig()).channelId);
+  const [highlightSelfMuted, setHighlightSelfMuted] = useState(() => sanitizeClientConfig(loadClientConfig()).highlightSelfMuted);
   const [updateNotice, setUpdateNotice] = useState(null);
   const [focusedTileId, setFocusedTileId] = useState('');
   const [peerVolumes, setPeerVolumes] = useState({});
@@ -675,11 +742,19 @@ export default function MainView() {
   const webrtcRef = useRef(null);
   const streamRef = useRef(null);
   const configRef = useRef({});
+  // 呼び出し応答時の自動ミュート解除など、定義順の都合で先に参照したい
+  // setMicrophoneEnabled/setSpeakerOutputEnabled への最新参照を保持する。
+  const mediaControlsRef = useRef({});
   const mediaRecoveryRef = useRef(false);
   const telemetryStateRef = useRef({});
   const adminHandlersRef = useRef({});
   const audioMonitorRef = useRef({});
   const softRestartInFlightRef = useRef(false);
+  const lastQuickRestartAtRef = useRef(0);
+  // startClientSession の多重実行ガード。初期化中(メディア取得に数秒かかる)に
+  // サーバー到達確認ポーリングが「managerがまだ無い」と判断してもう一度
+  // セッションを開始すると、同じ拠点からサーバーへ二重セッションが張られる。
+  const sessionStartInFlightRef = useRef(false);
   const softRestartHandlerRef = useRef(null);
   const serverProbeInFlightRef = useRef(false);
   const speakerMutedRef = useRef(false);
@@ -1115,7 +1190,7 @@ export default function MainView() {
     }
   }, [installLocalStream, selectedVideoId, selectedAudioInId]);
 
-  const releaseClientRuntime = useCallback(({ status = 'connecting', updateState = true } = {}) => {
+  const releaseClientRuntime = useCallback(({ status = 'connecting', updateState = true, keepLocalMedia = false } = {}) => {
     const manager = webrtcRef.current;
     webrtcRef.current = null;
     if (manager) {
@@ -1138,9 +1213,14 @@ export default function MainView() {
       manager.disconnect();
     }
 
-    stopLocalAudioMonitor();
-    streamRef.current?.getTracks().forEach(track => track.stop());
-    streamRef.current = null;
+    // サーバー都合の再起動(keepLocalMedia)では自拠点カメラ/マイクは止めない。
+    // producer は stopTracks:false で produce しているため、manager.disconnect で
+    // セッションを破棄してもローカルトラックは生き続け、自拠点映像が途切れない。
+    if (!keepLocalMedia) {
+      stopLocalAudioMonitor();
+      streamRef.current?.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
 
     // セッション再構築時は画面共有・呼び出し状態もリセット（manager側のトラックは disconnect で閉じる）
     const share = screenShareRef.current;
@@ -1155,7 +1235,7 @@ export default function MainView() {
     outgoingCallRef.current = null;
 
     if (updateState) {
-      setLocalStream(null);
+      if (!keepLocalMedia) setLocalStream(null);
       setPeers(new Map());
       setViewerPresenceActive(false);
       setScreenShare(null);
@@ -1164,7 +1244,13 @@ export default function MainView() {
     }
   }, [stopLocalAudioMonitor]);
 
-  const startClientSession = useCallback(async ({ stopPreviousStream = false } = {}) => {
+  const startClientSessionInner = useCallback(async ({ stopPreviousStream = false, reuseLocalMedia = false } = {}) => {
+    // 既存セッションが残っていれば必ず破棄してから開始する（1拠点1セッションの保証）。
+    // 破棄せず新しい manager を作ると、古い socket が自動再接続を続けて
+    // サーバーに同じ拠点が二重に現れる。
+    if (webrtcRef.current) {
+      releaseClientRuntime({ updateState: false, keepLocalMedia: true });
+    }
     const conf = sanitizeClientConfig(loadClientConfig());
     configRef.current = conf;
     setSettingsDraft(conf);
@@ -1180,8 +1266,14 @@ export default function MainView() {
     setSelectedAudioInId(audioId);
     setSelectedAudioOutId(outId);
 
-    const { stream, error } = await acquireMedia({ videoId, audioId });
-    await installLocalStream(stream, error, { stopPrevious: stopPreviousStream });
+    // サーバー都合の再起動では、生きているローカルメディアをそのまま再利用して
+    // 自拠点映像を途切れさせない。トラックが落ちている場合のみ取り直す。
+    const existingStream = streamRef.current;
+    const existingLive = !!existingStream && existingStream.getTracks().some(track => track.readyState === 'live');
+    if (!(reuseLocalMedia && existingLive)) {
+      const { stream, error } = await acquireMedia({ videoId, audioId });
+      await installLocalStream(stream, error, { stopPrevious: stopPreviousStream });
+    }
 
     const rtcManager = new WebRTCManager();
     webrtcRef.current = rtcManager;
@@ -1233,8 +1325,14 @@ export default function MainView() {
       if (!current || current.callId !== payload.callId) return;
       const name = current.targetName || '相手拠点';
       stopOutgoingCall(payload.callId);
-      if (payload.action === 'answered') showCallNotice(`${name} が応答しました`);
-      else if (payload.action === 'dismissed') showCallNotice(`${name} は応答できませんでした`, 'warn');
+      if (payload.action === 'answered') {
+        showCallNotice(`${name} が応答しました`);
+        // 発信側も応答を受け取った時点でミュートを解除する（設定でオフ可・既定オン）。
+        if (configRef.current?.autoUnmuteOnCallAnswer !== false) {
+          mediaControlsRef.current.setMicrophoneEnabled?.(true)?.catch?.(() => {});
+          mediaControlsRef.current.setSpeakerOutputEnabled?.(true);
+        }
+      } else if (payload.action === 'dismissed') showCallNotice(`${name} は応答できませんでした`, 'warn');
       else if (payload.action === 'timeout') showCallNotice(`${name} の応答がありませんでした`, 'warn');
       else if (payload.action === 'disconnected') showCallNotice(`${name} が切断されました`, 'warn');
     };
@@ -1284,21 +1382,49 @@ export default function MainView() {
     });
     setSfuStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     return { manager: rtcManager, connectionState };
-  }, [camEnabled, micEnabled, installLocalStream, playJoinTone, refreshDevices, showIncomingCall, showCallNotice, stopIncomingCall, stopOutgoingCall]);
+  }, [camEnabled, micEnabled, installLocalStream, playJoinTone, refreshDevices, releaseClientRuntime, showIncomingCall, showCallNotice, stopIncomingCall, stopOutgoingCall]);
+
+  // startClientSessionInner の多重実行ガード。初期化(メディア取得)には数秒かかり、
+  // その間にサーバー到達確認ポーリング等が重ねてセッション開始を呼ぶと、
+  // 同じ拠点からサーバーへ二重セッションが張られてしまう。
+  const startClientSession = useCallback(async (options = {}) => {
+    if (sessionStartInFlightRef.current) {
+      return { manager: webrtcRef.current, connectionState: 'starting' };
+    }
+    sessionStartInFlightRef.current = true;
+    try {
+      return await startClientSessionInner(options);
+    } finally {
+      sessionStartInFlightRef.current = false;
+    }
+  }, [startClientSessionInner]);
 
   const performQuickRestart = useCallback(async (payload = {}) => {
     if (softRestartInFlightRef.current) return;
-    softRestartInFlightRef.current = true;
-    const startedAt = Date.now();
     const reason = payload?.reason || payload?.source || 'server-command';
+
+    // 不安定なVPN経路ではサーバーの restartCommand やクライアント自身の復旧が
+    // 短時間に重なりやすい。直前に再起動して既にセッションが健全なら、重複した
+    // 再起動要求は無視して常時接続を揺らさない（手動/明示要求は除く）。
+    const sinceLast = Date.now() - lastQuickRestartAtRef.current;
+    const manager = webrtcRef.current;
+    const forced = payload?.forced || /manual|remote-config|update/.test(reason);
+    if (!forced && sinceLast < QUICK_RESTART_COOLDOWN_MS && manager?.isSocketConnected() && manager?.isInitialized()) {
+      console.log(`[QuickRestart] skipped (healthy, ${sinceLast}ms since last) reason=${reason}`);
+      return;
+    }
+
+    softRestartInFlightRef.current = true;
+    lastQuickRestartAtRef.current = Date.now();
+    const startedAt = Date.now();
     console.log(`[QuickRestart] requested reason=${reason}`);
 
     try {
-      releaseClientRuntime({ status: 'restarting' });
-      setCamError(null);
-      setUiResetToken(token => token + 1);
+      // サーバー都合の再起動でも自拠点カメラは保持し続ける（要件: 常時自拠点表示）。
+      releaseClientRuntime({ status: 'restarting', keepLocalMedia: true });
+      setCamError(null); // 取り直しに失敗すれば installLocalStream が再設定する
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      const { connectionState } = await startClientSession({ stopPreviousStream: false });
+      const { connectionState } = await startClientSession({ stopPreviousStream: false, reuseLocalMedia: true });
       window.electronAPI?.quickRestartResult?.({
         ok: true,
         reason,
@@ -1490,6 +1616,11 @@ export default function MainView() {
   }, [flushTelemetrySoon]);
 
   useEffect(() => {
+    mediaControlsRef.current.setMicrophoneEnabled = setMicrophoneEnabled;
+    mediaControlsRef.current.setSpeakerOutputEnabled = setSpeakerOutputEnabled;
+  }, [setMicrophoneEnabled, setSpeakerOutputEnabled]);
+
+  useEffect(() => {
     adminHandlersRef.current = {
       setDevice: async ({ kind, deviceId }) => {
         if (!deviceId && deviceId !== '') throw new Error('deviceId is required');
@@ -1653,6 +1784,7 @@ export default function MainView() {
     localStorage.setItem('sfu_config', JSON.stringify(next));
     setSelfName(next.locationName || '自拠点');
     setChannelId(next.channelId || 'general');
+    setHighlightSelfMuted(next.highlightSelfMuted);
     setSettingsDraft(next);
     setSettingsOpen(false);
 
@@ -1677,11 +1809,54 @@ export default function MainView() {
     }
   }, [channels]);
 
+  // ─── キーボードショートカット ──────────────────────────────
+  // 数字キー1-9はチャンネル一覧の並び順に固定（設定不可）。マイク/スピーカー/
+  // カメラのキーは設定画面で変更できる(既定 M/S/C)。設定画面を開いている間や
+  // テキスト入力中は無効化し、意図しない発火を防ぐ。
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (settingsOpen) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const el = event.target;
+      const tag = el?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable) return;
+
+      if (/^[1-9]$/.test(event.key)) {
+        const channelTarget = channels[Number(event.key) - 1];
+        if (channelTarget) {
+          event.preventDefault();
+          changeChannel(channelTarget.id);
+        }
+        return;
+      }
+
+      const shortcuts = configRef.current?.shortcuts || defaultShortcuts;
+      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+      if (key === shortcuts.micToggle) {
+        event.preventDefault();
+        toggleMic();
+      } else if (key === shortcuts.speakerToggle) {
+        event.preventDefault();
+        setSpeakerOutputEnabled(speakerMuted);
+      } else if (key === shortcuts.cameraToggle) {
+        event.preventDefault();
+        toggleCam();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [settingsOpen, channels, changeChannel, toggleMic, toggleCam, setSpeakerOutputEnabled, speakerMuted]);
+
   const answerIncomingCall = useCallback(async (call) => {
     const targetChannelId = call?.fromChannelId || '';
     stopIncomingCall(call?.callId || '');
     // 発信側の鳴動表示を止める（失敗しても応答処理は続行）
     webrtcRef.current?.ackCall(call?.callId, 'answered').catch(() => {});
+    // 着信側も応答した時点でミュートを解除する（設定でオフ可・既定オン）。
+    if (configRef.current?.autoUnmuteOnCallAnswer !== false) {
+      mediaControlsRef.current.setMicrophoneEnabled?.(true)?.catch?.(() => {});
+      mediaControlsRef.current.setSpeakerOutputEnabled?.(true);
+    }
     if (!targetChannelId || targetChannelId === activeChannelId) return;
     if (!channels.some(channel => channel.id === targetChannelId)) return;
     await changeChannel(targetChannelId);
@@ -1989,7 +2164,11 @@ export default function MainView() {
   const videoTiles = useMemo(() => {
     const tiles = [{
       id: 'self',
-      key: `self-${uiResetToken}`,
+      // タイルのキーは socketId ベースで固定（再接続のたびに変える key にすると
+      // <video> 要素が作り直され、一瞬の黒画面や再接続を繰り返すデコーダ生成/破棄
+      // によるGPUプロセスのメモリ増加を招く）。stream の切り替えは VideoCell 内の
+      // srcObject 差し替え effect が担う。
+      key: 'self',
       label: selfName,
       stream: localStream,
       isSelf: true,
@@ -2008,7 +2187,7 @@ export default function MainView() {
     if (screenShare?.stream) {
       tiles.push({
         id: 'self-screen',
-        key: `self-screen-${uiResetToken}`,
+        key: 'self-screen',
         label: `${selfName} / ${screenShare.sourceName}`,
         stream: screenShare.stream,
         isSelf: true,
@@ -2032,7 +2211,7 @@ export default function MainView() {
       if (!isScreenShareApp) {
         tiles.push({
           id: `peer:${socketId}`,
-          key: `${uiResetToken}-${socketId}`,
+          key: `peer:${socketId}`,
           label: peer.locationName || '不明',
           stream: peer.stream,
           isSelf: false,
@@ -2051,7 +2230,7 @@ export default function MainView() {
       if (peer.screenProducerId && peer.screenStream?.getVideoTracks().length && !peer.screenPaused) {
         tiles.push({
           id: `screen:${socketId}`,
-          key: `${uiResetToken}-${socketId}-screen`,
+          key: `screen:${socketId}`,
           label: `${peer.locationName || '不明'} / ${peer.screenLabel || '画面共有'}`,
           stream: peer.screenStream,
           isSelf: false,
@@ -2085,7 +2264,6 @@ export default function MainView() {
     selectedAudioOutId,
     selfName,
     speakerMuted,
-    uiResetToken,
   ]);
 
   // ── チャンネル別グルーピング ──
@@ -2137,6 +2315,7 @@ export default function MainView() {
         isScreen={!!tile.isScreen}
         videoPaused={tile.videoPaused}
         audioPaused={tile.audioPaused}
+        highlightMuted={highlightSelfMuted}
         speakerDeviceId={tile.speakerDeviceId}
         speakerMuted={tile.speakerMuted}
         volume={tile.baseVolume * volumeValue}
@@ -2152,7 +2331,7 @@ export default function MainView() {
         onCall={callTargetSocketId ? () => callMember(callTargetSocketId) : null}
       />
     );
-  }, [callMember, getTileVolume, handleTileFocus, handleTileVolumeChange]);
+  }, [callMember, getTileVolume, handleTileFocus, handleTileVolumeChange, highlightSelfMuted]);
 
   const memberMenuVolume = memberMenu ? getTileVolume(`peer:${memberMenu.socketId}`) : 1;
   const incomingCallChannelName = incomingCall?.fromChannelId
@@ -2620,7 +2799,21 @@ export default function MainView() {
       </button>
 
       {settingsOpen && (
-        <div className="settings-overlay" role="dialog" aria-modal="true" aria-label="接続設定">
+        <div
+          className="settings-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="接続設定"
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter') return;
+            const el = event.target;
+            // ショートカットキー入力欄はEnterキー自体を割り当てる操作に使うため対象外。
+            // textarea は改行との衝突を避けるため対象外(現状は無いが将来のため)。
+            if (el?.classList?.contains('shortcut-key-input') || el?.tagName === 'TEXTAREA') return;
+            event.preventDefault();
+            saveSettingsDraft();
+          }}
+        >
           <div className="settings-panel">
             <div className="settings-panel-head">
               <div>
@@ -2632,52 +2825,98 @@ export default function MainView() {
               </button>
             </div>
 
-            <div className="settings-section">
-              <h2>基本設定</h2>
-              <div className="field">
-                <label>拠点名</label>
-                <input
-                  type="text"
-                  value={settingsDraft.locationName}
-                  onChange={e => updateSettingsDraft('locationName', e.target.value)}
-                  placeholder="例: 東京本社"
-                />
+            <div className="settings-body">
+              <div className="settings-section">
+                <h2>基本設定</h2>
+                <div className="field">
+                  <label>拠点名</label>
+                  <input
+                    type="text"
+                    value={settingsDraft.locationName}
+                    onChange={e => updateSettingsDraft('locationName', e.target.value)}
+                    placeholder="例: 東京本社"
+                  />
+                </div>
+                <div className="field">
+                  <label>音声チャンネル</label>
+                  <select
+                    value={settingsDraft.channelId}
+                    onChange={e => updateSettingsDraft('channelId', e.target.value)}
+                  >
+                    {channels.map(channel => (
+                      <option key={channel.id} value={channel.id}>{channel.name}</option>
+                    ))}
+                  </select>
+                </div>
               </div>
-              <div className="field">
-                <label>音声チャンネル</label>
-                <select
-                  value={settingsDraft.channelId}
-                  onChange={e => updateSettingsDraft('channelId', e.target.value)}
-                >
-                  {channels.map(channel => (
-                    <option key={channel.id} value={channel.id}>{channel.name}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
 
-            <div className="settings-section">
-              <h2>SFUサーバー</h2>
-              <div className="server-row">
-                <div className="field">
-                  <label>IPアドレス</label>
-                  <input
-                    type="text"
-                    value={settingsDraft.serverIp}
-                    onChange={e => updateSettingsDraft('serverIp', e.target.value)}
-                    placeholder="例: 192.168.1.223"
-                  />
+              <div className="settings-section">
+                <h2>SFUサーバー</h2>
+                <div className="server-row">
+                  <div className="field">
+                    <label>IPアドレス</label>
+                    <input
+                      type="text"
+                      value={settingsDraft.serverIp}
+                      onChange={e => updateSettingsDraft('serverIp', e.target.value)}
+                      placeholder="例: 192.168.1.223"
+                    />
+                  </div>
+                  <div className="field">
+                    <label>ポート</label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={settingsDraft.serverPort}
+                      onChange={e => updateSettingsDraft('serverPort', e.target.value)}
+                      placeholder="3000"
+                    />
+                  </div>
                 </div>
-                <div className="field">
-                  <label>ポート</label>
+              </div>
+
+              <div className="settings-section">
+                <h2>キーボードショートカット</h2>
+                <ShortcutKeyField
+                  label="マイク ミュート切替"
+                  value={settingsDraft.shortcuts?.micToggle}
+                  onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, micToggle: key })}
+                />
+                <ShortcutKeyField
+                  label="スピーカー ミュート切替"
+                  value={settingsDraft.shortcuts?.speakerToggle}
+                  onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, speakerToggle: key })}
+                />
+                <ShortcutKeyField
+                  label="カメラ ON/OFF切替"
+                  value={settingsDraft.shortcuts?.cameraToggle}
+                  onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, cameraToggle: key })}
+                />
+                <p className="field-hint">数字キー（1〜9）でチャンネル一覧の上から順に移動できます（固定）。</p>
+              </div>
+
+              <div className="settings-section">
+                <h2>通話</h2>
+                <label className="field-toggle">
                   <input
-                    type="text"
-                    inputMode="numeric"
-                    value={settingsDraft.serverPort}
-                    onChange={e => updateSettingsDraft('serverPort', e.target.value)}
-                    placeholder="3000"
+                    type="checkbox"
+                    checked={!!settingsDraft.autoUnmuteOnCallAnswer}
+                    onChange={e => updateSettingsDraft('autoUnmuteOnCallAnswer', e.target.checked)}
                   />
-                </div>
+                  <span>呼び出しに応答したら双方のミュートを自動解除する</span>
+                </label>
+              </div>
+
+              <div className="settings-section">
+                <h2>表示</h2>
+                <label className="field-toggle">
+                  <input
+                    type="checkbox"
+                    checked={!!settingsDraft.highlightSelfMuted}
+                    onChange={e => updateSettingsDraft('highlightSelfMuted', e.target.checked)}
+                  />
+                  <span>自拠点がマイクミュート中は枠を赤色で強調する</span>
+                </label>
               </div>
             </div>
 
