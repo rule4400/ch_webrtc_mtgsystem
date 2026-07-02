@@ -2130,3 +2130,117 @@ body.resizing-sidebar {
     min-height: 74px;
   }
 }
+
+/* ── プレゼンスモード（商談中/不在/帰宅） ──────────────── */
+.presence-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: #fff;
+  z-index: 3;
+  pointer-events: none;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.45);
+}
+.presence-badge.presence-busy { background: #d97706; }
+.presence-badge.presence-away { background: #6b7280; }
+.presence-badge.presence-gohome { background: #4338ca; }
+
+.ctrl-separator {
+  width: 1px;
+  height: 26px;
+  background: var(--border);
+  margin: 0 2px;
+  flex-shrink: 0;
+}
+
+.ctrl-btn.mode-btn.mode-active { color: #fff; }
+.ctrl-btn.mode-btn.mode-active.busy { background: #d97706; border-color: #d97706; }
+.ctrl-btn.mode-btn.mode-active.away { background: #6b7280; border-color: #6b7280; }
+.ctrl-btn.mode-btn.mode-active.gohome { background: #4338ca; border-color: #4338ca; }
+
+/* 帰宅モード: 映像エリアだけを覆う（コントロールバーの高さ分は空ける）。
+   サイドバーは別グリッド列、設定FAB/着信画面はより高い z-index のため見える。 */
+.gohome-cover {
+  position: absolute;
+  inset: 0 0 var(--ctrl-h, 64px) 0;
+  z-index: 30;
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  color: rgba(255,255,255,0.55);
+}
+.gohome-cover .gohome-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: rgba(255,255,255,0.8);
+}
+.gohome-cover .gohome-note {
+  font-size: 0.8rem;
+  color: rgba(255,255,255,0.45);
+}
+
+/* ── 通知音設定 ─────────────────────────────────────── */
+.btn-sub {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.08);
+  color: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.btn-sub:hover { background: rgba(255,255,255,0.16); }
+
+.ringtone-volume-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ringtone-volume-row input[type="range"] { flex: 1; }
+
+.ringtone-current {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 0.85rem;
+}
+.ringtone-file-btn { margin-top: 2px; }
+
+.ringtone-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.ringtone-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+.ringtone-list li:last-child { border-bottom: none; }
+.ringtone-list .ringtone-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ringtone-notice { color: #93c5fd; }

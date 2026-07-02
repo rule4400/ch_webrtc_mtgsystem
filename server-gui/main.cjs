@@ -49,11 +49,11 @@ const DEFAULT_SYSTEM_SETTINGS = {
     { id: 'support', name: 'サポート' },
   ],
   latestVersions: {
-    client: '0.3.2',
+    client: '0.3.3',
     viewer: '0.1.0',
     'screen-share': '0.1.0',
-    server: '1.1.2',
-    'server-gui': '1.1.2',
+    server: '1.1.3',
+    'server-gui': '1.1.3',
   },
   updatePackages: {},
   updateFolder: '',
@@ -695,6 +695,12 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
     NODE_PATH: getNodePathEnv(),
   };
   if (workerBin) env.MEDIASOUP_WORKER_BIN = workerBin;
+  // 通知音フォルダは userData 配下に置き、サーバー本体(server-runtime)を
+  // アップデートで入れ替えてもインポート済みの通知音が消えないようにする。
+  if (!env.RINGTONES_DIR) {
+    env.RINGTONES_DIR = path.join(app.getPath('userData'), 'ringtones');
+    try { fs.mkdirSync(env.RINGTONES_DIR, { recursive: true }); } catch { /* 起動は継続 */ }
+  }
   
   // Electron 同梱の Node ランタイムで内蔵サーバーを起動する。
   serverProcess = spawn(process.execPath, [path.join(serverDir, 'index.js')], {

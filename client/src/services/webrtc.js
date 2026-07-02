@@ -17,6 +17,8 @@ const SETUP_WATCHDOG_MS = 20000;
 // 送信画質(高/中/低)ごとのビットレート倍率。サーバー配布の上限値に乗算する。
 const SEND_QUALITY_SCALE = { high: 1, medium: 0.6, low: 0.35 };
 const QUALITY_LEVELS = ['low', 'medium', 'high'];
+// プレゼンスモード（none=通常 / busy=商談中 / away=不在 / gohome=帰宅）
+const PRESENCE_MODES = ['none', 'busy', 'away', 'gohome'];
 // サーバーから設定が取得できない場合(旧サーバー等)の既定ビットレート(bps)
 const DEFAULT_MEDIA_SETTINGS = {
   videoMaxBitrate: 1_200_000,
@@ -109,6 +111,7 @@ export class WebRTCManager {
     this._sendQuality    = 'high';
     this._recvQuality    = 'high';
     this._forceTcp       = false;  // メディアをTCPで送受信する(クライアント設定)
+    this._presenceMode   = 'none'; // 自拠点のプレゼンス(商談中/不在/帰宅)
     this._initialized    = false;
     this._pendingQueue   = [];     // 初期化前に届いた newProducer
     this._locationName   = '';
@@ -320,6 +323,7 @@ export class WebRTCManager {
       assertCurrent('init-mediasoup');
       this._initialized = true;
       this._announceRecvQuality();
+      this._announcePresenceMode();
 
       // 初期化前にキューイングした newProducer を処理
       const queued = this._pendingQueue.splice(0);
@@ -571,6 +575,14 @@ export class WebRTCManager {
       this.onPeerJoined?.(payload);
     });
 
+    this.socket.on('peerPresenceChanged', (payload = {}) => {
+      const peer = this.peers.get(payload.socketId);
+      if (peer) {
+        peer.presenceMode = payload.presenceMode || 'none';
+        this.onPeerUpdated?.(payload.socketId, { ...peer });
+      }
+    });
+
     this.socket.on('incomingCall', (payload = {}, ack) => {
       ack?.({ ok: true, receivedAt: Date.now(), socketId: this.socket.id });
       this.onIncomingCall?.(payload);
@@ -788,6 +800,33 @@ export class WebRTCManager {
   _announceRecvQuality() {
     if (this._recvQuality === 'high') return; // 既定値は送信不要
     this._request('setRecvQuality', { quality: this._recvQuality }).catch(() => {});
+  }
+
+  /**
+   * プレゼンスモード(商談中/不在/帰宅)を設定し、接続中ならサーバー経由で
+   * 全拠点へ配信する。再接続・セッション再構築後も _announcePresenceMode で
+   * 自動再申告されるため、モードが勝手に解除されることはない。
+   */
+  async setPresenceMode(mode) {
+    const m = PRESENCE_MODES.includes(mode) ? mode : 'none';
+    this._presenceMode = m;
+    if (this.socket?.connected && this._initialized) {
+      try {
+        await this._request('setPresenceMode', { mode: m });
+      } catch {
+        // 旧サーバー未対応/一時的な失敗。次回セッション構築時に再申告される。
+      }
+    }
+  }
+
+  getPresenceMode() {
+    return this._presenceMode;
+  }
+
+  /** プレゼンスモードをサーバーへ申告する(セッション構築時)。既定(none)は送信不要 */
+  _announcePresenceMode() {
+    if (this._presenceMode === 'none') return;
+    this._request('setPresenceMode', { mode: this._presenceMode }).catch(() => {});
   }
 
   async _initSendTransport() {
@@ -1185,6 +1224,7 @@ export class WebRTCManager {
           appType:         metadata.appType || 'client',
           appVersion:      metadata.appVersion || '',
           channelId:       metadata.peerChannelId || metadata.channelId || 'general',
+          presenceMode:    metadata.peerPresenceMode || 'none',
           stream:          new MediaStream(),
           screenStream:    new MediaStream(),
           videoProducerId: null,
@@ -1318,7 +1358,7 @@ export class WebRTCManager {
             peer.locationName,
             producer.kind,
             producer.paused,
-            { ...producer, appType: peer.appType, appVersion: peer.appVersion, peerChannelId: peer.channelId },
+            { ...producer, appType: peer.appType, appVersion: peer.appVersion, peerChannelId: peer.channelId, peerPresenceMode: peer.presenceMode },
           );
         }
       }
@@ -1343,6 +1383,11 @@ export class WebRTCManager {
         }
         if (peer.channelId && localPeer.channelId !== peer.channelId) {
           localPeer.channelId = peer.channelId;
+          this.onPeerUpdated?.(peer.socketId, { ...localPeer });
+        }
+        const remotePresence = peer.presenceMode || 'none';
+        if ((localPeer.presenceMode || 'none') !== remotePresence) {
+          localPeer.presenceMode = remotePresence;
           this.onPeerUpdated?.(peer.socketId, { ...localPeer });
         }
         for (const producer of peer.producers) {

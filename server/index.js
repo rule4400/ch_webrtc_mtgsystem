@@ -94,11 +94,11 @@ const DEFAULT_CHANNELS = [
 const APP_TYPES = ['client', 'viewer', 'screen-share', 'server', 'server-gui'];
 const SERVER_APP_VERSION = serverPackage.version || '0.0.0';
 const DEFAULT_APP_VERSIONS = {
-  client: '0.3.2',
+  client: '0.3.3',
   viewer: '0.1.1',
   'screen-share': '0.1.0',
   server: SERVER_APP_VERSION,
-  'server-gui': '1.1.2',
+  'server-gui': '1.1.3',
 };
 let systemState = {
   brand: SYSTEM_NAME,
@@ -566,6 +566,7 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     appType: peer.appType || peer.telemetry?.appType || 'client',
     appVersion: peer.appVersion || peer.telemetry?.appVersion || '',
     channelId: peer.channelId || DEFAULT_CHANNELS[0].id,
+    presenceMode: peer.presenceMode || 'none',
     remoteAddress: peer.socket.handshake.address,
     connectedAt: peer.connectedAt,
     heartbeatAgeMs,
@@ -665,6 +666,48 @@ app.get('/updates/:filename', (req, res) => {
   const filePath = path.join(updateDir, fileName);
   if (!fileName || !filePath.startsWith(updateDir) || !fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'file not found' });
+  }
+  res.download(filePath, fileName);
+});
+
+// ── 通知音（着信音）配信 ──────────────────────────────────
+// RINGTONES_DIR（未指定なら server/ringtones）に置いた mp3/wav 等を全クライアントへ
+// 配布する。クライアントは一覧から選んで取り込み、ローカルに保存して使用する
+// （取り込み後はサーバーが落ちていても鳴る）。server-gui 経由の起動では
+// RINGTONES_DIR が userData 配下に設定され、サーバー更新後もファイルが残る。
+const RINGTONE_FILE_EXT = /\.(mp3|wav|ogg|m4a|aac)$/i;
+const ringtonesDir = process.env.RINGTONES_DIR || path.join(__dirname, 'ringtones');
+try {
+  fs.mkdirSync(ringtonesDir, { recursive: true });
+} catch (err) {
+  console.warn('[Ringtones] ディレクトリを作成できません:', err.message);
+}
+
+function listRingtones() {
+  if (!ringtonesDir || !fs.existsSync(ringtonesDir)) return [];
+  try {
+    return fs.readdirSync(ringtonesDir)
+      .filter(name => RINGTONE_FILE_EXT.test(name))
+      .map(name => {
+        const stat = fs.statSync(path.join(ringtonesDir, name));
+        return { name, size: stat.size, mtimeMs: stat.mtimeMs };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name, 'ja'));
+  } catch (err) {
+    console.error('[Ringtones] list failed:', err.message);
+    return [];
+  }
+}
+
+app.get('/ringtones', (_, res) => {
+  res.json({ dir: ringtonesDir, files: listRingtones() });
+});
+
+app.get('/ringtones/:filename', (req, res) => {
+  const fileName = path.basename(String(req.params.filename || ''));
+  const filePath = path.join(ringtonesDir, fileName);
+  if (!fileName || !RINGTONE_FILE_EXT.test(fileName) || !filePath.startsWith(ringtonesDir) || !fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'ringtone not found' });
   }
   res.download(filePath, fileName);
 });
@@ -1117,6 +1160,7 @@ io.on('connection', async socket => {
     metadataReady: false,
     instanceId: '',
     recvQuality: 'high',
+    presenceMode: 'none',
     connectedAt: Date.now(),
     lastHeartbeatAt: null,
     telemetryRecoveryAt: 0,
@@ -1547,6 +1591,21 @@ io.on('connection', async socket => {
     }
   });
 
+  // ── プレゼンスモード（商談中/不在/帰宅）の設定と全拠点への配信 ──
+  socket.on('setPresenceMode', (payload = {}, callback) => {
+    const peer = peers[socket.id];
+    if (!peer) return safeCallback(callback, { error: 'peer not found' });
+    const mode = ['none', 'busy', 'away', 'gohome'].includes(payload.mode) ? payload.mode : 'none';
+    peer.presenceMode = mode;
+    socket.broadcast.emit('peerPresenceChanged', {
+      socketId: socket.id,
+      locationName: peer.locationName,
+      presenceMode: mode,
+      serverTime: Date.now(),
+    });
+    safeCallback(callback, { ok: true, presenceMode: mode });
+  });
+
   // ── 受信画質の設定（simulcastの優先レイヤ選択）──
   // クライアント側の「受信画質」設定。low/medium/high を空間レイヤ 0/1/2 に
   // マップし、既存および今後作られる video consumer に適用する。
@@ -1631,6 +1690,7 @@ io.on('connection', async socket => {
         appType:      peerInfo.appType,
         appVersion:   peerInfo.appVersion,
         channelId:    peerInfo.channelId,
+        presenceMode: peerInfo.presenceMode || 'none',
         isSelf:       peerId === socket.id,
         producers,
       });

@@ -14,11 +14,12 @@ import {
   Volume2, VolumeX, Settings, ChevronDown, X, Download,
   Plus, Pencil, PanelLeftClose, PanelLeftOpen, Maximize2, Minimize2,
   Volume1, Bell, BellRing, Trash2, Check, MonitorUp, Pause, Play, SwitchCamera, Square,
+  Briefcase, Clock, Moon, Music,
 } from 'lucide-react';
 import { WebRTCManager } from '../services/webrtc';
 import ScreenShareModal from '../components/ScreenShareModal';
 
-const APP_VERSION = '0.3.2';
+const APP_VERSION = '0.3.3';
 const APP_TYPE = 'client';
 const CALL_RING_TIMEOUT_MS = 30000;
 const CALL_RING_INTERVAL_MS = 1500;
@@ -120,6 +121,7 @@ const VideoCell = React.memo(function VideoCell({
   isScreen = false,
   videoPaused,
   audioPaused,
+  presenceMode = 'none',
   highlightMuted = false,
   speakerDeviceId,
   speakerMuted,
@@ -248,6 +250,13 @@ const VideoCell = React.memo(function VideoCell({
           <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: '0.75rem', marginTop: 8 }}>
             カメラ OFF
           </span>
+        </div>
+      )}
+
+      {/* プレゼンスモード（商談中/不在/帰宅）バッジ */}
+      {!isScreen && PRESENCE_LABELS[presenceMode] && (
+        <div className={`presence-badge presence-${presenceMode}`}>
+          {PRESENCE_LABELS[presenceMode]}
         </div>
       )}
 
@@ -568,6 +577,16 @@ const defaultShortcuts = {
   speakerToggle: 's',
   cameraToggle: 'c',
   callAnswer: 'Enter',
+  busyMode: 'u',
+  awayMode: 'i',
+  goHomeMode: 'o',
+};
+
+// プレゼンスモードの表示定義（タイルバッジ・ボタンで共用）
+const PRESENCE_LABELS = {
+  busy: '商談中',
+  away: '不在',
+  gohome: '帰宅',
 };
 const QUALITY_OPTIONS = ['high', 'medium', 'low'];
 const QUALITY_LABELS = { high: '高', medium: '中', low: '低' };
@@ -583,7 +602,47 @@ const defaultClientConfig = {
   forceTcp: false,          // メディアをTCPで送受信（UDPが不安定な場合のみ）
   sendQuality: 'high',      // 送信画質（ビットレート倍率）
   recvQuality: 'high',      // 受信画質（simulcastレイヤ選択）
+  callVolume: 100,          // 呼び出し音の音量（0-100）
 };
+
+// ── カスタム着信音（mp3/wav等）の永続化 ─────────────────────
+// dataURL として localStorage に保存する。設定(sfu_config)とは別キーにして
+// 設定保存のたびに大きなデータを書き直さないようにする。localStorage は
+// Electron の userData に保存されるため、アプリ更新後も引き継がれる。
+const RINGTONE_STORAGE_KEY = 'sfu_ringtone';
+const RINGTONE_MAX_BYTES = 3 * 1024 * 1024; // 3MB（dataURL化で約1.33倍になる）
+
+function loadCustomRingtone() {
+  try {
+    const raw = localStorage.getItem(RINGTONE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.dataUrl !== 'string' || !parsed.dataUrl.startsWith('data:')) return null;
+    return { name: String(parsed.name || 'カスタム着信音'), dataUrl: parsed.dataUrl };
+  } catch {
+    return null;
+  }
+}
+
+function saveCustomRingtone(ringtone) {
+  try {
+    if (!ringtone) localStorage.removeItem(RINGTONE_STORAGE_KEY);
+    else localStorage.setItem(RINGTONE_STORAGE_KEY, JSON.stringify(ringtone));
+    return true;
+  } catch (err) {
+    console.warn('[ringtone] save failed:', err.message);
+    return false;
+  }
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('ファイルを読み込めませんでした'));
+    reader.readAsDataURL(file);
+  });
+}
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
 // 直前の再起動からこの時間内に届いた「健全なセッションへの」再起動要求は無視する。
 // 復旧機構（サーバーrestartCommand/クライアント自己復旧）の多重発火を吸収する。
@@ -636,6 +695,9 @@ function sanitizeClientConfig(config) {
   const forceTcp = raw.forceTcp === true;
   const sendQuality = QUALITY_OPTIONS.includes(raw.sendQuality) ? raw.sendQuality : defaultClientConfig.sendQuality;
   const recvQuality = QUALITY_OPTIONS.includes(raw.recvQuality) ? raw.recvQuality : defaultClientConfig.recvQuality;
+  const callVolume = Number.isFinite(Number(raw.callVolume))
+    ? Math.min(100, Math.max(0, Math.round(Number(raw.callVolume))))
+    : defaultClientConfig.callVolume;
 
   return {
     ...raw,
@@ -650,6 +712,7 @@ function sanitizeClientConfig(config) {
     forceTcp,
     sendQuality,
     recvQuality,
+    callVolume,
   };
 }
 
@@ -731,6 +794,16 @@ export default function MainView() {
   const [localStream,  setLocalStream]  = useState(null);
   // 起動時のマイク状態は設定に従う（既定: ミュートで開始）
   const [micEnabled,   setMicEnabled]   = useState(() => !loadClientConfig().startMicMuted);
+  // プレゼンスモード（none/busy=商談中/away=不在/gohome=帰宅）。
+  // ref は着信音量計算やショートカットなどコールバックから参照するために持つ。
+  const [presenceMode, setPresenceMode] = useState('none');
+  const presenceModeRef = useRef('none');
+  // カスタム着信音（mp3/wav等、localStorageに永続化）
+  const [customRingtone, setCustomRingtone] = useState(() => loadCustomRingtone());
+  const customRingtoneRef = useRef(null);
+  const ringtoneAudioRef = useRef(null);   // 鳴動中の Audio 要素（ループ再生）
+  const [serverRingtones, setServerRingtones] = useState(null); // null=未取得
+  const [ringtoneNotice, setRingtoneNotice] = useState('');
   const [camEnabled,   setCamEnabled]   = useState(true);
   const [speakerMuted, setSpeakerMuted] = useState(false);
 
@@ -905,9 +978,26 @@ export default function MainView() {
     }
   }, []);
 
-  const playCallTone = useCallback(() => {
+  // customRingtone(state) をコールバックから参照するための ref 同期
+  useEffect(() => {
+    customRingtoneRef.current = customRingtone;
+  }, [customRingtone]);
+
+  /**
+   * 着信音の実効音量（0-1）。設定の呼び出し音量に、商談中モードなら 0.5 を掛ける。
+   * 不在/帰宅モードは 100% のまま。
+   */
+  const ringVolumeScale = useCallback(() => {
+    const conf = configRef.current?.serverIp ? configRef.current : loadClientConfig();
+    const base = Math.min(100, Math.max(0, Number(conf.callVolume ?? 100))) / 100;
+    const busyFactor = presenceModeRef.current === 'busy' ? 0.5 : 1;
+    return base * busyFactor;
+  }, []);
+
+  /** 既定のベル音を合成再生する（volume: 0-1） */
+  const playSynthCallTone = useCallback((volume) => {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) return;
+    if (!AudioContextClass || volume <= 0) return;
 
     try {
       const context = callAudioRef.current && callAudioRef.current.state !== 'closed'
@@ -918,7 +1008,7 @@ export default function MainView() {
 
       const now = context.currentTime;
       const master = context.createGain();
-      master.gain.setValueAtTime(0.32, now);
+      master.gain.setValueAtTime(0.32 * volume, now);
       master.connect(context.destination);
 
       for (let index = 0; index < 6; index += 1) {
@@ -939,6 +1029,59 @@ export default function MainView() {
       console.warn('[callTone]', err.message);
     }
   }, []);
+
+  /**
+   * 着信音を鳴らす。カスタム着信音(mp3/wav)が設定されていればループ再生、
+   * なければ既定のベル音を合成する。鳴動間隔(CALL_RING_INTERVAL_MS)ごとに
+   * 呼ばれるが、カスタム音のループ再生中は多重再生しない。
+   */
+  const playCallTone = useCallback(() => {
+    const volume = ringVolumeScale();
+    if (volume <= 0) return;
+
+    const ringtone = customRingtoneRef.current;
+    if (ringtone?.dataUrl) {
+      const playing = ringtoneAudioRef.current;
+      if (playing && !playing.paused && !playing.ended) {
+        playing.volume = volume; // モード切替を鳴動中にも反映
+        return;
+      }
+      try {
+        const audio = playing || new Audio(ringtone.dataUrl);
+        audio.loop = true;
+        audio.volume = volume;
+        ringtoneAudioRef.current = audio;
+        audio.play().catch(err => {
+          // 自動再生ブロック等。既定のベル音にフォールバックする。
+          console.warn('[ringtone]', err.message);
+          playSynthCallTone(volume);
+        });
+      } catch (err) {
+        console.warn('[ringtone]', err.message);
+        playSynthCallTone(volume);
+      }
+      return;
+    }
+
+    playSynthCallTone(volume);
+  }, [playSynthCallTone, ringVolumeScale]);
+
+  /** 設定画面の試聴用。ドラフト中の音量・選択中の音源で一度だけ鳴らす */
+  const previewCallTone = useCallback((volumePercent) => {
+    const volume = Math.min(100, Math.max(0, Number(volumePercent ?? 100))) / 100;
+    const ringtone = customRingtoneRef.current;
+    if (ringtone?.dataUrl) {
+      try {
+        const audio = new Audio(ringtone.dataUrl);
+        audio.volume = volume;
+        audio.play().catch(() => {});
+        // 試聴は数秒で止める（長い曲をフルで流さない）
+        setTimeout(() => { try { audio.pause(); } catch { /* ignore */ } }, 4000);
+        return;
+      } catch { /* fall through to synth */ }
+    }
+    playSynthCallTone(volume);
+  }, [playSynthCallTone]);
 
   // ── 呼び出し結果の一時通知（画面下部に数秒表示）──
   const showCallNotice = useCallback((text, tone = 'info') => {
@@ -968,6 +1111,11 @@ export default function MainView() {
     if (incomingCallRingIntervalRef.current) {
       clearInterval(incomingCallRingIntervalRef.current);
       incomingCallRingIntervalRef.current = null;
+    }
+    // カスタム着信音（ループ再生中の Audio 要素）を停止する
+    if (ringtoneAudioRef.current) {
+      try { ringtoneAudioRef.current.pause(); } catch { /* ignore */ }
+      ringtoneAudioRef.current = null;
     }
     activeIncomingCallIdRef.current = '';
     setIncomingCall(null);
@@ -1401,6 +1549,8 @@ export default function MainView() {
     const currentStream = streamRef.current;
     rtcManager.camEnabled = camEnabled;
     rtcManager.micEnabled = micEnabled;
+    // セッション再構築でもプレゼンスモードを維持する（接続後に自動申告される）
+    rtcManager.setPresenceMode(presenceModeRef.current).catch(() => {});
     rtcManager.setLocalTracks(
       currentStream?.getVideoTracks()[0] || null,
       currentStream?.getAudioTracks()[0] || null,
@@ -1795,11 +1945,82 @@ export default function MainView() {
     setMicrophoneEnabled(!micEnabled).catch(() => {});
   }, [micEnabled, setMicrophoneEnabled]);
 
+  // ─── プレゼンスモード（商談中/不在/帰宅）────────────────────
+  // 同じモードをもう一度押すと解除。モードは排他（同時に1つ）で、
+  // サーバー経由で全拠点へ配信され、各拠点のタイルにバッジ表示される。
+  const togglePresenceMode = useCallback((mode) => {
+    const next = presenceModeRef.current === mode ? 'none' : mode;
+    presenceModeRef.current = next;
+    setPresenceMode(next);
+    webrtcRef.current?.setPresenceMode(next)?.catch?.(() => {});
+  }, []);
+
+  // ─── カスタム着信音の管理 ──────────────────────────────────
+  const applyCustomRingtone = useCallback((ringtone) => {
+    if (saveCustomRingtone(ringtone)) {
+      setCustomRingtone(ringtone);
+      setRingtoneNotice(ringtone ? `「${ringtone.name}」を着信音に設定しました` : '既定の着信音に戻しました');
+    } else {
+      setRingtoneNotice('保存に失敗しました。ファイルサイズを小さくして再度お試しください。');
+    }
+  }, []);
+
+  const importRingtoneFile = useCallback(async (file) => {
+    if (!file) return;
+    const isAudio = /\.(mp3|wav|ogg|m4a|aac)$/i.test(file.name) || String(file.type).startsWith('audio/');
+    if (!isAudio) {
+      setRingtoneNotice('mp3 / wav などの音声ファイルを選択してください');
+      return;
+    }
+    if (file.size > RINGTONE_MAX_BYTES) {
+      setRingtoneNotice('ファイルが大きすぎます（3MB以下の音声を選択してください）');
+      return;
+    }
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      applyCustomRingtone({ name: file.name, dataUrl });
+    } catch (err) {
+      setRingtoneNotice(`読み込みに失敗しました: ${err.message}`);
+    }
+  }, [applyCustomRingtone]);
+
+  /** サーバーの ringtones フォルダにある通知音一覧を取得する（設定画面表示時） */
+  const fetchServerRingtones = useCallback(async () => {
+    setServerRingtones(null);
+    try {
+      const conf = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+      const res = await fetch(`${serverUrlFromConfig(conf)}/ringtones`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setServerRingtones(Array.isArray(data.files) ? data.files : []);
+    } catch (err) {
+      console.warn('[ringtones]', err.message);
+      setServerRingtones([]);
+    }
+  }, []);
+
+  /** サーバー配布の通知音をダウンロードしてローカルに保存し、着信音として使う */
+  const importServerRingtone = useCallback(async (name) => {
+    try {
+      const conf = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+      const res = await fetch(`${serverUrlFromConfig(conf)}/ringtones/${encodeURIComponent(name)}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      if (blob.size > RINGTONE_MAX_BYTES) throw new Error('ファイルが大きすぎます（3MB以下）');
+      const dataUrl = await readFileAsDataUrl(blob);
+      applyCustomRingtone({ name, dataUrl });
+    } catch (err) {
+      setRingtoneNotice(`取り込みに失敗しました: ${err.message}`);
+    }
+  }, [applyCustomRingtone]);
+
   const openSettingsPanel = useCallback(() => {
     const current = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
     setSettingsDraft(current);
+    setRingtoneNotice('');
     setSettingsOpen(true);
-  }, []);
+    fetchServerRingtones();
+  }, [fetchServerRingtones]);
 
   const updateSettingsDraft = useCallback((key, value) => {
     setSettingsDraft(prev => ({ ...prev, [key]: value }));
@@ -1910,11 +2131,20 @@ export default function MainView() {
       } else if (key === shortcuts.cameraToggle) {
         event.preventDefault();
         toggleCam();
+      } else if (key === (shortcuts.busyMode || 'u')) {
+        event.preventDefault();
+        togglePresenceMode('busy');
+      } else if (key === (shortcuts.awayMode || 'i')) {
+        event.preventDefault();
+        togglePresenceMode('away');
+      } else if (key === (shortcuts.goHomeMode || 'o')) {
+        event.preventDefault();
+        togglePresenceMode('gohome');
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [settingsOpen, channels, changeChannel, toggleMic, toggleCam, setSpeakerOutputEnabled, speakerMuted, incomingCall, answerIncomingCall]);
+  }, [settingsOpen, channels, changeChannel, toggleMic, toggleCam, setSpeakerOutputEnabled, speakerMuted, incomingCall, answerIncomingCall, togglePresenceMode]);
 
   const createChannel = useCallback(async (event) => {
     event?.preventDefault?.();
@@ -2026,7 +2256,15 @@ export default function MainView() {
       }
     }
 
-    const targetName = peers.get(socketId)?.locationName || '相手拠点';
+    const targetPeer = peers.get(socketId);
+    const targetName = targetPeer?.locationName || '相手拠点';
+
+    // 相手が商談中モードの場合は確認してから呼び出す
+    if (targetPeer?.presenceMode === 'busy') {
+      const proceed = window.confirm(`${targetName} は商談中です。本当に呼び出しますか？`);
+      if (!proceed) return;
+    }
+
     try {
       const result = await webrtcRef.current?.callPeer(socketId);
       const callId = result?.callId || '';
@@ -2225,6 +2463,7 @@ export default function MainView() {
       speakerMuted: false,
       sameChannel: true,
       channelId: activeChannelId,
+      presenceMode,
       canControlVolume: false,
       baseVolume: 0,
       sortRank: 0,
@@ -2269,6 +2508,7 @@ export default function MainView() {
           speakerMuted: speakerMuted || !sameChannel,
           sameChannel,
           channelId: peerChannelId,
+          presenceMode: peer.presenceMode || 'none',
           canControlVolume: true,
           baseVolume: remoteAudioVolume,
           sortRank: sameChannel ? 1 : 3,
@@ -2307,6 +2547,7 @@ export default function MainView() {
     localStream,
     micEnabled,
     peerEntries,
+    presenceMode,
     remoteAudioVolume,
     screenShare,
     selectedAudioOutId,
@@ -2363,6 +2604,7 @@ export default function MainView() {
         isScreen={!!tile.isScreen}
         videoPaused={tile.videoPaused}
         audioPaused={tile.audioPaused}
+        presenceMode={tile.presenceMode || 'none'}
         highlightMuted={highlightSelfMuted}
         speakerDeviceId={tile.speakerDeviceId}
         speakerMuted={tile.speakerMuted}
@@ -2630,6 +2872,17 @@ export default function MainView() {
       )}
 
       <div className="meeting-stage">
+      {/* 帰宅モード: 映像エリアを黒くする（サイドバー・コントロールバー・
+          着信画面などのボタン群は覆わない）。セッションは維持される。 */}
+      {presenceMode === 'gohome' && (
+        <div className="gohome-cover" role="status" aria-label="帰宅モード中">
+          <Moon size={42} />
+          <div className="gohome-title">帰宅モード</div>
+          <div className="gohome-note">
+            映像表示をオフにしています。{(settingsDraft.shortcuts?.goHomeMode || 'o').toUpperCase()} キーまたは下のボタンで解除できます。
+          </div>
+        </div>
+      )}
 
       <div className="floating-status">
         <span className="status-dot" style={{
@@ -2835,6 +3088,37 @@ export default function MainView() {
         >
           <MonitorUp size={20} />
         </button>
+
+        <div className="ctrl-separator" aria-hidden="true" />
+
+        {/* プレゼンスモード（商談中/不在/帰宅） */}
+        <button
+          className={`ctrl-btn mode-btn ${presenceMode === 'busy' ? 'mode-active busy' : ''}`}
+          onClick={() => togglePresenceMode('busy')}
+          title={`商談中モード（${(settingsDraft.shortcuts?.busyMode || 'u').toUpperCase()}）: 他拠点に商談中と表示・着信音50%`}
+          aria-label="商談中モード"
+          aria-pressed={presenceMode === 'busy'}
+        >
+          <Briefcase size={20} />
+        </button>
+        <button
+          className={`ctrl-btn mode-btn ${presenceMode === 'away' ? 'mode-active away' : ''}`}
+          onClick={() => togglePresenceMode('away')}
+          title={`不在モード（${(settingsDraft.shortcuts?.awayMode || 'i').toUpperCase()}）: 他拠点に不在と表示`}
+          aria-label="不在モード"
+          aria-pressed={presenceMode === 'away'}
+        >
+          <Clock size={20} />
+        </button>
+        <button
+          className={`ctrl-btn mode-btn ${presenceMode === 'gohome' ? 'mode-active gohome' : ''}`}
+          onClick={() => togglePresenceMode('gohome')}
+          title={`帰宅モード（${(settingsDraft.shortcuts?.goHomeMode || 'o').toUpperCase()}）: 映像表示をオフにする`}
+          aria-label="帰宅モード"
+          aria-pressed={presenceMode === 'gohome'}
+        >
+          <Moon size={20} />
+        </button>
       </div>
 
       <button
@@ -2945,6 +3229,21 @@ export default function MainView() {
                   value={settingsDraft.shortcuts?.callAnswer}
                   onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, callAnswer: key })}
                 />
+                <ShortcutKeyField
+                  label="商談中モード切替"
+                  value={settingsDraft.shortcuts?.busyMode}
+                  onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, busyMode: key })}
+                />
+                <ShortcutKeyField
+                  label="不在モード切替"
+                  value={settingsDraft.shortcuts?.awayMode}
+                  onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, awayMode: key })}
+                />
+                <ShortcutKeyField
+                  label="帰宅モード切替"
+                  value={settingsDraft.shortcuts?.goHomeMode}
+                  onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, goHomeMode: key })}
+                />
                 <p className="field-hint">数字キー（1〜9）でチャンネル一覧の上から順に移動できます（固定）。</p>
               </div>
 
@@ -2983,6 +3282,71 @@ export default function MainView() {
                   />
                   <span>メディアをTCPで送受信する（UDPが不安定・遮断される場合のみ）</span>
                 </label>
+              </div>
+
+              <div className="settings-section">
+                <h2>通知音（呼び出し音）</h2>
+                <div className="field">
+                  <label>音量: {settingsDraft.callVolume ?? 100}%</label>
+                  <div className="ringtone-volume-row">
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={settingsDraft.callVolume ?? 100}
+                      onChange={e => updateSettingsDraft('callVolume', Number(e.target.value))}
+                    />
+                    <button type="button" className="btn-sub" onClick={() => previewCallTone(settingsDraft.callVolume ?? 100)}>
+                      試聴
+                    </button>
+                  </div>
+                  <p className="field-hint">商談中モード中は自動的に50%へ下がります。音量は「保存して反映」で確定します。</p>
+                </div>
+                <div className="field">
+                  <label>着信音</label>
+                  <div className="ringtone-current">
+                    <Music size={14} />
+                    <span>{customRingtone?.name || '既定のベル音'}</span>
+                    {customRingtone && (
+                      <button type="button" className="btn-sub" onClick={() => applyCustomRingtone(null)}>
+                        既定に戻す
+                      </button>
+                    )}
+                  </div>
+                  <label className="btn-sub ringtone-file-btn">
+                    ファイルから選択（mp3 / wav）
+                    <input
+                      type="file"
+                      accept=".mp3,.wav,.ogg,.m4a,.aac,audio/*"
+                      style={{ display: 'none' }}
+                      onChange={e => { importRingtoneFile(e.target.files?.[0]); e.target.value = ''; }}
+                    />
+                  </label>
+                </div>
+                <div className="field">
+                  <label>サーバーの通知音</label>
+                  {serverRingtones === null && <p className="field-hint">読み込み中…</p>}
+                  {Array.isArray(serverRingtones) && serverRingtones.length === 0 && (
+                    <p className="field-hint">
+                      サーバーに通知音がありません。サーバーの ringtones フォルダに mp3/wav を置くと、全拠点がここから取り込めます。
+                    </p>
+                  )}
+                  {Array.isArray(serverRingtones) && serverRingtones.length > 0 && (
+                    <ul className="ringtone-list">
+                      {serverRingtones.map(file => (
+                        <li key={file.name}>
+                          <span className="ringtone-name">{file.name}</span>
+                          <button type="button" className="btn-sub" onClick={() => importServerRingtone(file.name)}>
+                            取り込む
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                {ringtoneNotice && <p className="field-hint ringtone-notice">{ringtoneNotice}</p>}
+                <p className="field-hint">取り込んだ着信音と音量はこの端末に保存され、アプリを更新しても引き継がれます。</p>
               </div>
 
               <div className="settings-section">
