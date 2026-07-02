@@ -67,6 +67,38 @@ const rtcMinPort = Number(process.env.RTC_MIN_PORT) || 10000;
 const rtcMaxPort = Number(process.env.RTC_MAX_PORT) || 10200;
 
 /**
+ * メディア伝送のTCP設定。
+ *   FORCE_TCP=1  … UDPを無効化し、全メディアをTCP(ICE-TCP)で送受信する
+ *   PREFER_TCP=1 … UDPも有効なままTCP候補を優先する（UDPが不安定な環境向け）
+ * どちらも未指定ならUDP優先（既定）。TCPはHoLブロッキングで遅延が増えるため、
+ * UDPが通る環境ではUDP優先のままにすること。
+ */
+const forceTcp = /^(1|true|yes)$/i.test(process.env.FORCE_TCP || '');
+const preferTcp = forceTcp || /^(1|true|yes)$/i.test(process.env.PREFER_TCP || '');
+if (forceTcp) console.log('[Config] FORCE_TCP=1: メディアはTCPのみで伝送します');
+else if (preferTcp) console.log('[Config] PREFER_TCP=1: TCP候補を優先します');
+
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+/**
+ * ビットレート設定（bps）。サーバー側の既定値で、getServerConfig 経由で
+ * 全クライアントに配布される。クライアント側の画質設定(高/中/低)は
+ * この値に対する倍率として適用される。
+ *   VIDEO_MAX_BITRATE  … カメラ映像の最上位レイヤ上限（既定 1200000）
+ *   SCREEN_MAX_BITRATE … 画面共有の最上位レイヤ上限（既定 1800000）
+ *   AUDIO_MAX_BITRATE  … Opus音声の平均ビットレート上限（既定 0 = コーデック既定）
+ */
+const mediaSettings = {
+  videoMaxBitrate: clampInt(process.env.VIDEO_MAX_BITRATE, 100_000, 8_000_000, 1_200_000),
+  screenMaxBitrate: clampInt(process.env.SCREEN_MAX_BITRATE, 100_000, 10_000_000, 1_800_000),
+  audioMaxBitrate: clampInt(process.env.AUDIO_MAX_BITRATE, 0, 510_000, 0),
+};
+
+/**
  * クライアントへ渡す ICE サーバー（STUN/TURN）。
  * 拠点間で UDP がブロックされる環境では TURN を設定すると到達性が上がる。
  * 環境変数:
@@ -100,6 +132,10 @@ module.exports = {
 
   // クライアントへ配布する ICE サーバー
   iceServers: buildIceServers(),
+
+  // メディア伝送設定（getServerConfig でクライアントへ配布）
+  mediaTransport: { forceTcp, preferTcp },
+  mediaSettings,
 
   mediasoup: {
     numWorkers: Math.min(os.cpus().length, 4),
@@ -143,9 +179,10 @@ module.exports = {
       initialAvailableOutgoingBitrate: 1_000_000,
       minimumAvailableOutgoingBitrate: 600_000,
       maxSctpMessageSize: 262144,
-      enableUdp: true,
+      enableUdp: !forceTcp,
       enableTcp: true,
-      preferUdp: true,
+      preferUdp: !preferTcp,
+      preferTcp,
     },
   },
 };

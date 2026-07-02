@@ -104,7 +104,7 @@ async function run() {
     const peerChannelEvents = [];
     socket.on('peerChannelChanged', payload => peerChannelEvents.push(payload));
 
-    socket.emit('setMetadata', { locationName: 'smoke-client', appType: 'client', appVersion: '0.3.1', channelId: 'general' });
+    socket.emit('setMetadata', { locationName: 'smoke-client', appType: 'client', appVersion: '0.3.2', channelId: 'general' });
     const viewerPresenceEvents = [];
     socket.on('viewerPresence', payload => viewerPresenceEvents.push(payload));
 
@@ -117,8 +117,8 @@ async function run() {
       type: 'set-system-state',
       state: {
         channels: [{ id: 'general', name: '一般' }, { id: 'ops', name: 'Ops' }],
-        latestVersions: { client: '0.3.1' },
-        updatePackages: { client: { version: '0.3.1', url: 'https://example.com/client' } },
+        latestVersions: { client: '0.3.2' },
+        updatePackages: { client: { version: '0.3.2', url: 'https://example.com/client' } },
       },
     });
     await wait(250);
@@ -153,7 +153,7 @@ async function run() {
 
     const telemetry = await emitAck(socket, 'clientTelemetry', {
       appType: 'client',
-      appVersion: '0.3.1',
+      appVersion: '0.3.2',
       locationName: 'smoke-client',
       channelId: 'ops',
       devices: {
@@ -267,7 +267,7 @@ async function run() {
 
     let updateOk = false;
     socket.on('updateCommand', (payload, ack) => {
-      updateOk = payload.appType === 'client' && payload.version === '0.3.1';
+      updateOk = payload.appType === 'client' && payload.version === '0.3.2';
       ack?.({ ok: true, socketId: socket.id, receivedAt: Date.now() });
     });
     child.send({ type: 'force-update', appType: 'client' });
@@ -279,7 +279,7 @@ async function run() {
     if (healthClient?.health !== 'healthy') throw new Error('health snapshot did not include healthy client');
     if (healthClient?.viewerPresence !== true) throw new Error('health snapshot did not include viewer presence');
     if (healthClient?.channelId !== 'ops') throw new Error('health snapshot did not include client channel');
-    if (health.systemState?.latestVersions?.client !== '0.3.1') throw new Error('health snapshot did not include systemState');
+    if (health.systemState?.latestVersions?.client !== '0.3.2') throw new Error('health snapshot did not include systemState');
 
     viewerSocket.disconnect();
     viewerSocket = null;

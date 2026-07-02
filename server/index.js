@@ -94,11 +94,11 @@ const DEFAULT_CHANNELS = [
 const APP_TYPES = ['client', 'viewer', 'screen-share', 'server', 'server-gui'];
 const SERVER_APP_VERSION = serverPackage.version || '0.0.0';
 const DEFAULT_APP_VERSIONS = {
-  client: '0.3.1',
+  client: '0.3.2',
   viewer: '0.1.1',
   'screen-share': '0.1.0',
   server: SERVER_APP_VERSION,
-  'server-gui': '1.1.1',
+  'server-gui': '1.1.2',
 };
 let systemState = {
   brand: SYSTEM_NAME,
@@ -555,6 +555,8 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     kind: consumer.kind,
     paused: consumer.paused,
     closed: consumer.closed,
+    // サーバーからこのピアへの下りRTPが実際に流れているか（停滞中は true）
+    flowStalled: !!consumer.appData?.flowStalled,
   }));
   const heartbeatAgeMs = peer.lastHeartbeatAt ? now - peer.lastHeartbeatAt : null;
 
@@ -834,6 +836,13 @@ function emitIncomingCall(socketId, payload, source = 'server') {
   return { ok: true, call: callPayload };
 }
 
+/** 受信画質(low/medium/high)を simulcast の空間レイヤ(0/1/2)に変換する */
+function recvQualityToSpatialLayer(quality) {
+  if (quality === 'low') return 0;
+  if (quality === 'medium') return 1;
+  return 2;
+}
+
 function normalizeMediaStateKind(kind) {
   const value = shortString(kind, 32);
   if (value === 'camera' || value === 'video') return 'camera';
@@ -916,16 +925,54 @@ async function sampleProducerInboundBytes(producer) {
   return bytes;
 }
 
+/** consumer(下りRTP)の送信済みバイト数を取得する */
+async function sampleConsumerOutboundBytes(consumer) {
+  const stats = await consumer.getStats();
+  let bytes = 0;
+  for (const item of stats) {
+    if (item.type === 'outbound-rtp') bytes += Number(item.byteCount) || 0;
+  }
+  return bytes;
+}
+
+/** 停滞を検出したピアへの復旧指示（クールダウン+エスカレーション込み） */
+function recoverStalledPeer(socketId, peer, stalledKinds, now) {
+  if (now - (peer.mediaStallRecoveryAt || 0) < MEDIA_STALL_COOLDOWN_MS) return;
+  peer.mediaStallRecoveryAt = now;
+  peer.mediaStallStrikes = (peer.mediaStallStrikes || 0) + 1;
+
+  if (peer.mediaStallStrikes >= MEDIA_STALL_ESCALATE_STRIKES) {
+    // セッション再構築を繰り返しても届かない → クライアント側の
+    // ネットワークスタック/アプリごと再起動させる方が復旧確率が高い。
+    peer.mediaStallStrikes = 0;
+    sendAdminLog(`[Recovery] media-stalled escalation name=${peer.locationName} kinds=${stalledKinds.join(',')} → restartCommand`);
+    emitRestartCommand(peer.socket, 1, `media-stalled:${socketId}`);
+    return;
+  }
+
+  sendAdminLog(`[Recovery] media-stalled name=${peer.locationName} kinds=${stalledKinds.join(',')} strike=${peer.mediaStallStrikes} → session rebuild`);
+  // サーバー側の古い transport/producer を破棄してから作り直させる。
+  // 生かしたままだとクライアントの再構築後も停滞した経路が残り続ける。
+  resetPeerMedia(peer);
+  peer.socket.emit('mediaLayerRestarted');
+}
+
 let mediaFlowCheckRunning = false;
 async function checkMediaFlow(now = Date.now()) {
   if (!MEDIA_STALL_RECOVERY || recovering || mediaFlowCheckRunning) return;
   mediaFlowCheckRunning = true;
   try {
+    // ── フェーズ1: 上り(producer)。サーバーが各拠点から実際にRTPを受信できているか ──
+    // このtickでバイト増加が確認できた producerId の集合。フェーズ2で
+    // 「上りは届いているのに下りが止まっている」判定に使う。
+    const flowingProducers = new Set();
+    const stalledByPeer = new Map(); // socketId → string[]
+
     for (const [socketId, peer] of Object.entries(peers)) {
       if (!peer.socket?.connected || !peer.metadataReady) continue;
 
       const stalledKinds = [];
-      for (const entry of peer.producers.values()) {
+      for (const [producerId, entry] of peer.producers) {
         const producer = entry.producer;
         // paused(ミュート等)や閉じた producer はRTPが止まるのが正常。
         // 追跡をリセットしておき、resume 後に停滞時計がゼロから始まるようにする。
@@ -945,6 +992,7 @@ async function checkMediaFlow(now = Date.now()) {
           entry.flowBytes = bytes;
           entry.flowAt = now;
           entry.flowStalled = false;
+          flowingProducers.add(producerId);
           continue;
         }
         const stalledFor = now - (entry.flowAt || now);
@@ -953,29 +1001,54 @@ async function checkMediaFlow(now = Date.now()) {
           stalledKinds.push(`${entry.source || entry.kind}:${Math.round(stalledFor / 1000)}s`);
         }
       }
+      if (stalledKinds.length) stalledByPeer.set(socketId, stalledKinds);
+    }
+
+    // ── フェーズ2: 下り(consumer)。サーバーが各拠点へ実際にRTPを送出できているか ──
+    // 「セッションは接続されているのに映像が真っ暗」の典型例: 上り(producer)は
+    // 流れているのに、受信側ピアへの consumer 送出だけが止まっているケースを検出する。
+    for (const [socketId, peer] of Object.entries(peers)) {
+      if (!peer.socket?.connected || !peer.metadataReady) continue;
+
+      const stalledKinds = stalledByPeer.get(socketId) || [];
+      for (const consumer of peer.consumers.values()) {
+        const tracking = consumer.appData || (consumer.appData = {});
+        // paused/producerPaused 中は送出が止まるのが正常。元のproducerが
+        // 流れていない場合も、原因は上り側（フェーズ1が回収する）なので対象外。
+        if (
+          consumer.closed || consumer.paused || consumer.producerPaused ||
+          !flowingProducers.has(consumer.producerId)
+        ) {
+          tracking.flowBytes = null;
+          tracking.flowAt = null;
+          tracking.flowStalled = false;
+          continue;
+        }
+        let bytes;
+        try {
+          bytes = await sampleConsumerOutboundBytes(consumer);
+        } catch {
+          continue;
+        }
+        if (tracking.flowBytes == null || bytes > tracking.flowBytes) {
+          tracking.flowBytes = bytes;
+          tracking.flowAt = now;
+          tracking.flowStalled = false;
+          continue;
+        }
+        const stalledFor = now - (tracking.flowAt || now);
+        if (stalledFor >= MEDIA_STALL_RESTART_MS) {
+          tracking.flowStalled = true;
+          stalledKinds.push(`recv-${consumer.kind}:${Math.round(stalledFor / 1000)}s`);
+        }
+      }
 
       if (!stalledKinds.length) {
-        if (peer.producers.size > 0) peer.mediaStallStrikes = 0;
+        // 上り・下りとも健全 → エスカレーション用の連続停滞カウントをリセット
+        if (peer.producers.size > 0 || peer.consumers.size > 0) peer.mediaStallStrikes = 0;
         continue;
       }
-      if (now - (peer.mediaStallRecoveryAt || 0) < MEDIA_STALL_COOLDOWN_MS) continue;
-      peer.mediaStallRecoveryAt = now;
-      peer.mediaStallStrikes = (peer.mediaStallStrikes || 0) + 1;
-
-      if (peer.mediaStallStrikes >= MEDIA_STALL_ESCALATE_STRIKES) {
-        // セッション再構築を繰り返しても届かない → クライアント側の
-        // ネットワークスタック/アプリごと再起動させる方が復旧確率が高い。
-        peer.mediaStallStrikes = 0;
-        sendAdminLog(`[Recovery] media-stalled escalation name=${peer.locationName} kinds=${stalledKinds.join(',')} → restartCommand`);
-        emitRestartCommand(peer.socket, 1, `media-stalled:${socketId}`);
-        continue;
-      }
-
-      sendAdminLog(`[Recovery] media-stalled name=${peer.locationName} kinds=${stalledKinds.join(',')} strike=${peer.mediaStallStrikes} → session rebuild`);
-      // サーバー側の古い transport/producer を破棄してから作り直させる。
-      // 生かしたままだとクライアントの再構築後も停滞した経路が残り続ける。
-      resetPeerMedia(peer);
-      peer.socket.emit('mediaLayerRestarted');
+      recoverStalledPeer(socketId, peer, stalledKinds, now);
     }
   } finally {
     mediaFlowCheckRunning = false;
@@ -991,11 +1064,16 @@ mediaFlowTimer.unref?.();
 
 async function createWebRtcTransport(router, forceTcp = false, peer = null) {
   const { listenIps, initialAvailableOutgoingBitrate } = config.mediasoup.webRtcTransport;
+  // クライアントの要求(forceTcp)とサーバー設定(FORCE_TCP/PREFER_TCP)を合成する。
+  // どちらかがTCPを要求すればTCPで伝送する（映像・音声・画面共有すべて）。
+  const tcpOnly = forceTcp || !!config.mediaTransport?.forceTcp;
+  const preferTcp = tcpOnly || !!config.mediaTransport?.preferTcp;
   const transport = await router.createWebRtcTransport({
     listenIps,
-    enableUdp: !forceTcp,
+    enableUdp: !tcpOnly,
     enableTcp: true,
-    preferUdp: !forceTcp,
+    preferUdp: !preferTcp,
+    preferTcp,
     initialAvailableOutgoingBitrate,
   });
   transport.on('dtlsstatechange', state => { if (state === 'closed') transport.close(); });
@@ -1038,6 +1116,7 @@ io.on('connection', async socket => {
     channelId: DEFAULT_CHANNELS[0].id,
     metadataReady: false,
     instanceId: '',
+    recvQuality: 'high',
     connectedAt: Date.now(),
     lastHeartbeatAt: null,
     telemetryRecoveryAt: 0,
@@ -1139,9 +1218,13 @@ io.on('connection', async socket => {
     safeCallback(callback, router.rtpCapabilities);
   });
 
-  // ── サーバー設定（ICE サーバーなど）──
+  // ── サーバー設定（ICE サーバー・ビットレート・TCP設定など）──
   socket.on('getServerConfig', (_, callback) => {
-    safeCallback(callback, { iceServers: config.iceServers || [] });
+    safeCallback(callback, {
+      iceServers: config.iceServers || [],
+      mediaSettings: config.mediaSettings || {},
+      mediaTransport: config.mediaTransport || {},
+    });
   });
 
   socket.on('getSystemState', (_, callback) => {
@@ -1430,6 +1513,16 @@ io.on('connection', async socket => {
 
       peer.consumers.set(consumer.id, consumer);
 
+      // このピアが受信画質を設定済みなら、新しい consumer にも適用する
+      if (consumer.kind === 'video' && peer.recvQuality && peer.recvQuality !== 'high') {
+        try {
+          await consumer.setPreferredLayers({
+            spatialLayer: recvQualityToSpatialLayer(peer.recvQuality),
+            temporalLayer: 2,
+          });
+        } catch (_) { /* simulcastでない場合は無視 */ }
+      }
+
       consumer.on('transportclose', () => {
         consumer.close();
         peers[socket.id]?.consumers.delete(consumer.id);
@@ -1450,6 +1543,28 @@ io.on('connection', async socket => {
       });
     } catch (err) {
       console.error('[consume]', err);
+      safeCallback(callback, { error: err.message });
+    }
+  });
+
+  // ── 受信画質の設定（simulcastの優先レイヤ選択）──
+  // クライアント側の「受信画質」設定。low/medium/high を空間レイヤ 0/1/2 に
+  // マップし、既存および今後作られる video consumer に適用する。
+  socket.on('setRecvQuality', async (payload = {}, callback) => {
+    try {
+      const peer = getPeerForRequest(socket, callback);
+      if (!peer) return;
+      const quality = ['low', 'medium', 'high'].includes(payload.quality) ? payload.quality : 'high';
+      peer.recvQuality = quality;
+      const spatialLayer = recvQualityToSpatialLayer(quality);
+      for (const consumer of peer.consumers.values()) {
+        if (consumer.closed || consumer.kind !== 'video') continue;
+        try {
+          await consumer.setPreferredLayers({ spatialLayer, temporalLayer: 2 });
+        } catch (_) { /* simulcastでないconsumer等は無視 */ }
+      }
+      safeCallback(callback, { ok: true, quality });
+    } catch (err) {
       safeCallback(callback, { error: err.message });
     }
   });
@@ -1607,7 +1722,10 @@ if (process.send) {
       type: 'stats',
       data: { ...snapshot, cpu: cpuPercent },
     });
-  }, 250); // 監視表示のリアルタイム性向上のため毎秒4回送信
+    // 既定500ms。全ピアのスナップショット構築+IPC送信はCPU/GC負荷が大きく、
+    // 拠点数が増えると常時接続の安定性に影響するため頻度を抑えめにする。
+    // 表示のリアルタイム性を上げたい場合は STATS_INTERVAL_MS で調整可能。
+  }, Math.max(100, Number(process.env.STATS_INTERVAL_MS) || 500));
 
   process.on('message', rawMessage => {
     const msg = asObject(rawMessage);

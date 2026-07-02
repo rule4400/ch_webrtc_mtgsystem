@@ -14,6 +14,15 @@ import { io } from 'socket.io-client';
 import * as mediasoupClient from 'mediasoup-client';
 
 const SETUP_WATCHDOG_MS = 20000;
+// 送信画質(高/中/低)ごとのビットレート倍率。サーバー配布の上限値に乗算する。
+const SEND_QUALITY_SCALE = { high: 1, medium: 0.6, low: 0.35 };
+const QUALITY_LEVELS = ['low', 'medium', 'high'];
+// サーバーから設定が取得できない場合(旧サーバー等)の既定ビットレート(bps)
+const DEFAULT_MEDIA_SETTINGS = {
+  videoMaxBitrate: 1_200_000,
+  screenMaxBitrate: 1_800_000,
+  audioMaxBitrate: 0, // 0 = Opus 既定
+};
 const HARD_RECONNECT_DELAY_MS = 1000;
 const INBOUND_STALL_WATCHDOG_MS = 12000;
 const WATCHDOG_RECOVERY_COOLDOWN_MS = 18000;
@@ -94,6 +103,12 @@ export class WebRTCManager {
     this.screenPaused          = false;
 
     this.iceServers      = [];     // サーバーから取得
+    // メディア品質設定。上限はサーバー(getServerConfig)から配布され、
+    // 送信画質はクライアント設定の倍率、受信画質はサーバーのレイヤ選択で適用。
+    this._serverMedia    = { ...DEFAULT_MEDIA_SETTINGS };
+    this._sendQuality    = 'high';
+    this._recvQuality    = 'high';
+    this._forceTcp       = false;  // メディアをTCPで送受信する(クライアント設定)
     this._initialized    = false;
     this._pendingQueue   = [];     // 初期化前に届いた newProducer
     this._locationName   = '';
@@ -159,6 +174,9 @@ export class WebRTCManager {
     this._locationName = locationName;
     this._channelId = options.channelId || this._channelId || 'general';
     this._appVersion = options.appVersion || this._appVersion || '0.1.0';
+    if (QUALITY_LEVELS.includes(options.sendQuality)) this._sendQuality = options.sendQuality;
+    if (QUALITY_LEVELS.includes(options.recvQuality)) this._recvQuality = options.recvQuality;
+    if (typeof options.forceTcp === 'boolean') this._forceTcp = options.forceTcp;
     this._manualDisconnect = false;
 
     // 既存ソケットがある状態で connect が呼ばれた場合は必ず破棄してから作り直す。
@@ -301,6 +319,7 @@ export class WebRTCManager {
       await this._initMediasoup();
       assertCurrent('init-mediasoup');
       this._initialized = true;
+      this._announceRecvQuality();
 
       // 初期化前にキューイングした newProducer を処理
       const queued = this._pendingQueue.splice(0);
@@ -692,10 +711,14 @@ export class WebRTCManager {
       peer.screenAudioProducerId = null;
     }
 
-    // サーバー設定（iceServers）取得（任意・失敗しても続行）
+    // サーバー設定（iceServers・ビットレート上限・TCP設定）取得（任意・失敗しても続行）
     try {
       const cfg = await this._request('getServerConfig');
       if (cfg && Array.isArray(cfg.iceServers)) this.iceServers = cfg.iceServers;
+      const ms = cfg?.mediaSettings || {};
+      if (Number.isFinite(ms.videoMaxBitrate) && ms.videoMaxBitrate > 0) this._serverMedia.videoMaxBitrate = ms.videoMaxBitrate;
+      if (Number.isFinite(ms.screenMaxBitrate) && ms.screenMaxBitrate > 0) this._serverMedia.screenMaxBitrate = ms.screenMaxBitrate;
+      if (Number.isFinite(ms.audioMaxBitrate) && ms.audioMaxBitrate >= 0) this._serverMedia.audioMaxBitrate = ms.audioMaxBitrate;
     } catch {
       // Older server versions did not expose this optional event.
     }
@@ -719,8 +742,56 @@ export class WebRTCManager {
       : params;
   }
 
+  /** カメラ映像の simulcast エンコーディング。サーバー配布の上限×送信画質の倍率 */
+  _videoEncodings() {
+    const scale = SEND_QUALITY_SCALE[this._sendQuality] || 1;
+    const max = Math.max(100_000, Math.round(this._serverMedia.videoMaxBitrate * scale));
+    return [
+      { rid: 'r0', maxBitrate: Math.max(60_000, Math.round(max / 8)), scaleResolutionDownBy: 4 },
+      { rid: 'r1', maxBitrate: Math.max(120_000, Math.round(max / 2.4)), scaleResolutionDownBy: 2 },
+      { rid: 'r2', maxBitrate: max },
+    ];
+  }
+
+  /** 画面共有の simulcast エンコーディング */
+  _screenEncodings() {
+    const scale = SEND_QUALITY_SCALE[this._sendQuality] || 1;
+    const max = Math.max(150_000, Math.round(this._serverMedia.screenMaxBitrate * scale));
+    return [
+      { rid: 'r0', maxBitrate: Math.max(100_000, Math.round(max / 3)), scaleResolutionDownBy: 2 },
+      { rid: 'r1', maxBitrate: max },
+    ];
+  }
+
+  /**
+   * 送信画質を設定する。produce 済みの producer には即時反映されないため、
+   * 呼び出し側(設定保存時)がセッション再構築を行って反映する。
+   */
+  setSendQuality(quality) {
+    if (QUALITY_LEVELS.includes(quality)) this._sendQuality = quality;
+  }
+
+  /** 受信画質を設定し、接続中ならサーバーへ即時反映を依頼する */
+  async setRecvQuality(quality) {
+    if (!QUALITY_LEVELS.includes(quality)) return;
+    this._recvQuality = quality;
+    if (this.socket?.connected && this._initialized) {
+      try {
+        await this._request('setRecvQuality', { quality });
+      } catch {
+        // 旧サーバーは未対応。次回セッション構築時に再送される。
+      }
+    }
+  }
+
+  /** 受信画質をサーバーへ申告する(セッション構築時)。旧サーバーでは応答が無いため待たない */
+  _announceRecvQuality() {
+    if (this._recvQuality === 'high') return; // 既定値は送信不要
+    this._request('setRecvQuality', { quality: this._recvQuality }).catch(() => {});
+  }
+
   async _initSendTransport() {
-    const { params } = await this._request('createWebRtcTransport', { forceTcp: false });
+    const { params } = await this._request('createWebRtcTransport', { forceTcp: this._forceTcp });
     this.sendTransport = this.device.createSendTransport(this._transportOptions(params));
     this.sendTransport.on('connect', async ({ dtlsParameters }, cb, eb) => {
       try { await this._request('connectTransport', { transportId: this.sendTransport.id, dtlsParameters }); cb(); }
@@ -739,7 +810,7 @@ export class WebRTCManager {
   }
 
   async _initRecvTransport() {
-    const { params } = await this._request('createWebRtcTransport', { forceTcp: false });
+    const { params } = await this._request('createWebRtcTransport', { forceTcp: this._forceTcp });
     this.recvTransport = this.device.createRecvTransport(this._transportOptions(params));
     this.recvTransport.on('connect', async ({ dtlsParameters }, cb, eb) => {
       try { await this._request('connectTransport', { transportId: this.recvTransport.id, dtlsParameters }); cb(); }
@@ -825,11 +896,7 @@ export class WebRTCManager {
       },
     };
     if (kind === 'video') {
-      params.encodings = [
-        { rid: 'r0', maxBitrate: 150_000, scaleResolutionDownBy: 4 },
-        { rid: 'r1', maxBitrate: 500_000, scaleResolutionDownBy: 2 },
-        { rid: 'r2', maxBitrate: 1_200_000 },
-      ];
+      params.encodings = this._videoEncodings();
       params.codecOptions = { videoGoogleStartBitrate: 1000 };
     } else if (kind === 'audio') {
       params.codecOptions = {
@@ -838,6 +905,10 @@ export class WebRTCManager {
         opusFec: true,
         opusMaxPlaybackRate: 48000,
       };
+      // サーバー側で音声ビットレート上限が設定されていれば適用する
+      if (this._serverMedia.audioMaxBitrate > 0) {
+        params.codecOptions.opusMaxAverageBitrate = this._serverMedia.audioMaxBitrate;
+      }
     }
     const producer = await this.sendTransport.produce(params);
     producer.on('transportclose', () => {
@@ -962,10 +1033,7 @@ export class WebRTCManager {
         label: this.screenLabel || '画面共有',
         channelId: this._channelId,
       },
-      encodings: [
-        { rid: 'r0', maxBitrate: 600_000, scaleResolutionDownBy: 2 },
-        { rid: 'r1', maxBitrate: 1_800_000 },
-      ],
+      encodings: this._screenEncodings(),
       codecOptions: { videoGoogleStartBitrate: 1200 },
     });
     this.screenProducer.on('transportclose', () => { this.screenProducer = null; });

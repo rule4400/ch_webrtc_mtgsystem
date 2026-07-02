@@ -18,7 +18,7 @@ import {
 import { WebRTCManager } from '../services/webrtc';
 import ScreenShareModal from '../components/ScreenShareModal';
 
-const APP_VERSION = '0.3.1';
+const APP_VERSION = '0.3.2';
 const APP_TYPE = 'client';
 const CALL_RING_TIMEOUT_MS = 30000;
 const CALL_RING_INTERVAL_MS = 1500;
@@ -186,6 +186,21 @@ const VideoCell = React.memo(function VideoCell({
     };
     tryPlay();
   }, [stream, isSelf, speakerMuted, audioPaused, volume]);
+
+  // 黒画面自己復旧: ストリームは生きているのに <video> の再生が止まっている
+  // (自動再生ブロックの取りこぼし・デバイス復帰後の停止など)場合に再生を試みる。
+  // セッションが健全でも再生が止まると「接続しているのに真っ暗」になるため、
+  // 周期的に確認して自己回復する。
+  useEffect(() => {
+    const id = setInterval(() => {
+      const video = videoRef.current;
+      if (!video || !video.srcObject) return;
+      if (video.paused || video.ended) {
+        video.play().catch(() => { /* 次周期で再試行 */ });
+      }
+    }, 4000);
+    return () => clearInterval(id);
+  }, []);
 
   // スピーカーデバイス変更
   useEffect(() => {
@@ -552,7 +567,10 @@ const defaultShortcuts = {
   micToggle: 'm',
   speakerToggle: 's',
   cameraToggle: 'c',
+  callAnswer: 'Enter',
 };
+const QUALITY_OPTIONS = ['high', 'medium', 'low'];
+const QUALITY_LABELS = { high: '高', medium: '中', low: '低' };
 const defaultClientConfig = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
@@ -561,6 +579,10 @@ const defaultClientConfig = {
   shortcuts: { ...defaultShortcuts },
   autoUnmuteOnCallAnswer: true,
   highlightSelfMuted: true,
+  startMicMuted: true,      // 起動時はマイクミュートで開始（設定で変更可）
+  forceTcp: false,          // メディアをTCPで送受信（UDPが不安定な場合のみ）
+  sendQuality: 'high',      // 送信画質（ビットレート倍率）
+  recvQuality: 'high',      // 受信画質（simulcastレイヤ選択）
 };
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
 // 直前の再起動からこの時間内に届いた「健全なセッションへの」再起動要求は無視する。
@@ -610,6 +632,10 @@ function sanitizeClientConfig(config) {
   // 明示的に false が保存されていない限り既定オン（後から追加した設定のため）。
   const autoUnmuteOnCallAnswer = raw.autoUnmuteOnCallAnswer !== false;
   const highlightSelfMuted = raw.highlightSelfMuted !== false;
+  const startMicMuted = raw.startMicMuted !== false;
+  const forceTcp = raw.forceTcp === true;
+  const sendQuality = QUALITY_OPTIONS.includes(raw.sendQuality) ? raw.sendQuality : defaultClientConfig.sendQuality;
+  const recvQuality = QUALITY_OPTIONS.includes(raw.recvQuality) ? raw.recvQuality : defaultClientConfig.recvQuality;
 
   return {
     ...raw,
@@ -620,6 +646,10 @@ function sanitizeClientConfig(config) {
     shortcuts,
     autoUnmuteOnCallAnswer,
     highlightSelfMuted,
+    startMicMuted,
+    forceTcp,
+    sendQuality,
+    recvQuality,
   };
 }
 
@@ -699,7 +729,8 @@ async function probeServerReady(config, timeoutMs = 800) {
 export default function MainView() {
   // ── 映像/音声状態 ──
   const [localStream,  setLocalStream]  = useState(null);
-  const [micEnabled,   setMicEnabled]   = useState(true);
+  // 起動時のマイク状態は設定に従う（既定: ミュートで開始）
+  const [micEnabled,   setMicEnabled]   = useState(() => !loadClientConfig().startMicMuted);
   const [camEnabled,   setCamEnabled]   = useState(true);
   const [speakerMuted, setSpeakerMuted] = useState(false);
 
@@ -1379,6 +1410,9 @@ export default function MainView() {
     const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName, {
       channelId: conf.channelId,
       appVersion: APP_VERSION,
+      forceTcp: conf.forceTcp === true,
+      sendQuality: conf.sendQuality,
+      recvQuality: conf.recvQuality,
     });
     setSfuStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     return { manager: rtcManager, connectionState };
@@ -1777,8 +1811,12 @@ export default function MainView() {
     const requiresReconnect =
       previous.serverIp !== next.serverIp ||
       previous.serverPort !== next.serverPort ||
-      previous.locationName !== next.locationName;
+      previous.locationName !== next.locationName ||
+      // TCP切替と送信画質は transport/producer の再作成が必要
+      previous.forceTcp !== next.forceTcp ||
+      previous.sendQuality !== next.sendQuality;
     const channelChanged = previous.channelId !== next.channelId;
+    const recvQualityChanged = previous.recvQuality !== next.recvQuality;
 
     configRef.current = next;
     localStorage.setItem('sfu_config', JSON.stringify(next));
@@ -1790,8 +1828,10 @@ export default function MainView() {
 
     if (requiresReconnect) {
       await performQuickRestart({ reason: 'settings-updated' });
-    } else if (channelChanged) {
-      await webrtcRef.current?.setChannel(next.channelId);
+    } else {
+      if (channelChanged) await webrtcRef.current?.setChannel(next.channelId);
+      // 受信画質は再接続不要（サーバー側のレイヤ選択で即時反映）
+      if (recvQualityChanged) await webrtcRef.current?.setRecvQuality(next.recvQuality);
     }
   }, [performQuickRestart, settingsDraft]);
 
@@ -1808,44 +1848,6 @@ export default function MainView() {
       console.warn('[setChannel]', err.message);
     }
   }, [channels]);
-
-  // ─── キーボードショートカット ──────────────────────────────
-  // 数字キー1-9はチャンネル一覧の並び順に固定（設定不可）。マイク/スピーカー/
-  // カメラのキーは設定画面で変更できる(既定 M/S/C)。設定画面を開いている間や
-  // テキスト入力中は無効化し、意図しない発火を防ぐ。
-  useEffect(() => {
-    const handleKeyDown = (event) => {
-      if (settingsOpen) return;
-      if (event.metaKey || event.ctrlKey || event.altKey) return;
-      const el = event.target;
-      const tag = el?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable) return;
-
-      if (/^[1-9]$/.test(event.key)) {
-        const channelTarget = channels[Number(event.key) - 1];
-        if (channelTarget) {
-          event.preventDefault();
-          changeChannel(channelTarget.id);
-        }
-        return;
-      }
-
-      const shortcuts = configRef.current?.shortcuts || defaultShortcuts;
-      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
-      if (key === shortcuts.micToggle) {
-        event.preventDefault();
-        toggleMic();
-      } else if (key === shortcuts.speakerToggle) {
-        event.preventDefault();
-        setSpeakerOutputEnabled(speakerMuted);
-      } else if (key === shortcuts.cameraToggle) {
-        event.preventDefault();
-        toggleCam();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [settingsOpen, channels, changeChannel, toggleMic, toggleCam, setSpeakerOutputEnabled, speakerMuted]);
 
   const answerIncomingCall = useCallback(async (call) => {
     const targetChannelId = call?.fromChannelId || '';
@@ -1867,6 +1869,52 @@ export default function MainView() {
     // 発信側へ「応答なし」を通知して鳴動表示を止める
     webrtcRef.current?.ackCall(call?.callId, 'dismissed').catch(() => {});
   }, [stopIncomingCall]);
+
+  // ─── キーボードショートカット ──────────────────────────────
+  // 数字キー1-9はチャンネル一覧の並び順に固定（設定不可）。マイク/スピーカー/
+  // カメラ/着信応答のキーは設定画面で変更できる(既定 M/S/C/Enter)。
+  // 設定画面を開いている間やテキスト入力中は無効化し、意図しない発火を防ぐ。
+  useEffect(() => {
+    const handleKeyDown = (event) => {
+      if (settingsOpen) return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      const el = event.target;
+      const tag = el?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el?.isContentEditable) return;
+
+      const shortcuts = configRef.current?.shortcuts || defaultShortcuts;
+      const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+
+      // 着信中は応答キーを最優先で処理する（既定 Enter）
+      if (incomingCall && key === (shortcuts.callAnswer || 'Enter')) {
+        event.preventDefault();
+        answerIncomingCall(incomingCall);
+        return;
+      }
+
+      if (/^[1-9]$/.test(event.key)) {
+        const channelTarget = channels[Number(event.key) - 1];
+        if (channelTarget) {
+          event.preventDefault();
+          changeChannel(channelTarget.id);
+        }
+        return;
+      }
+
+      if (key === shortcuts.micToggle) {
+        event.preventDefault();
+        toggleMic();
+      } else if (key === shortcuts.speakerToggle) {
+        event.preventDefault();
+        setSpeakerOutputEnabled(speakerMuted);
+      } else if (key === shortcuts.cameraToggle) {
+        event.preventDefault();
+        toggleCam();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [settingsOpen, channels, changeChannel, toggleMic, toggleCam, setSpeakerOutputEnabled, speakerMuted, incomingCall, answerIncomingCall]);
 
   const createChannel = useCallback(async (event) => {
     event?.preventDefault?.();
@@ -2617,7 +2665,7 @@ export default function MainView() {
             </div>
             <div className="incoming-call-actions">
               <button type="button" className="incoming-call-answer" onClick={() => answerIncomingCall(incomingCall)}>
-                応答
+                応答{(settingsDraft.shortcuts?.callAnswer || 'Enter') === 'Enter' ? '（Enter）' : ''}
               </button>
               <button type="button" className="incoming-call-dismiss" onClick={() => dismissIncomingCall(incomingCall)} aria-label="呼び出し通知を停止">
                 <X size={18} />
@@ -2892,7 +2940,49 @@ export default function MainView() {
                   value={settingsDraft.shortcuts?.cameraToggle}
                   onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, cameraToggle: key })}
                 />
+                <ShortcutKeyField
+                  label="着信に応答"
+                  value={settingsDraft.shortcuts?.callAnswer}
+                  onChange={key => updateSettingsDraft('shortcuts', { ...settingsDraft.shortcuts, callAnswer: key })}
+                />
                 <p className="field-hint">数字キー（1〜9）でチャンネル一覧の上から順に移動できます（固定）。</p>
+              </div>
+
+              <div className="settings-section">
+                <h2>メディア品質</h2>
+                <div className="server-row">
+                  <div className="field">
+                    <label>送信画質</label>
+                    <select
+                      value={settingsDraft.sendQuality || 'high'}
+                      onChange={e => updateSettingsDraft('sendQuality', e.target.value)}
+                    >
+                      {QUALITY_OPTIONS.map(q => (
+                        <option key={q} value={q}>{QUALITY_LABELS[q]}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field">
+                    <label>受信画質</label>
+                    <select
+                      value={settingsDraft.recvQuality || 'high'}
+                      onChange={e => updateSettingsDraft('recvQuality', e.target.value)}
+                    >
+                      {QUALITY_OPTIONS.map(q => (
+                        <option key={q} value={q}>{QUALITY_LABELS[q]}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <p className="field-hint">回線が細い拠点では「中」「低」にすると安定します。送信画質の変更は保存時に再接続して反映されます。</p>
+                <label className="field-toggle">
+                  <input
+                    type="checkbox"
+                    checked={!!settingsDraft.forceTcp}
+                    onChange={e => updateSettingsDraft('forceTcp', e.target.checked)}
+                  />
+                  <span>メディアをTCPで送受信する（UDPが不安定・遮断される場合のみ）</span>
+                </label>
               </div>
 
               <div className="settings-section">
@@ -2904,6 +2994,14 @@ export default function MainView() {
                     onChange={e => updateSettingsDraft('autoUnmuteOnCallAnswer', e.target.checked)}
                   />
                   <span>呼び出しに応答したら双方のミュートを自動解除する</span>
+                </label>
+                <label className="field-toggle">
+                  <input
+                    type="checkbox"
+                    checked={!!settingsDraft.startMicMuted}
+                    onChange={e => updateSettingsDraft('startMicMuted', e.target.checked)}
+                  />
+                  <span>起動時はマイクをミュートで開始する</span>
                 </label>
               </div>
 
