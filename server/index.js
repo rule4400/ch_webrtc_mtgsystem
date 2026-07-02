@@ -98,7 +98,7 @@ const DEFAULT_APP_VERSIONS = {
   viewer: '0.1.1',
   'screen-share': '0.1.0',
   server: SERVER_APP_VERSION,
-  'server-gui': '1.1.4',
+  'server-gui': '1.1.5',
 };
 let systemState = {
   brand: SYSTEM_NAME,
@@ -646,7 +646,10 @@ function listUpdateFiles() {
   if (!updateDir || !fs.existsSync(updateDir)) return [];
   try {
     return fs.readdirSync(updateDir)
-      .filter(name => /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i.test(name))
+      // macOS の AppleDouble(._*)や .DS_Store 等の隠しファイルは配布対象外。
+      // ._foo.dmg は拡張子が一致してしまい、本物の代わりに配布登録されると
+      // ダウンロードが dotfile 拒否(404 NotFoundError)になる（実障害の原因）。
+      .filter(name => !name.startsWith('.') && /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i.test(name))
       .map(name => {
         const stat = fs.statSync(path.join(updateDir, name));
         return { name, size: stat.size, mtimeMs: stat.mtimeMs };
@@ -657,6 +660,38 @@ function listUpdateFiles() {
   }
 }
 
+/**
+ * 配布ファイルを手動ストリームで送る。
+ * express の res.download(内部の send)は、パス中に「.」で始まる要素が
+ * 1つでもあると（macOS の ._AppleDouble ファイルや、隠しフォルダ配下に
+ * 置かれた配布ディレクトリなど）既定設定で 404 NotFoundError を投げる。
+ * 手動配信にすることでファイル名・配置場所に依存せず確実に配布できる。
+ */
+function sendDownload(req, res, filePath, fileName) {
+  let stat;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    return res.status(404).json({ error: 'file not found' });
+  }
+  if (!stat.isFile()) return res.status(404).json({ error: 'file not found' });
+
+  // 非ASCIIファイル名は RFC 5987 (filename*) で渡し、filename には安全な代替名を入れる
+  const asciiName = fileName.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('Content-Disposition', `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+  if (req.method === 'HEAD') return res.end();
+
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', (err) => {
+    console.error('[Download] stream failed:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'read failed' });
+    else res.destroy();
+  });
+  stream.pipe(res);
+}
+
 app.get('/updates', (_, res) => {
   res.json({ updateDir: updateDir || null, files: listUpdateFiles() });
 });
@@ -665,10 +700,11 @@ app.get('/updates/:filename', (req, res) => {
   if (!updateDir) return res.status(404).json({ error: 'update dir not configured' });
   const fileName = path.basename(String(req.params.filename || ''));
   const filePath = path.join(updateDir, fileName);
-  if (!fileName || !filePath.startsWith(updateDir) || !fs.existsSync(filePath)) {
-    return res.status(404).json({ error: 'file not found' });
+  if (!fileName || fileName.startsWith('.') || !filePath.startsWith(updateDir) || !fs.existsSync(filePath)) {
+    console.warn(`[Updates] download not found: "${fileName}" dir=${updateDir}`);
+    return res.status(404).json({ error: 'file not found', fileName });
   }
-  res.download(filePath, fileName);
+  sendDownload(req, res, filePath, fileName);
 });
 
 // ── 通知音（着信音）配信 ──────────────────────────────────
@@ -688,7 +724,7 @@ function listRingtones() {
   if (!ringtonesDir || !fs.existsSync(ringtonesDir)) return [];
   try {
     return fs.readdirSync(ringtonesDir)
-      .filter(name => RINGTONE_FILE_EXT.test(name))
+      .filter(name => !name.startsWith('.') && RINGTONE_FILE_EXT.test(name))
       .map(name => {
         const stat = fs.statSync(path.join(ringtonesDir, name));
         return { name, size: stat.size, mtimeMs: stat.mtimeMs };
@@ -707,10 +743,10 @@ app.get('/ringtones', (_, res) => {
 app.get('/ringtones/:filename', (req, res) => {
   const fileName = path.basename(String(req.params.filename || ''));
   const filePath = path.join(ringtonesDir, fileName);
-  if (!fileName || !RINGTONE_FILE_EXT.test(fileName) || !filePath.startsWith(ringtonesDir) || !fs.existsSync(filePath)) {
+  if (!fileName || fileName.startsWith('.') || !RINGTONE_FILE_EXT.test(fileName) || !filePath.startsWith(ringtonesDir) || !fs.existsSync(filePath)) {
     return res.status(404).json({ error: 'ringtone not found' });
   }
-  res.download(filePath, fileName);
+  sendDownload(req, res, filePath, fileName);
 });
 
 app.get('/health', (_, res) => res.json(getStatsSnapshot()));

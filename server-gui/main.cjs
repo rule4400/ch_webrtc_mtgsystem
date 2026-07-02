@@ -52,8 +52,8 @@ const DEFAULT_SYSTEM_SETTINGS = {
     client: '0.4.0',
     viewer: '0.1.0',
     'screen-share': '0.1.0',
-    server: '1.1.4',
-    'server-gui': '1.1.4',
+    server: '1.1.5',
+    'server-gui': '1.1.5',
   },
   updatePackages: {},
   updateFolder: '',
@@ -88,7 +88,11 @@ function scanUpdateFolder(dir) {
 
   let names = [];
   try {
-    names = fs.readdirSync(dir).filter(name => UPDATE_FILE_EXT.test(name));
+    // macOS の AppleDouble(._*)や .DS_Store 等の隠しファイルは除外する。
+    // ._foo.dmg は拡張子・アプリ種別・バージョンの判定に一致してしまい、
+    // 本物より新しい mtime だと配布パッケージとして登録され、クライアントの
+    // ダウンロードが 404 (dotfile 拒否) になる実障害があった。
+    names = fs.readdirSync(dir).filter(name => !name.startsWith('.') && UPDATE_FILE_EXT.test(name));
   } catch (err) {
     safeSend('server-log', `WARN: アップデートフォルダを読み取れません: ${err.message}`);
     return result;
@@ -749,6 +753,10 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
     if (updateFolder) {
       sendToServer({ type: 'set-update-dir', dir: updateFolder });
       watchUpdateFolder(updateFolder);
+      // 起動時に再スキャンして配布登録を実ファイルと同期する。
+      // 以前のバージョンで ._AppleDouble ファイル等が誤登録されたまま
+      // system-settings.json に残っていても、ここで正しい実体に上書きされる。
+      applyUpdateScan(updateFolder, { announce: false });
     }
   }, 500);
 }
