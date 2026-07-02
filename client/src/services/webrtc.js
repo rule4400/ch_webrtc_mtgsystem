@@ -138,6 +138,7 @@ export class WebRTCManager {
     this._setupRetryDelay = 1000;
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
+    this._telemetryRttHistory = []; // 自拠点の通信安定度(アンテナ表示)算出用
     this._connectGeneration = 0;
     this._setupGeneration = 0;
     this._setupStartedAt = 0;
@@ -1225,6 +1226,7 @@ export class WebRTCManager {
           appVersion:      metadata.appVersion || '',
           channelId:       metadata.peerChannelId || metadata.channelId || 'general',
           presenceMode:    metadata.peerPresenceMode || 'none',
+          signalLevel:     Number.isFinite(metadata.peerSignalLevel) ? metadata.peerSignalLevel : null,
           stream:          new MediaStream(),
           screenStream:    new MediaStream(),
           videoProducerId: null,
@@ -1358,7 +1360,7 @@ export class WebRTCManager {
             peer.locationName,
             producer.kind,
             producer.paused,
-            { ...producer, appType: peer.appType, appVersion: peer.appVersion, peerChannelId: peer.channelId, peerPresenceMode: peer.presenceMode },
+            { ...producer, appType: peer.appType, appVersion: peer.appVersion, peerChannelId: peer.channelId, peerPresenceMode: peer.presenceMode, peerSignalLevel: peer.signalLevel },
           );
         }
       }
@@ -1388,6 +1390,10 @@ export class WebRTCManager {
         const remotePresence = peer.presenceMode || 'none';
         if ((localPeer.presenceMode || 'none') !== remotePresence) {
           localPeer.presenceMode = remotePresence;
+          this.onPeerUpdated?.(peer.socketId, { ...localPeer });
+        }
+        if (Number.isFinite(peer.signalLevel) && localPeer.signalLevel !== peer.signalLevel) {
+          localPeer.signalLevel = peer.signalLevel;
           this.onPeerUpdated?.(peer.socketId, { ...localPeer });
         }
         for (const producer of peer.producers) {
@@ -1438,7 +1444,32 @@ export class WebRTCManager {
       if (err) return;
       this._lastTelemetryRtt = Date.now() - sentAt;
       this._lastTelemetryAckAt = Date.now();
+      this._telemetryRttHistory.push(this._lastTelemetryRtt);
+      if (this._telemetryRttHistory.length > 15) this._telemetryRttHistory.shift();
     });
+  }
+
+  /**
+   * 自拠点のサーバー通信安定度(0-5)。サーバー側の signalLevelFor と同じ
+   * しきい値で、telemetry RTT の平均とジッタから算出する。
+   *   5=非常に良好 / 4=良好 / 3=普通 / 2=不安定 / 1=非常に不安定 / 0=切断
+   */
+  getSelfSignalLevel() {
+    if (!this.socket?.connected || !this._initialized) return 0;
+    const ackAge = this._lastTelemetryAckAt ? Date.now() - this._lastTelemetryAckAt : null;
+    if (ackAge == null) return 3;
+    if (ackAge > 15000) return 1;
+    const samples = this._telemetryRttHistory;
+    if (!samples.length) return 3;
+    const avg = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+    let jitter = 0;
+    for (let i = 1; i < samples.length; i += 1) jitter += Math.abs(samples[i] - samples[i - 1]);
+    jitter = samples.length > 1 ? jitter / (samples.length - 1) : 0;
+    if (avg <= 50 && jitter <= 15) return 5;
+    if (avg <= 120 && jitter <= 40) return 4;
+    if (avg <= 250 && jitter <= 90) return 3;
+    if (avg <= 500) return 2;
+    return 1;
   }
 
   getTransportReport() {

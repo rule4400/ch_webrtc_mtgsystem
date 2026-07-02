@@ -19,7 +19,7 @@ import {
 import { WebRTCManager } from '../services/webrtc';
 import ScreenShareModal from '../components/ScreenShareModal';
 
-const APP_VERSION = '0.3.3';
+const APP_VERSION = '0.4.0';
 const APP_TYPE = 'client';
 const CALL_RING_TIMEOUT_MS = 30000;
 const CALL_RING_INTERVAL_MS = 1500;
@@ -32,7 +32,7 @@ const DEFAULT_SYSTEM_STATE = {
 
 // ─── デバイス選択ドロップダウンボタン ────────────────────
 
-function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, onDeviceChange, title }) {
+function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, onDeviceChange, title, label }) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef(null);
 
@@ -49,6 +49,7 @@ function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, on
       {/* メインボタン（ミュートトグル） */}
       <button className={`ctrl-btn ${!active ? 'danger' : ''}`} onClick={onToggle}>
         {active ? <Icon size={20} /> : <IconOff size={20} />}
+        {label && <span className="ctrl-btn-label">{label}</span>}
       </button>
       {/* デバイス選択トリガー */}
       {devices.length > 0 && (
@@ -73,6 +74,35 @@ function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, on
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// ── 通信安定度アンテナ（各拠点タイル右下、5段階+色分け） ─────────
+// 0=切断(グレー) 1=赤 2=オレンジ 3=黄 4=黄緑 5=緑
+const SIGNAL_COLORS = ['#6b7280', '#ef4444', '#f97316', '#eab308', '#84cc16', '#22c55e'];
+const SIGNAL_TITLES = ['切断', '非常に不安定', '不安定', '普通', '良好', '非常に良好'];
+
+function SignalBars({ level }) {
+  if (level == null) return null;
+  const clamped = Math.max(0, Math.min(5, Math.round(level)));
+  const color = SIGNAL_COLORS[clamped];
+  return (
+    <div
+      className="signal-bars"
+      title={`サーバー通信の安定度: ${SIGNAL_TITLES[clamped]}（${clamped}/5）`}
+      aria-label={`通信安定度 ${clamped}/5`}
+    >
+      {[1, 2, 3, 4, 5].map(step => (
+        <span
+          key={step}
+          className="signal-bar"
+          style={{
+            height: `${3 + step * 2.2}px`,
+            background: step <= clamped ? color : 'rgba(255,255,255,0.22)',
+          }}
+        />
+      ))}
     </div>
   );
 }
@@ -122,6 +152,7 @@ const VideoCell = React.memo(function VideoCell({
   videoPaused,
   audioPaused,
   presenceMode = 'none',
+  signalLevel = null,
   highlightMuted = false,
   speakerDeviceId,
   speakerMuted,
@@ -214,6 +245,9 @@ const VideoCell = React.memo(function VideoCell({
   }, [speakerDeviceId, isSelf]);
 
   const cameraOff = !!videoPaused;
+  // カメラONのはずなのに映像トラックが届いていない（consume未完了・経路劣化など）
+  const noVideoSignal = !cameraOff && !isSelf && !isScreen &&
+    (!stream || stream.getVideoTracks().length === 0);
   const selfMutedHighlight = isSelf && !!audioPaused && highlightMuted;
 
   return (
@@ -243,15 +277,19 @@ const VideoCell = React.memo(function VideoCell({
         }}
       />
 
-      {/* カメラ OFF オーバーレイ */}
-      {cameraOff && (
+      {/* カメラOFF / 映像未達 オーバーレイ: 拠点名を中央に大きく表示する */}
+      {(cameraOff || noVideoSignal) && (
         <div className="cam-off-overlay">
-          <VideoOff size={30} color="rgba(255,255,255,0.3)" />
-          <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: '0.75rem', marginTop: 8 }}>
-            カメラ OFF
+          <div className="camoff-name">{label}</div>
+          <span className="camoff-caption">
+            <VideoOff size={13} />
+            {cameraOff ? 'カメラ OFF' : '映像を受信していません'}
           </span>
         </div>
       )}
+
+      {/* サーバー通信の安定度（右下・5段階アンテナ） */}
+      {!isScreen && <SignalBars level={signalLevel} />}
 
       {/* プレゼンスモード（商談中/不在/帰宅）バッジ */}
       {!isScreen && PRESENCE_LABELS[presenceMode] && (
@@ -593,6 +631,10 @@ const QUALITY_LABELS = { high: '高', medium: '中', low: '低' };
 const defaultClientConfig = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
+  // 保険用サブサーバー（クラウド等）。メインに接続できない状態が続くと自動切替する。
+  subServerIp: '',
+  subServerPort: '3000',
+  activeServer: 'main',     // 'main' | 'sub' 現在使用するサーバー
   locationName: '自拠点',
   channelId: 'general',
   shortcuts: { ...defaultShortcuts },
@@ -685,6 +727,13 @@ function sanitizeClientConfig(config) {
   const serverPort = /^\d{1,5}$/.test(rawPort) && Number(rawPort) >= 1 && Number(rawPort) <= 65535
     ? rawPort
     : defaultClientConfig.serverPort;
+  const subServerIp = String(raw.subServerIp || '').trim();
+  const rawSubPort = String(raw.subServerPort || defaultClientConfig.subServerPort).trim();
+  const subServerPort = /^\d{1,5}$/.test(rawSubPort) && Number(rawSubPort) >= 1 && Number(rawSubPort) <= 65535
+    ? rawSubPort
+    : defaultClientConfig.subServerPort;
+  // サブサーバーが未登録なら activeServer は必ず main に戻す
+  const activeServer = raw.activeServer === 'sub' && subServerIp ? 'sub' : 'main';
   const locationName = String(raw.locationName || defaultClientConfig.locationName).trim() || defaultClientConfig.locationName;
   const channelId = String(raw.channelId || defaultClientConfig.channelId).trim() || defaultClientConfig.channelId;
   const shortcuts = sanitizeShortcuts(raw.shortcuts);
@@ -703,6 +752,9 @@ function sanitizeClientConfig(config) {
     ...raw,
     serverIp,
     serverPort,
+    subServerIp,
+    subServerPort,
+    activeServer,
     locationName,
     channelId,
     shortcuts,
@@ -729,10 +781,18 @@ function loadClientConfig() {
   }
 }
 
+/** 現在使用するサーバー（メイン/サブ）のURLを返す */
 function serverUrlFromConfig(config) {
   const conf = sanitizeClientConfig(config);
+  if (conf.activeServer === 'sub' && conf.subServerIp) {
+    return `http://${conf.subServerIp}:${conf.subServerPort || 3000}`;
+  }
   return `http://${conf.serverIp}:${conf.serverPort || 3000}`;
 }
+
+// メイン到達不能がこの時間続き、かつもう一方のサーバーが応答するなら自動切替する
+const FAILOVER_AFTER_MS = 12000;
+const FAILOVER_COOLDOWN_MS = 30000;
 
 function clampNumber(value, min, max) {
   const numeric = Number(value);
@@ -798,12 +858,17 @@ export default function MainView() {
   // ref は着信音量計算やショートカットなどコールバックから参照するために持つ。
   const [presenceMode, setPresenceMode] = useState('none');
   const presenceModeRef = useRef('none');
+  // 自拠点のサーバー通信安定度（0-5、タイル右下のアンテナ表示用）
+  const [selfSignalLevel, setSelfSignalLevel] = useState(0);
   // カスタム着信音（mp3/wav等、localStorageに永続化）
   const [customRingtone, setCustomRingtone] = useState(() => loadCustomRingtone());
   const customRingtoneRef = useRef(null);
   const ringtoneAudioRef = useRef(null);   // 鳴動中の Audio 要素（ループ再生）
   const [serverRingtones, setServerRingtones] = useState(null); // null=未取得
   const [ringtoneNotice, setRingtoneNotice] = useState('');
+  // アプリ内確認ダイアログ（OS標準の confirm の代わり）
+  // { title, message, confirmLabel, onConfirm }
+  const [confirmDialog, setConfirmDialog] = useState(null);
   const [camEnabled,   setCamEnabled]   = useState(true);
   const [speakerMuted, setSpeakerMuted] = useState(false);
 
@@ -861,6 +926,8 @@ export default function MainView() {
   const sessionStartInFlightRef = useRef(false);
   const softRestartHandlerRef = useRef(null);
   const serverProbeInFlightRef = useRef(false);
+  // 自動フェイルオーバーの状態（現サーバーの到達不能開始時刻と直近切替時刻）
+  const serverFailoverRef = useRef({ downSince: null, lastSwitchAt: 0 });
   const speakerMutedRef = useRef(false);
   const sendTelemetryRef = useRef(null);
   const joinAudioRef = useRef(null);
@@ -1702,11 +1769,16 @@ export default function MainView() {
   }, []);
 
   // ─── サーバー到達確認: オフライン復帰を1秒周期で拾う ─────────────
+  // あわせて自動フェイルオーバーを行う: 現在のサーバーに一定時間到達できず、
+  // もう一方（メイン⇄サブ）のサーバーが応答する場合は自動で切り替えて再接続する。
   useEffect(() => {
     const id = setInterval(async () => {
       if (softRestartInFlightRef.current || serverProbeInFlightRef.current) return;
       const manager = webrtcRef.current;
-      if (manager?.isSocketConnected() && manager?.isInitialized()) return;
+      if (manager?.isSocketConnected() && manager?.isInitialized()) {
+        serverFailoverRef.current.downSince = null;
+        return;
+      }
 
       serverProbeInFlightRef.current = true;
       try {
@@ -1714,9 +1786,40 @@ export default function MainView() {
         const reachable = await probeServerReady(conf);
         if (!reachable) {
           setSfuStatus(prev => (prev === 'restarting' ? prev : 'error'));
+
+          // ── 自動フェイルオーバー判定 ──
+          const failover = serverFailoverRef.current;
+          const now = Date.now();
+          if (failover.downSince == null) failover.downSince = now;
+          const otherServer = conf.activeServer === 'sub' ? 'main' : 'sub';
+          const otherConfigured = otherServer === 'sub' ? !!conf.subServerIp : !!conf.serverIp;
+          if (
+            otherConfigured &&
+            now - failover.downSince >= FAILOVER_AFTER_MS &&
+            now - failover.lastSwitchAt >= FAILOVER_COOLDOWN_MS
+          ) {
+            const candidate = { ...conf, activeServer: otherServer };
+            const candidateReachable = await probeServerReady(candidate);
+            if (candidateReachable) {
+              failover.lastSwitchAt = Date.now();
+              failover.downSince = null;
+              configRef.current = candidate;
+              localStorage.setItem('sfu_config', JSON.stringify(candidate));
+              setSettingsDraft(candidate);
+              showCallNotice(
+                otherServer === 'sub'
+                  ? 'メインサーバーに接続できないため、サブサーバーへ切り替えます'
+                  : 'サブサーバーに接続できないため、メインサーバーへ切り替えます',
+                'warn',
+              );
+              console.warn(`[Failover] switching to ${otherServer} server`);
+              await softRestartHandlerRef.current?.({ reason: 'server-failover', forced: true });
+            }
+          }
           return;
         }
 
+        serverFailoverRef.current.downSince = null;
         setSfuStatus(prev => (prev === 'connected' ? prev : 'connecting'));
         if (manager) {
           manager.requestReconnect();
@@ -1731,7 +1834,7 @@ export default function MainView() {
     }, 1000);
 
     return () => clearInterval(id);
-  }, [startClientSession]);
+  }, [startClientSession, showCallNotice]);
 
   // ─── ローカルカメラ/マイク自己復旧 ───────────────────────
   useEffect(() => {
@@ -1853,6 +1956,8 @@ export default function MainView() {
   useEffect(() => {
     const sendTelemetry = () => {
       const manager = webrtcRef.current;
+      // 自拠点アンテナ表示の更新（未接続時は0=切断表示）
+      setSelfSignalLevel(manager?.getSelfSignalLevel?.() ?? 0);
       if (!manager) return;
       const state = telemetryStateRef.current;
       const stream = streamRef.current;
@@ -2030,8 +2135,8 @@ export default function MainView() {
     const previous = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
     const next = sanitizeClientConfig({ ...configRef.current, ...settingsDraft });
     const requiresReconnect =
-      previous.serverIp !== next.serverIp ||
-      previous.serverPort !== next.serverPort ||
+      // 使用サーバー(メイン/サブ)の切替やIP/ポート変更で接続先URLが変わる場合
+      serverUrlFromConfig(previous) !== serverUrlFromConfig(next) ||
       previous.locationName !== next.locationName ||
       // TCP切替と送信画質は transport/producer の再作成が必要
       previous.forceTcp !== next.forceTcp ||
@@ -2095,9 +2200,27 @@ export default function MainView() {
   // 数字キー1-9はチャンネル一覧の並び順に固定（設定不可）。マイク/スピーカー/
   // カメラ/着信応答のキーは設定画面で変更できる(既定 M/S/C/Enter)。
   // 設定画面を開いている間やテキスト入力中は無効化し、意図しない発火を防ぐ。
+  // アプリ内確認ダイアログのキーボード操作（Enter=実行 / Esc=キャンセル）
+  useEffect(() => {
+    if (!confirmDialog) return undefined;
+    const onKey = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setConfirmDialog(null);
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        const dialog = confirmDialog;
+        setConfirmDialog(null);
+        dialog.onConfirm?.();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [confirmDialog]);
+
   useEffect(() => {
     const handleKeyDown = (event) => {
-      if (settingsOpen) return;
+      if (settingsOpen || confirmDialog) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const el = event.target;
       const tag = el?.tagName;
@@ -2144,7 +2267,7 @@ export default function MainView() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [settingsOpen, channels, changeChannel, toggleMic, toggleCam, setSpeakerOutputEnabled, speakerMuted, incomingCall, answerIncomingCall, togglePresenceMode]);
+  }, [settingsOpen, confirmDialog, channels, changeChannel, toggleMic, toggleCam, setSpeakerOutputEnabled, speakerMuted, incomingCall, answerIncomingCall, togglePresenceMode]);
 
   const createChannel = useCallback(async (event) => {
     event?.preventDefault?.();
@@ -2259,32 +2382,41 @@ export default function MainView() {
     const targetPeer = peers.get(socketId);
     const targetName = targetPeer?.locationName || '相手拠点';
 
-    // 相手が商談中モードの場合は確認してから呼び出す
+    const startCall = async () => {
+      try {
+        const result = await webrtcRef.current?.callPeer(socketId);
+        const callId = result?.callId || '';
+        if (!callId) throw new Error('呼び出しIDを取得できませんでした');
+
+        const call = { callId, targetSocketId: socketId, targetName, startedAt: Date.now() };
+        outgoingCallRef.current = call;
+        setOutgoingCall(call);
+
+        // サーバー通知が届かない場合のフォールバック（サーバー側タイムアウトと同じ30秒）
+        if (outgoingCallTimerRef.current) clearTimeout(outgoingCallTimerRef.current);
+        outgoingCallTimerRef.current = setTimeout(() => {
+          if (outgoingCallRef.current?.callId !== callId) return;
+          stopOutgoingCall(callId);
+          showCallNotice(`${targetName} の応答がありませんでした`, 'warn');
+        }, CALL_RING_TIMEOUT_MS + 2000);
+      } catch (err) {
+        console.warn('[callPeer]', err.message);
+        setCamError(`呼び出しに失敗しました: ${err.message}`);
+      }
+    };
+
+    // 相手が商談中モードの場合はアプリ内ダイアログで確認してから呼び出す
     if (targetPeer?.presenceMode === 'busy') {
-      const proceed = window.confirm(`${targetName} は商談中です。本当に呼び出しますか？`);
-      if (!proceed) return;
+      setConfirmDialog({
+        title: '商談中の拠点への呼び出し',
+        message: `${targetName} は商談中です。本当に呼び出しますか？`,
+        confirmLabel: '呼び出す',
+        onConfirm: startCall,
+      });
+      return;
     }
 
-    try {
-      const result = await webrtcRef.current?.callPeer(socketId);
-      const callId = result?.callId || '';
-      if (!callId) throw new Error('呼び出しIDを取得できませんでした');
-
-      const call = { callId, targetSocketId: socketId, targetName, startedAt: Date.now() };
-      outgoingCallRef.current = call;
-      setOutgoingCall(call);
-
-      // サーバー通知が届かない場合のフォールバック（サーバー側タイムアウトと同じ30秒）
-      if (outgoingCallTimerRef.current) clearTimeout(outgoingCallTimerRef.current);
-      outgoingCallTimerRef.current = setTimeout(() => {
-        if (outgoingCallRef.current?.callId !== callId) return;
-        stopOutgoingCall(callId);
-        showCallNotice(`${targetName} の応答がありませんでした`, 'warn');
-      }, CALL_RING_TIMEOUT_MS + 2000);
-    } catch (err) {
-      console.warn('[callPeer]', err.message);
-      setCamError(`呼び出しに失敗しました: ${err.message}`);
-    }
+    await startCall();
   }, [peers, showCallNotice, stopOutgoingCall]);
 
   const moveMemberToChannel = useCallback(async (socketId, nextChannelId) => {
@@ -2464,6 +2596,7 @@ export default function MainView() {
       sameChannel: true,
       channelId: activeChannelId,
       presenceMode,
+      signalLevel: selfSignalLevel,
       canControlVolume: false,
       baseVolume: 0,
       sortRank: 0,
@@ -2509,6 +2642,7 @@ export default function MainView() {
           sameChannel,
           channelId: peerChannelId,
           presenceMode: peer.presenceMode || 'none',
+          signalLevel: Number.isFinite(peer.signalLevel) ? peer.signalLevel : null,
           canControlVolume: true,
           baseVolume: remoteAudioVolume,
           sortRank: sameChannel ? 1 : 3,
@@ -2548,6 +2682,7 @@ export default function MainView() {
     micEnabled,
     peerEntries,
     presenceMode,
+    selfSignalLevel,
     remoteAudioVolume,
     screenShare,
     selectedAudioOutId,
@@ -2605,6 +2740,7 @@ export default function MainView() {
         videoPaused={tile.videoPaused}
         audioPaused={tile.audioPaused}
         presenceMode={tile.presenceMode || 'none'}
+        signalLevel={tile.signalLevel ?? null}
         highlightMuted={highlightSelfMuted}
         speakerDeviceId={tile.speakerDeviceId}
         speakerMuted={tile.speakerMuted}
@@ -2812,6 +2948,11 @@ export default function MainView() {
             </button>
           )}
           <div className="version-line">{sidebarCollapsed ? `v${APP_VERSION}` : `Client v${APP_VERSION}`}</div>
+          {settingsDraft.activeServer === 'sub' && (
+            <div className="version-line sub-server-line" title="保険用サブサーバーに接続しています">
+              {sidebarCollapsed ? 'SUB' : 'サブサーバー接続中'}
+            </div>
+          )}
         </div>
 
         {!sidebarCollapsed && (
@@ -2899,6 +3040,36 @@ export default function MainView() {
       {/* ── カメラエラー表示 ── */}
       {camError && (
         <div className="cam-error-bar">⚠ {camError}</div>
+      )}
+
+      {/* ── アプリ内確認ダイアログ ── */}
+      {confirmDialog && (
+        <div className="confirm-overlay" role="alertdialog" aria-modal="true" aria-labelledby="confirm-dialog-title">
+          <div className="confirm-panel">
+            <div className="confirm-icon">
+              <BellRing size={26} />
+            </div>
+            <div id="confirm-dialog-title" className="confirm-title">{confirmDialog.title}</div>
+            <div className="confirm-message">{confirmDialog.message}</div>
+            <div className="confirm-actions">
+              <button type="button" className="confirm-cancel" onClick={() => setConfirmDialog(null)}>
+                キャンセル（Esc）
+              </button>
+              <button
+                type="button"
+                className="confirm-primary"
+                autoFocus
+                onClick={() => {
+                  const dialog = confirmDialog;
+                  setConfirmDialog(null);
+                  dialog.onConfirm?.();
+                }}
+              >
+                {confirmDialog.confirmLabel || 'OK'}（Enter）
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {incomingCall && (
@@ -3038,97 +3209,112 @@ export default function MainView() {
         </div>
       )}
 
-      {/* ── コントロールバー ── */}
+      {/* ── コントロールバー ──
+          左: デバイス操作（マイク/カメラ/スピーカー/画面共有）を1ブロックに、
+          右端: プレゼンスモード（商談中/不在/帰宅）と設定を別ブロックで棲み分け。 */}
       <div className="control-bar">
-        {/* マイク */}
-        <DeviceButton
-          active={micEnabled}
-          onToggle={toggleMic}
-          Icon={Mic}
-          IconOff={MicOff}
-          devices={audioInDevices}
-          selectedId={selectedAudioInId}
-          onDeviceChange={(id) => changeMediaDevice('audioIn', id)}
-          title="マイク"
-        />
+        <div className="ctrl-group device-group">
+          {/* マイク */}
+          <DeviceButton
+            active={micEnabled}
+            onToggle={toggleMic}
+            Icon={Mic}
+            IconOff={MicOff}
+            devices={audioInDevices}
+            selectedId={selectedAudioInId}
+            onDeviceChange={(id) => changeMediaDevice('audioIn', id)}
+            title="マイク"
+            label="マイク"
+          />
 
-        {/* カメラ */}
-        <DeviceButton
-          active={camEnabled}
-          onToggle={toggleCam}
-          Icon={Video}
-          IconOff={VideoOff}
-          devices={videoDevices}
-          selectedId={selectedVideoId}
-          onDeviceChange={(id) => changeMediaDevice('video', id)}
-          title="カメラ"
-        />
+          {/* カメラ */}
+          <DeviceButton
+            active={camEnabled}
+            onToggle={toggleCam}
+            Icon={Video}
+            IconOff={VideoOff}
+            devices={videoDevices}
+            selectedId={selectedVideoId}
+            onDeviceChange={(id) => changeMediaDevice('video', id)}
+            title="カメラ"
+            label="カメラ"
+          />
 
-        {/* スピーカー */}
-        <DeviceButton
-          active={!speakerMuted}
-          onToggle={() => setSpeakerOutputEnabled(speakerMuted)}
-          Icon={Volume2}
-          IconOff={VolumeX}
-          devices={audioOutDevices}
-          selectedId={selectedAudioOutId}
-          onDeviceChange={changeSpeaker}
-          title="スピーカー"
-        />
+          {/* スピーカー */}
+          <DeviceButton
+            active={!speakerMuted}
+            onToggle={() => setSpeakerOutputEnabled(speakerMuted)}
+            Icon={Volume2}
+            IconOff={VolumeX}
+            devices={audioOutDevices}
+            selectedId={selectedAudioOutId}
+            onDeviceChange={changeSpeaker}
+            title="スピーカー"
+            label="スピーカー"
+          />
 
-        {/* 画面共有 */}
-        <button
-          className={`ctrl-btn ${screenShare ? 'sharing' : ''}`}
-          onClick={() => {
-            if (screenShare) stopScreenShare();
-            else setShareModalMode('start');
-          }}
-          title={screenShare ? '画面共有を停止' : '画面共有'}
-          aria-label={screenShare ? '画面共有を停止' : '画面共有'}
-        >
-          <MonitorUp size={20} />
-        </button>
+          {/* 画面共有 */}
+          <button
+            className={`ctrl-btn ${screenShare ? 'sharing' : ''}`}
+            onClick={() => {
+              if (screenShare) stopScreenShare();
+              else setShareModalMode('start');
+            }}
+            title={screenShare ? '画面共有を停止' : '画面共有'}
+            aria-label={screenShare ? '画面共有を停止' : '画面共有'}
+          >
+            <MonitorUp size={20} />
+            <span className="ctrl-btn-label">画面共有</span>
+          </button>
+        </div>
 
-        <div className="ctrl-separator" aria-hidden="true" />
+        <div className="ctrl-group mode-group">
+          {/* プレゼンスモード（商談中/不在/帰宅） */}
+          <button
+            className={`ctrl-btn mode-btn ${presenceMode === 'busy' ? 'mode-active busy' : ''}`}
+            onClick={() => togglePresenceMode('busy')}
+            title={`商談中モード（${(settingsDraft.shortcuts?.busyMode || 'u').toUpperCase()}）: 他拠点に商談中と表示・着信音50%`}
+            aria-label="商談中モード"
+            aria-pressed={presenceMode === 'busy'}
+          >
+            <Briefcase size={20} />
+            <span className="ctrl-btn-label">商談中</span>
+          </button>
+          <button
+            className={`ctrl-btn mode-btn ${presenceMode === 'away' ? 'mode-active away' : ''}`}
+            onClick={() => togglePresenceMode('away')}
+            title={`不在モード（${(settingsDraft.shortcuts?.awayMode || 'i').toUpperCase()}）: 他拠点に不在と表示`}
+            aria-label="不在モード"
+            aria-pressed={presenceMode === 'away'}
+          >
+            <Clock size={20} />
+            <span className="ctrl-btn-label">不在</span>
+          </button>
+          <button
+            className={`ctrl-btn mode-btn ${presenceMode === 'gohome' ? 'mode-active gohome' : ''}`}
+            onClick={() => togglePresenceMode('gohome')}
+            title={`帰宅モード（${(settingsDraft.shortcuts?.goHomeMode || 'o').toUpperCase()}）: 映像表示をオフにする`}
+            aria-label="帰宅モード"
+            aria-pressed={presenceMode === 'gohome'}
+          >
+            <Moon size={20} />
+            <span className="ctrl-btn-label">帰宅</span>
+          </button>
 
-        {/* プレゼンスモード（商談中/不在/帰宅） */}
-        <button
-          className={`ctrl-btn mode-btn ${presenceMode === 'busy' ? 'mode-active busy' : ''}`}
-          onClick={() => togglePresenceMode('busy')}
-          title={`商談中モード（${(settingsDraft.shortcuts?.busyMode || 'u').toUpperCase()}）: 他拠点に商談中と表示・着信音50%`}
-          aria-label="商談中モード"
-          aria-pressed={presenceMode === 'busy'}
-        >
-          <Briefcase size={20} />
-        </button>
-        <button
-          className={`ctrl-btn mode-btn ${presenceMode === 'away' ? 'mode-active away' : ''}`}
-          onClick={() => togglePresenceMode('away')}
-          title={`不在モード（${(settingsDraft.shortcuts?.awayMode || 'i').toUpperCase()}）: 他拠点に不在と表示`}
-          aria-label="不在モード"
-          aria-pressed={presenceMode === 'away'}
-        >
-          <Clock size={20} />
-        </button>
-        <button
-          className={`ctrl-btn mode-btn ${presenceMode === 'gohome' ? 'mode-active gohome' : ''}`}
-          onClick={() => togglePresenceMode('gohome')}
-          title={`帰宅モード（${(settingsDraft.shortcuts?.goHomeMode || 'o').toUpperCase()}）: 映像表示をオフにする`}
-          aria-label="帰宅モード"
-          aria-pressed={presenceMode === 'gohome'}
-        >
-          <Moon size={20} />
-        </button>
+          <div className="ctrl-separator" aria-hidden="true" />
+
+          {/* 設定 */}
+          <button
+            className="ctrl-btn settings-btn"
+            onClick={openSettingsPanel}
+            title="設定"
+            aria-label="設定"
+          >
+            <Settings size={20} />
+            <span className="ctrl-btn-label">設定</span>
+          </button>
+        </div>
       </div>
-
-      <button
-        className="settings-fab"
-        onClick={openSettingsPanel}
-        title="設定"
-        aria-label="設定"
-      >
-        <Settings size={18} />
-      </button>
 
       {settingsOpen && (
         <div
@@ -3186,7 +3372,7 @@ export default function MainView() {
                 <h2>SFUサーバー</h2>
                 <div className="server-row">
                   <div className="field">
-                    <label>IPアドレス</label>
+                    <label>メイン IPアドレス</label>
                     <input
                       type="text"
                       value={settingsDraft.serverIp}
@@ -3205,6 +3391,42 @@ export default function MainView() {
                     />
                   </div>
                 </div>
+                <div className="server-row">
+                  <div className="field">
+                    <label>サブ（保険）IPアドレス</label>
+                    <input
+                      type="text"
+                      value={settingsDraft.subServerIp || ''}
+                      onChange={e => updateSettingsDraft('subServerIp', e.target.value)}
+                      placeholder="例: cloud.example.jp / 203.0.113.10"
+                    />
+                  </div>
+                  <div className="field">
+                    <label>ポート</label>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={settingsDraft.subServerPort || '3000'}
+                      onChange={e => updateSettingsDraft('subServerPort', e.target.value)}
+                      placeholder="3000"
+                    />
+                  </div>
+                </div>
+                <div className="field">
+                  <label>使用するサーバー</label>
+                  <select
+                    value={settingsDraft.activeServer === 'sub' ? 'sub' : 'main'}
+                    onChange={e => updateSettingsDraft('activeServer', e.target.value)}
+                  >
+                    <option value="main">メインサーバー</option>
+                    <option value="sub" disabled={!String(settingsDraft.subServerIp || '').trim()}>
+                      サブ（保険）サーバー
+                    </option>
+                  </select>
+                </div>
+                <p className="field-hint">
+                  現在のサーバーに約{Math.round(FAILOVER_AFTER_MS / 1000)}秒間接続できず、もう一方のサーバーが応答する場合は自動的に切り替えて再接続します。
+                </p>
               </div>
 
               <div className="settings-section">

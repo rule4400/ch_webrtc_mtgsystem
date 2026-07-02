@@ -94,11 +94,11 @@ const DEFAULT_CHANNELS = [
 const APP_TYPES = ['client', 'viewer', 'screen-share', 'server', 'server-gui'];
 const SERVER_APP_VERSION = serverPackage.version || '0.0.0';
 const DEFAULT_APP_VERSIONS = {
-  client: '0.3.3',
+  client: '0.4.0',
   viewer: '0.1.1',
   'screen-share': '0.1.0',
   server: SERVER_APP_VERSION,
-  'server-gui': '1.1.3',
+  'server-gui': '1.1.4',
 };
 let systemState = {
   brand: SYSTEM_NAME,
@@ -572,6 +572,7 @@ function getPeerClientSnapshot(id, peer, now = Date.now()) {
     heartbeatAgeMs,
     health: healthStatus(peer, now),
     rttMs: peer.rttMs ?? null,
+    signalLevel: signalLevelFor(peer, now),
     connectionQuality: connectionQuality(peer),
     mediaState: deriveMediaState(peer),
     producers: peer.producers.size,
@@ -877,6 +878,27 @@ function emitIncomingCall(socketId, payload, source = 'server') {
   });
 
   return { ok: true, call: callPayload };
+}
+
+/**
+ * 拠点のサーバー通信安定度を0-5で算出する（クライアントのアンテナ表示用）。
+ * telemetry RTT の平均とジッタ、ハートビート鮮度から求める。
+ *   5=非常に良好 / 4=良好 / 3=普通 / 2=不安定 / 1=非常に不安定 / 0=切断
+ */
+function signalLevelFor(peer, now = Date.now()) {
+  if (!peer?.socket?.connected) return 0;
+  const heartbeatAge = peer.lastHeartbeatAt ? now - peer.lastHeartbeatAt : null;
+  if (heartbeatAge == null) return 3;       // telemetry未着（起動直後など）
+  if (heartbeatAge > 15000) return 1;       // ハートビートが途絶え気味
+  const quality = connectionQuality(peer);
+  if (quality.level === 'unknown') return 3;
+  const avg = quality.avgRttMs ?? 0;
+  const jitter = quality.jitterMs ?? 0;
+  if (avg <= 50 && jitter <= 15) return 5;
+  if (avg <= 120 && jitter <= 40) return 4;
+  if (avg <= 250 && jitter <= 90) return 3;
+  if (avg <= 500) return 2;
+  return 1;
 }
 
 /** 受信画質(low/medium/high)を simulcast の空間レイヤ(0/1/2)に変換する */
@@ -1691,6 +1713,7 @@ io.on('connection', async socket => {
         appVersion:   peerInfo.appVersion,
         channelId:    peerInfo.channelId,
         presenceMode: peerInfo.presenceMode || 'none',
+        signalLevel:  signalLevelFor(peerInfo),
         isSelf:       peerId === socket.id,
         producers,
       });
