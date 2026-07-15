@@ -67,6 +67,71 @@ const rtcMinPort = Number(process.env.RTC_MIN_PORT) || 10000;
 const rtcMaxPort = Number(process.env.RTC_MAX_PORT) || 10200;
 
 /**
+ * メディア固定ポート(WebRtcServer)。RTC_PORT を指定すると、全クライアントの
+ * メディア(UDP/TCP)がこの1ポートに集約される。
+ *
+ * UTM/ファイアウォール設置拠点では「動的な高ポート範囲のUDP」がIPS/アプリ制御で
+ * 遮断されやすく、transportごとにポートが変わる従来方式は「たまたま通る/通らない」
+ * を生む。固定ポートなら UTM 側の許可設定が「サーバーIPの UDP/TCP 1ポート」で
+ * 済み、挙動も決定的になる。未指定なら従来どおり RTC_MIN/MAX_PORT の範囲を使う。
+ */
+const rtcPort = Number(process.env.RTC_PORT) || 0;
+
+/**
+ * 追加TCP待受ポート（カンマ区切り、例: "443"）。RTC_PORT 固定ポートモード時のみ有効。
+ * UTM/FWが「外向きTCP 443しか通さない」拠点でも、mediasoup が443で直接
+ * ICE-TCP を待ち受けることで、TURN中継なしにメディア経路を確立できる。
+ * ※1024未満のポートは root/管理者権限が必要。バインドできない場合は
+ *   追加ポート無しで自動的に縮退起動する。
+ */
+const rtcExtraTcpPorts = parseIpList(process.env.RTC_EXTRA_TCP_PORTS)
+  .map(value => Number(value))
+  .filter(port => Number.isInteger(port) && port >= 1 && port <= 65535 && port !== rtcPort);
+
+/**
+ * WebRtcServer 用の listenInfos を構築する。
+ * announced IP がこのマシンのローカルIPなら、そのIPに直接 bind する
+ * （同一ポートに複数のワイルドカードbindはできないため）。
+ * NAT越し等でローカルに存在しないIPを広告する場合は 0.0.0.0 に1本だけ bind し、
+ * そのIPを announcedAddress として広告する。
+ */
+function buildRtcListenInfos(port, extraTcpPorts = []) {
+  const locals = new Set(localIpv4List());
+  const localAnnounced = announcedIps.filter(ip => locals.has(ip));
+  const nonLocalAnnounced = announcedIps.filter(ip => !locals.has(ip));
+  const infos = [];
+
+  const pushFor = (ip, announcedAddress) => {
+    infos.push({ protocol: 'udp', ip, announcedAddress, port });
+    infos.push({ protocol: 'tcp', ip, announcedAddress, port });
+    // 追加TCP待受（443等）。UTMが443しか通さない拠点向けのICE-TCP直接経路
+    for (const extraPort of extraTcpPorts) {
+      infos.push({ protocol: 'tcp', ip, announcedAddress, port: extraPort });
+    }
+  };
+
+  if (localAnnounced.length) {
+    for (const ip of localAnnounced) pushFor(ip, ip);
+    if (nonLocalAnnounced.length) {
+      console.warn(`[Config] RTC_PORT 固定ポートモードではローカルに存在しないIP (${nonLocalAnnounced.join(', ')}) は広告できません。NAT配下で使う場合は ANNOUNCED_IP にローカルIPを指定してください。`);
+    }
+  } else if (nonLocalAnnounced.length) {
+    pushFor('0.0.0.0', nonLocalAnnounced[0]);
+    if (nonLocalAnnounced.length > 1) {
+      console.warn(`[Config] RTC_PORT 固定ポートモードで広告できるNAT越しIPは1つだけです (${nonLocalAnnounced[0]} を使用)`);
+    }
+  }
+  return infos;
+}
+
+if (rtcPort) {
+  const extra = rtcExtraTcpPorts.length ? ` + 追加TCP待受 ${rtcExtraTcpPorts.join(', ')}` : '';
+  console.log(`[Config] RTC_PORT=${rtcPort}: メディアを固定ポート(UDP/TCP ${rtcPort})に集約します${extra}`);
+} else if (rtcExtraTcpPorts.length) {
+  console.warn('[Config] RTC_EXTRA_TCP_PORTS は RTC_PORT(固定ポートモード)と併用したときのみ有効です');
+}
+
+/**
  * メディア伝送のTCP設定。
  *   FORCE_TCP=1  … UDPを無効化し、全メディアをTCP(ICE-TCP)で送受信する
  *   PREFER_TCP=1 … UDPも有効なままTCP候補を優先する（UDPが不安定な環境向け）
@@ -129,6 +194,9 @@ module.exports = {
   announcedIp: localIp,
   announcedIps,
   rtcPortRange: { min: rtcMinPort, max: rtcMaxPort },
+  rtcPort,
+  rtcExtraTcpPorts,
+  buildRtcListenInfos,
 
   // クライアントへ配布する ICE サーバー
   iceServers: buildIceServers(),
