@@ -440,6 +440,16 @@ export class ViewerWebRTCManager {
     if (iceParameters) await transport.restartIce({ iceParameters });
   }
 
+  _replaceStreamTrack(stream, nextTrack) {
+    if (!stream || !nextTrack) return;
+    for (const track of stream.getTracks()) {
+      if (track !== nextTrack && track.kind === nextTrack.kind) {
+        try { stream.removeTrack(track); } catch { /* already removed */ }
+      }
+    }
+    if (!stream.getTracks().includes(nextTrack)) stream.addTrack(nextTrack);
+  }
+
   async _consumePeer(producerId, socketId, locationName, kind, paused, metadata = {}) {
     if (!this.recvTransport) return;
     if (this.consumers.has(producerId)) return;
@@ -493,17 +503,17 @@ export class ViewerWebRTCManager {
       const appData = metadata.appData || {};
       const source = metadata.source || appData.source || (kind === 'video' ? 'camera' : 'microphone');
       if (kind === 'video' && source === 'screen') {
-        peer.screenStream.addTrack(consumer.track);
+        this._replaceStreamTrack(peer.screenStream, consumer.track);
         peer.screenProducerId = producerId;
         peer.screenPaused = !!paused;
         peer.screenLabel = appData.label || appData.sourceName || '画面共有';
       } else if (kind === 'audio' && source === 'screen-audio') {
-        peer.screenStream.addTrack(consumer.track);
+        this._replaceStreamTrack(peer.screenStream, consumer.track);
         peer.screenAudioProducerId = producerId;
         peer.screenAudioPaused = !!paused;
         peer.screenLabel = peer.screenLabel || appData.label || appData.sourceName || '画面共有';
       } else {
-        peer.stream.addTrack(consumer.track);
+        this._replaceStreamTrack(peer.stream, consumer.track);
       }
 
       if (kind === 'video' && source !== 'screen') {
@@ -536,12 +546,18 @@ export class ViewerWebRTCManager {
       if (peer.videoProducerId === producerId) {
         peer.videoProducerId = null;
         peer.videoPaused = true;
+        if (closedTrack) {
+          try { peer.stream?.removeTrack(closedTrack); } catch { /* already removed */ }
+        }
         this.onPeerUpdated?.(socketId, { ...peer });
         break;
       }
       if (peer.audioProducerId === producerId) {
         peer.audioProducerId = null;
         peer.audioPaused = true;
+        if (closedTrack) {
+          try { peer.stream?.removeTrack(closedTrack); } catch { /* already removed */ }
+        }
         this.onPeerUpdated?.(socketId, { ...peer });
         break;
       }

@@ -484,7 +484,7 @@ export default function App() {
   const connect = useCallback(async (nextConfig) => {
     const seq = connectSeqRef.current + 1;
     connectSeqRef.current = seq;
-    managerRef.current?.disconnect();
+    managerRef.current?.disconnect({ stopTracks: false });
 
     setStatus('connecting');
     setError('');

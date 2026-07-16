@@ -1109,6 +1109,7 @@ function localIpv4Addresses() {
 // リクエストで応答を確認し、稼働状態をGUIに表示する。
 const dgram = require('dgram');
 const net = require('net');
+const tls = require('tls');
 const crypto = require('crypto');
 const ICE_PROBE_INTERVAL_MS = Number(process.env.ICE_PROBE_INTERVAL_MS) || 60000;
 let iceProbeResults = [];
@@ -1123,15 +1124,16 @@ function stunBindingRequest() {
 }
 
 function parseIceUrl(url) {
-  const match = /^(stuns?|turns?):([^:?/]+)(?::(\d+))?(?:\?transport=(udp|tcp))?$/i.exec(String(url || '').trim());
+  const match = /^(stuns?|turns?):(\[[0-9a-f:]+\]|[^:?/]+)(?::(\d+))?(?:\?transport=(udp|tcp))?$/i.exec(String(url || '').trim());
   if (!match) return null;
   const scheme = match[1].toLowerCase();
   const secure = scheme === 'stuns' || scheme === 'turns';
   return {
     scheme,
-    host: match[2],
+    host: match[2].startsWith('[') ? match[2].slice(1, -1) : match[2],
     port: Number(match[3]) || (secure ? 5349 : 3478),
     transport: (match[4] || (secure ? 'tcp' : 'udp')).toLowerCase(),
+    secure,
   };
 }
 
@@ -1139,7 +1141,7 @@ function probeStunUdp(host, port, timeoutMs = 4000) {
   return new Promise(resolve => {
     const startedAt = Date.now();
     const request = stunBindingRequest();
-    const socket = dgram.createSocket('udp4');
+    const socket = dgram.createSocket(net.isIP(host) === 6 ? 'udp6' : 'udp4');
     let done = false;
     const finish = (result) => {
       if (done) return;
@@ -1162,23 +1164,31 @@ function probeStunUdp(host, port, timeoutMs = 4000) {
   });
 }
 
-function probeStunTcp(host, port, timeoutMs = 4000) {
+function probeStunTcp(host, port, timeoutMs = 4000, secure = false) {
   return new Promise(resolve => {
     const startedAt = Date.now();
     const request = stunBindingRequest();
     let received = Buffer.alloc(0);
     let done = false;
-    const socket = net.connect({ host, port, timeout: timeoutMs });
+    const options = {
+      host,
+      port,
+      timeout: timeoutMs,
+      ...(secure && !net.isIP(host) ? { servername: host } : {}),
+    };
+    const socket = secure ? tls.connect(options) : net.connect(options);
     const finish = (result) => {
       if (done) return;
       done = true;
       try { socket.destroy(); } catch (_) { /* closed */ }
       resolve(result);
     };
-    socket.on('connect', () => socket.write(request));
+    socket.on(secure ? 'secureConnect' : 'connect', () => socket.write(request));
     socket.on('data', chunk => {
       received = Buffer.concat([received, chunk]);
-      if (received.length >= 20 && received.readUInt32BE(4) === 0x2112a442) {
+      if (received.length >= 20 &&
+          received.readUInt32BE(4) === 0x2112a442 &&
+          received.subarray(8, 20).equals(request.subarray(8, 20))) {
         finish({ ok: true, rttMs: Date.now() - startedAt });
       }
     });
@@ -1207,9 +1217,14 @@ async function probeIceServers() {
   try {
     iceProbeResults = await Promise.all(targets.map(async target => {
       const result = target.transport === 'tcp'
-        ? await probeStunTcp(target.host, target.port)
+        ? await probeStunTcp(target.host, target.port, 4000, target.secure)
         : await probeStunUdp(target.host, target.port);
-      return { url: target.url, transport: target.transport, checkedAt: Date.now(), ...result };
+      return {
+        url: target.url,
+        transport: target.secure ? 'tls' : target.transport,
+        checkedAt: Date.now(),
+        ...result,
+      };
     }));
   } finally {
     iceProbeRunning = false;
@@ -1265,6 +1280,7 @@ function getStatsSnapshot() {
     rtcSinglePortActive: !!(webRtcServer && !webRtcServer.closed),
     rtcExtraTcpPorts: activeExtraTcpPorts,
     iceServerCount: (config.iceServers || []).length,
+    turnConfigured: !!config.turnConfigured,
     // 監視GUI「メディア経路」タブ用: 外部STUN/TURN設定と死活確認結果
     iceServers: (config.iceServers || []).map(server => ({
       urls: server.urls,
@@ -1485,7 +1501,17 @@ app.get('/recordings/media/:id', (req, res) => {
 app.get('/health', (_, res) => res.json(getStatsSnapshot()));
 app.get('/ready', (_, res) => {
   const ready = !!router && workers.length > 0 && !recovering;
-  res.status(ready ? 200 : 503).json({ ready, recovering, workers: workers.length });
+  res.status(ready ? 200 : 503).json({
+    ready,
+    recovering,
+    workers: workers.length,
+    // ready は制御面の起動状態。拠点からの実メディア到達性はネットワークごとに
+    // 異なるため、直結不能時の代替経路があるかを別フィールドで明示する。
+    mediaPath: {
+      rtcSinglePortActive: !!(webRtcServer && !webRtcServer.closed),
+      turnConfigured: !!config.turnConfigured,
+    },
+  });
 });
 // クライアントのサーバー選択用: 実際に接続中の拠点数を軽量に返す。
 // フェイルオーバー/再接続時に「他拠点が接続している方のサーバー」へ寄せることで、

@@ -74,8 +74,17 @@ const DEFAULT_SYSTEM_SETTINGS = {
   // メディア接続ポート設定(UTM/FW対策)。サーバープロセス起動時に環境変数として
   // 渡される。rtcPort: 固定ポート(空=従来のポート範囲)、extraTcpPorts: 443等の
   // 追加TCP待受(カンマ区切り)、announcedIp: ICE候補として広告するIP
-  // (空=自動: サーバー自身の非内部IPv4を広告)。
-  network: { rtcPort: '', extraTcpPorts: '', announcedIp: '' },
+  // (空=自動: サーバー自身の非内部IPv4を広告)。STUN/TURN は直結できない
+  // 拠点向けの代替ICE経路としてクライアントへ配布する。
+  network: {
+    rtcPort: '',
+    extraTcpPorts: '',
+    announcedIp: '',
+    stunUrls: '',
+    turnUrls: '',
+    turnUser: '',
+    turnPass: '',
+  },
   // ルーティン再起動(HH:MM、複数可)。serverRestartTimes はサーバープロセスの
   // 計画再起動(GUI監視下で自動復帰)、clientRestartTimes は全拠点クライアントへ
   // systemState 経由で同期され、各拠点が指定時刻にアプリを再起動する。
@@ -298,6 +307,21 @@ function sanitizeIpListText(value) {
     .join(',');
 }
 
+function sanitizeIceUrlListText(value, allowedSchemes) {
+  const allowed = new Set(allowedSchemes.map(item => String(item).toLowerCase()));
+  return String(value ?? '')
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => {
+      if (!part || part.length > 512 || /[\s\u0000-\u001f\u007f]/.test(part)) return false;
+      const match = /^(stuns?|turns?):(?:\[[0-9a-f:]+\]|[a-z0-9.-]+)(?::(\d{1,5}))?(?:\?transport=(udp|tcp))?$/i.exec(part);
+      if (!match || !allowed.has(match[1].toLowerCase())) return false;
+      return !match[2] || Number(match[2]) <= 65535;
+    })
+    .slice(0, 16)
+    .join(',');
+}
+
 function sanitizeNetwork(input) {
   const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   const extraTcpPorts = String(raw.extraTcpPorts ?? '')
@@ -311,6 +335,10 @@ function sanitizeNetwork(input) {
     // ANNOUNCED_IP。空 = 自動（サーバー自身の非内部IPv4を全て広告）。
     // カンマ区切りで複数指定可（server/config.js が分割して解釈する）。
     announcedIp: sanitizeIpListText(raw.announcedIp),
+    stunUrls: sanitizeIceUrlListText(raw.stunUrls, ['stun', 'stuns']),
+    turnUrls: sanitizeIceUrlListText(raw.turnUrls, ['turn', 'turns']),
+    turnUser: shortText(raw.turnUser, 256),
+    turnPass: shortText(raw.turnPass, 256),
   };
 }
 
@@ -985,6 +1013,10 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
   if (network.rtcPort) env.RTC_PORT = network.rtcPort;
   if (network.extraTcpPorts) env.RTC_EXTRA_TCP_PORTS = network.extraTcpPorts;
   if (network.announcedIp) env.ANNOUNCED_IP = network.announcedIp;
+  if (network.stunUrls) env.STUN_URLS = network.stunUrls;
+  if (network.turnUrls) env.TURN_URLS = network.turnUrls;
+  if (network.turnUser) env.TURN_USER = network.turnUser;
+  if (network.turnPass) env.TURN_PASS = network.turnPass;
   
   // Electron 同梱の Node ランタイムで内蔵サーバーを起動する。
   serverProcess = spawn(process.execPath, [path.join(serverDir, 'index.js')], {

@@ -893,13 +893,12 @@
               <label>サーバー待受（STUN/ICE）の稼働状態</label>
               <div class="chip-row" id="routeListen"><span class="chip">サーバー停止中</span></div>
               <div class="settings-help">
-                本システムのメディアは外部TURN/STUNサーバーを経由せず、SFU自身がICE(STUN)を待ち受けて
-                各拠点と直接確立します。固定ポート運用時は「サーバーIP宛 TCP 3000 + UDP/TCP 固定ポート
-                （+追加TCP待受）」がUTM/ファイアウォールで許可されていれば疎通します。
+                通常はSFUへ直接接続し、直接経路を確立できない拠点だけ外部TURNを中継経路として利用します。
+                固定ポート運用時は「サーバーIP宛 TCP 3000 + UDP/TCP 固定ポート（+追加TCP待受）」を許可してください。
               </div>
             </div>
             <div class="settings-row">
-              <label>外部 STUN/TURN サーバーの死活監視（STUN_URLS / TURN_URLS 設定時のみ）</label>
+              <label>外部 STUN/TURN サーバーの到達確認（STUN_URLS / TURN_URLS 設定時のみ）</label>
               <div id="routeIceServers"><div class="empty">未設定（SFU直結モード）</div></div>
             </div>
             <div class="settings-row">
@@ -954,13 +953,33 @@
                   <input id="netAnnouncedIp" placeholder="自動（サーバー自身のIP）">
                   <span>空欄 = 自動でこのサーバー自身のIPを広告。全拠点から到達できるVPN内IPを明示する場合に設定(カンマ区切り可)</span>
                 </div>
+                <div class="update-row">
+                  <span>STUN URL</span>
+                  <input id="netStunUrls" placeholder="例: stun:stun.example.jp:3478">
+                  <span>任意。複数はカンマ区切り</span>
+                </div>
+                <div class="update-row">
+                  <span>TURN URL</span>
+                  <input id="netTurnUrls" placeholder="例: turns:turn.example.jp:443?transport=tcp">
+                  <span>直結できない拠点の中継経路。UDP/TCP/TLSをカンマ区切りで併記可</span>
+                </div>
+                <div class="update-row">
+                  <span>TURN ユーザー名</span>
+                  <input id="netTurnUser" autocomplete="off">
+                  <span>TURNサーバーの認証情報</span>
+                </div>
+                <div class="update-row">
+                  <span>TURN パスワード</span>
+                  <input id="netTurnPass" type="password" autocomplete="new-password">
+                  <span>この端末のシステム設定ファイルに保存されます</span>
+                </div>
               </div>
               <div class="settings-help">
                 固定ポートを設定すると、全拠点のメディア(UDP/TCP)がこの1ポートに集約され、
                 UTM側の許可設定が「サーバーIP宛 TCP 3000 + UDP/TCP 固定ポート」だけで済みます。
-                追加TCP待受(443等)を設定すると、443しか通さない厳しいUTM拠点でもTURNサーバー無しで
-                メディア経路を確立できます(macOS/Windowsは管理者権限不要。Linux等でバインドできない場合は
-                追加ポート無しで自動縮退します)。「設定を保存して配信」を押すとサーバーが自動再起動して適用されます。
+                追加TCP待受はSFUへの直接ICE-TCPであり、HTTPS/TURN-TLSではありません。直接接続を制限する
+                UTM拠点には、許可されやすい TURN-TLS（例: turns:ホスト名:443?transport=tcp）を併用してください。
+                「設定を保存して配信」を押すとサーバーが自動再起動して適用されます。
               </div>
             </div>
             <div class="settings-row">
@@ -1167,6 +1186,10 @@
     const netRtcPort = document.getElementById('netRtcPort');
     const netExtraTcp = document.getElementById('netExtraTcp');
     const netAnnouncedIp = document.getElementById('netAnnouncedIp');
+    const netStunUrls = document.getElementById('netStunUrls');
+    const netTurnUrls = document.getElementById('netTurnUrls');
+    const netTurnUser = document.getElementById('netTurnUser');
+    const netTurnPass = document.getElementById('netTurnPass');
     const maintServerTimes = document.getElementById('maintServerTimes');
     const maintClientTimes = document.getElementById('maintClientTimes');
     const routeListen = document.getElementById('routeListen');
@@ -1229,7 +1252,10 @@
       channels: [{ id: 'general', name: '一般' }],
       latestVersions: { client: '0.4.1', viewer: '0.1.0', 'screen-share': '0.2.1' },
       updatePackages: {},
-      network: { rtcPort: '', extraTcpPorts: '' },
+      network: {
+        rtcPort: '', extraTcpPorts: '', announcedIp: '',
+        stunUrls: '', turnUrls: '', turnUser: '', turnPass: '',
+      },
     };
     pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
 
@@ -1377,6 +1403,10 @@
       netRtcPort.value = systemSettings.network?.rtcPort || '';
       netExtraTcp.value = systemSettings.network?.extraTcpPorts || '';
       netAnnouncedIp.value = systemSettings.network?.announcedIp || '';
+      netStunUrls.value = systemSettings.network?.stunUrls || '';
+      netTurnUrls.value = systemSettings.network?.turnUrls || '';
+      netTurnUser.value = systemSettings.network?.turnUser || '';
+      netTurnPass.value = systemSettings.network?.turnPass || '';
       maintServerTimes.value = (systemSettings.maintenance?.serverRestartTimes || []).join(', ');
       maintClientTimes.value = (systemSettings.maintenance?.clientRestartTimes || []).join(', ');
       updateFolderDisplay.innerText = systemSettings.updateFolder || '未設定';
@@ -1475,6 +1505,10 @@
           rtcPort: netRtcPort.value.trim(),
           extraTcpPorts: netExtraTcp.value.trim(),
           announcedIp: netAnnouncedIp.value.trim(),
+          stunUrls: netStunUrls.value.trim(),
+          turnUrls: netTurnUrls.value.trim(),
+          turnUser: netTurnUser.value.trim(),
+          turnPass: netTurnPass.value,
         },
         maintenance: {
           serverRestartTimes: parseRestartTimes(maintServerTimes.value),
@@ -1836,11 +1870,14 @@
       }
       const announced = (stats.announcedIps || [stats.announcedIp]).filter(Boolean).join(', ');
       listenChips.push(`<span class="chip">公開IP ${escapeHtml(announced || '-')}</span>`);
+      listenChips.push(stats.turnConfigured
+        ? '<span class="chip ok">TURN代替経路あり</span>'
+        : '<span class="chip warn">TURN代替経路なし（直結のみ）</span>');
       routeListen.innerHTML = listenChips.join('');
 
       const probes = stats.iceProbes || [];
       if (!(stats.iceServers || []).length) {
-        routeIceServers.innerHTML = '<div class="empty">未設定（SFU直結モード）。サーバーの .env に STUN_URLS / TURN_URLS を設定すると死活監視がここに表示されます。</div>';
+        routeIceServers.innerHTML = '<div class="empty">未設定（SFU直結のみ）。設定タブで TURN を追加すると、直結できない拠点向けの中継経路と到達監視が有効になります。</div>';
       } else if (!probes.length) {
         routeIceServers.innerHTML = '<div class="empty">死活確認中...</div>';
       } else {
@@ -1861,7 +1898,7 @@
       routePeers.innerHTML = `
         <table class="route-table">
           <thead><tr>
-            <th>拠点</th><th>接続</th><th>経路</th><th>ICE</th><th>DTLS</th><th>中継</th><th>メディア状態</th>
+            <th>拠点</th><th>接続</th><th>経路</th><th>ICE</th><th>DTLS</th><th>接続方式</th><th>メディア状態</th>
           </tr></thead>
           <tbody>${clients.map(client => {
             const route = transportRouteInfo(client);
@@ -1878,7 +1915,7 @@
               <td>${escapeHtml(proto)}${remote ? `<div class="route-sub">${escapeHtml(remote)}</div>` : ''}</td>
               <td><span class="chip ${route.iceOk ? 'ok' : (route.count ? 'warn' : '')}">${route.iceOk ? '確立' : (route.count ? '未確立' : '-')}</span></td>
               <td><span class="chip ${route.dtlsOk ? 'ok' : (route.count ? 'warn' : '')}">${route.dtlsOk ? '確立' : (route.count ? '未確立' : '-')}</span></td>
-              <td>${client.tcpFallback ? '<span class="chip warn">TCP中継(自動)</span>' : (route.protocols.includes('TCP') ? '<span class="chip blue">TCP</span>' : '<span class="chip">UDP直結</span>')}</td>
+              <td>${client.tcpFallback ? '<span class="chip warn">TCP優先(自動)</span>' : (route.protocols.includes('TCP') ? '<span class="chip blue">TCP</span>' : '<span class="chip">UDP</span>')}</td>
               <td>${stateChips.join('')}${flows}</td>
             </tr>`;
           }).join('')}</tbody>

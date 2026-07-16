@@ -1342,6 +1342,22 @@ export class WebRTCManager {
 
   // ── 受信 ─────────────────────────────────────────────────
 
+  /**
+   * 同じ MediaStream に同種の終了済み/旧トラックを残さず、新しい consumer の
+   * トラックへ置き換える。remote producer が同じ Socket.IO セッションのまま
+   * 作り直された場合、古い video track が先頭に残ると getVideoTracks()[0] と
+   * <video> が終了済みトラックを参照し続け、RTP 復旧後も黒画面になる。
+   */
+  _replaceStreamTrack(stream, nextTrack) {
+    if (!stream || !nextTrack) return;
+    for (const track of stream.getTracks()) {
+      if (track !== nextTrack && track.kind === nextTrack.kind) {
+        try { stream.removeTrack(track); } catch { /* already removed */ }
+      }
+    }
+    if (!stream.getTracks().includes(nextTrack)) stream.addTrack(nextTrack);
+  }
+
   async _consumePeer(producerId, socketId, locationName, kind, paused, metadata = {}) {
     if (this._isSelfSocket(socketId)) return;
     if (!this.recvTransport || this.recvTransport.closed) { console.warn('[consume] recvTransport not ready'); return; }
@@ -1397,17 +1413,17 @@ export class WebRTCManager {
       const appData = metadata.appData || {};
       const source = metadata.source || appData.source || (kind === 'video' ? 'camera' : 'microphone');
       if (kind === 'video' && source === 'screen') {
-        peer.screenStream.addTrack(consumer.track);
+        this._replaceStreamTrack(peer.screenStream, consumer.track);
         peer.screenProducerId = producerId;
         peer.screenPaused = !!paused;
         peer.screenLabel = appData.label || appData.sourceName || '画面共有';
       } else if (kind === 'audio' && source === 'screen-audio') {
-        peer.screenStream.addTrack(consumer.track);
+        this._replaceStreamTrack(peer.screenStream, consumer.track);
         peer.screenAudioProducerId = producerId;
         peer.screenAudioPaused = !!paused;
         peer.screenLabel = peer.screenLabel || appData.label || appData.sourceName || '画面共有';
       } else {
-        peer.stream.addTrack(consumer.track);
+        this._replaceStreamTrack(peer.stream, consumer.track);
         if (kind === 'video') { peer.videoProducerId = producerId; peer.videoPaused = !!paused; }
         else                  { peer.audioProducerId = producerId; peer.audioPaused = !!paused; }
       }
@@ -1448,8 +1464,22 @@ export class WebRTCManager {
       this.consumers.delete(producerId);
     }
     for (const [socketId, peer] of this.peers) {
-      if (peer.videoProducerId === producerId) { peer.videoProducerId = null; this.onPeerUpdated?.(socketId, { ...peer }); break; }
-      if (peer.audioProducerId === producerId) { peer.audioProducerId = null; this.onPeerUpdated?.(socketId, { ...peer }); break; }
+      if (peer.videoProducerId === producerId) {
+        peer.videoProducerId = null;
+        if (closedTrack) {
+          try { peer.stream?.removeTrack(closedTrack); } catch { /* already removed */ }
+        }
+        this.onPeerUpdated?.(socketId, { ...peer });
+        break;
+      }
+      if (peer.audioProducerId === producerId) {
+        peer.audioProducerId = null;
+        if (closedTrack) {
+          try { peer.stream?.removeTrack(closedTrack); } catch { /* already removed */ }
+        }
+        this.onPeerUpdated?.(socketId, { ...peer });
+        break;
+      }
       if (peer.screenAudioProducerId === producerId) {
         peer.screenAudioProducerId = null;
         peer.screenAudioPaused = true;

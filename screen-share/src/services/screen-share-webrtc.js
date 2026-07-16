@@ -3,6 +3,7 @@ import * as mediasoupClient from 'mediasoup-client';
 
 const SETUP_WATCHDOG_MS = 20000;
 const HARD_RECONNECT_DELAY_MS = 1000;
+const SESSION_REBUILD_DELAY_MS = 2500;
 
 /**
  * 端末ごとに永続な一意ID。setMetadata でサーバーへ申告すると、サーバーは同じ
@@ -48,16 +49,18 @@ export class ScreenShareWebRTCManager {
     this._lastTelemetryRtt = null;
     this._lastTelemetryAckAt = null;
     this._setupInFlight = null;
+    this._pendingRequests = new Set();
     this._setupGeneration = 0;
     this._setupStartedAt = 0;
     this._setupWatchdogTimer = null;
+    this._setupRetryTimer = null;
+    this._setupRetryDelay = 1000;
     this._hardReconnectTimer = null;
+    this._sessionRebuildTimer = null;
+    this._iceRestartTimers = new Map();
     // サーバーから「重複セッション」として拒否された場合、この時刻まで自動再接続を控える
     // （クライアントアプリと同じ仕組み。無いと1秒周期の到達確認が拒否→再接続を延々繰り返す）
     this._rejectedUntil = 0;
-    // 接続済みなのに未初期化の場合のセットアップ再試行の間隔制御
-    this._lastSetupAttemptAt = 0;
-
     this.onConnectionChange = null;
     this.onSystemStateUpdated = null;
     this.onUpdateCommand = null;
@@ -80,11 +83,15 @@ export class ScreenShareWebRTCManager {
       this._setupGeneration += 1;
       this._setupInFlight = null;
       this._initialized = false;
+      this._failPendingRequests('socket replaced by reconnect');
+      this._clearSetupRetry();
+      this._clearSessionRebuild();
       this._clearSetupWatchdog();
       if (this._hardReconnectTimer) {
         clearTimeout(this._hardReconnectTimer);
         this._hardReconnectTimer = null;
       }
+      this._resetMediaSession();
       try { oldSocket.removeAllListeners(); } catch { /* ignore */ }
       try { oldSocket.io?.removeAllListeners?.(); } catch { /* ignore */ }
       try { oldSocket.disconnect(); } catch { /* ignore */ }
@@ -108,9 +115,11 @@ export class ScreenShareWebRTCManager {
       this.socket.on('connect', async () => {
         try {
           await this._setupSession();
+          this._setupRetryDelay = 1000;
           resolve();
         } catch (err) {
           this.onConnectionChange?.(false);
+          this._scheduleSetupRetry();
           reject(err);
         }
       });
@@ -127,7 +136,11 @@ export class ScreenShareWebRTCManager {
         // _setupSession() が切断前の（もう成功し得ない）Promiseをそのまま返し、
         // setMetadata が再送されず metadataReady=false のゾンビ接続になる。
         this._setupInFlight = null;
+        this._failPendingRequests(`socket disconnected (${reason})`);
+        this._clearSetupRetry();
+        this._clearSessionRebuild();
         this._clearSetupWatchdog();
+        this._resetMediaSession();
         this.onConnectionChange?.(false);
         if (!this._manualDisconnect && reason === 'io server disconnect') {
           // サーバー都合の切断は socket.io の自動再接続に乗らないため自前で繋ぎ直す。
@@ -140,12 +153,8 @@ export class ScreenShareWebRTCManager {
         }
       });
 
-      this.socket.io.on('reconnect', () => {
-        this._setupSession().catch(err => {
-          console.error('[ScreenShare] reconnect setup failed', err);
-          this.onConnectionChange?.(false);
-        });
-      });
+      // Socket の connect ハンドラが再接続時にもセッションを再構築する。
+      this.socket.io.on('reconnect', () => console.log('[ScreenShare] signaling transport restored'));
 
       this.socket.on('systemStateUpdated', (payload = {}) => {
         this.onSystemStateUpdated?.(payload);
@@ -161,6 +170,28 @@ export class ScreenShareWebRTCManager {
       this.socket.on('restartCommand', (payload = {}, ack) => {
         ack?.({ ok: true, socketId: this.socket.id, receivedAt: Date.now() });
         setTimeout(() => this._hardReconnect(payload.reason || 'server-command'), 100);
+      });
+
+      this.socket.on('mediaLayerRestarted', async () => {
+        console.warn('[ScreenShare] media layer restarted; rebuilding session');
+        // サーバー側の transport/producer は既に破棄済み。古い非同期処理を
+        // 世代更新と request 中断で無効化し、生きている画面トラックを再produceする。
+        this._setupGeneration += 1;
+        this._setupInFlight = null;
+        this._initialized = false;
+        this._failPendingRequests('media layer restarted');
+        this._clearSetupRetry();
+        this._clearSessionRebuild();
+        this._clearSetupWatchdog();
+        this._resetMediaSession();
+        this.onConnectionChange?.(false);
+        try {
+          await this._setupSession();
+          this._setupRetryDelay = 1000;
+        } catch (err) {
+          console.error('[ScreenShare] media layer rebuild failed', err);
+          this._scheduleSetupRetry();
+        }
       });
 
       // 同じ端末の稼働中セッションが既に存在するため、この接続は受け入れられなかった。
@@ -189,6 +220,10 @@ export class ScreenShareWebRTCManager {
     };
 
     const setupPromise = (async () => {
+      this._clearSetupRetry();
+      // 接続を維持したままセットアップを再試行する場合も、旧 transport を
+      // サーバー・クライアント双方から先に回収して二重送信を防ぐ。
+      this._resetMediaSession();
       this.socket.emit('setMetadata', {
         locationName: this._displayName,
         appType: 'screen-share',
@@ -209,9 +244,9 @@ export class ScreenShareWebRTCManager {
       await this.device.load({ routerRtpCapabilities: caps });
       await this._initSendTransport();
       assertCurrent('init-send-transport');
-      this._initialized = true;
       await this._reproduceScreen();
       assertCurrent('reproduce-screen');
+      this._initialized = true;
       this.onConnectionChange?.(true);
     })();
     this._setupInFlight = setupPromise;
@@ -228,24 +263,24 @@ export class ScreenShareWebRTCManager {
   }
 
   async _initSendTransport() {
-    try { this.sendTransport?.close(); } catch { /* ignore */ }
     const { params } = await this._request('createWebRtcTransport', { forceTcp: false });
     const options = this.iceServers.length ? { ...params, iceServers: this.iceServers } : params;
-    this.sendTransport = this.device.createSendTransport(options);
+    const transport = this.device.createSendTransport(options);
+    this.sendTransport = transport;
 
-    this.sendTransport.on('connect', async ({ dtlsParameters }, callback, errback) => {
+    transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
       try {
-        await this._request('connectTransport', { transportId: this.sendTransport.id, dtlsParameters });
+        await this._request('connectTransport', { transportId: transport.id, dtlsParameters });
         callback();
       } catch (err) {
         errback(err);
       }
     });
 
-    this.sendTransport.on('produce', async ({ kind, rtpParameters, appData }, callback, errback) => {
+    transport.on('produce', async ({ kind, rtpParameters, appData }, callback, errback) => {
       try {
         const { id } = await this._request('produce', {
-          transportId: this.sendTransport.id,
+          transportId: transport.id,
           kind,
           rtpParameters,
           appData,
@@ -256,9 +291,131 @@ export class ScreenShareWebRTCManager {
       }
     });
 
-    this.sendTransport.on('connectionstatechange', state => {
-      if (state === 'failed' || state === 'disconnected') this.onConnectionChange?.(false);
+    transport.on('connectionstatechange', state => {
+      console.log('[ScreenShare sendTransport]', state);
+      if (state === 'connected') {
+        this._cancelIceRestart(transport);
+        this._clearSessionRebuild();
+        if (transport === this.sendTransport && this._initialized) {
+          this.onConnectionChange?.(true);
+        }
+      }
+      if (state === 'failed') {
+        this.onConnectionChange?.(false);
+        this._scheduleIceRestart(transport, 500);
+      }
+      if (state === 'disconnected') {
+        this.onConnectionChange?.(false);
+        this._scheduleIceRestart(transport, 4500);
+      }
     });
+  }
+
+  _notifyTransportClosed(transport) {
+    if (!transport?.id || !this.socket?.connected) return;
+    try { this.socket.emit('closeTransport', { transportId: transport.id }); } catch { /* ignore */ }
+  }
+
+  /** ローカル共有トラックは維持したまま、mediasoup セッションだけを破棄する。 */
+  _resetMediaSession() {
+    const transport = this.sendTransport;
+    this._notifyTransportClosed(transport);
+    try { this.screenProducer?.close(); } catch { /* ignore */ }
+    try { this.screenAudioProducer?.close(); } catch { /* ignore */ }
+    try { transport?.close(); } catch { /* ignore */ }
+    for (const timer of this._iceRestartTimers.values()) clearTimeout(timer);
+    this._iceRestartTimers.clear();
+    this.sendTransport = null;
+    this.screenProducer = null;
+    this.screenAudioProducer = null;
+  }
+
+  _scheduleSetupRetry() {
+    if (this._manualDisconnect || !this.socket?.connected || this._setupRetryTimer) return;
+    const delay = this._setupRetryDelay;
+    this._setupRetryDelay = Math.min(30000, Math.round(this._setupRetryDelay * 1.7));
+    this._setupRetryTimer = setTimeout(async () => {
+      this._setupRetryTimer = null;
+      if (this._manualDisconnect || !this.socket?.connected) return;
+      try {
+        await this._setupSession();
+        this._setupRetryDelay = 1000;
+      } catch (err) {
+        console.warn('[ScreenShare] media setup retry failed:', err.message);
+        this.onConnectionChange?.(false);
+        this._scheduleSetupRetry();
+      }
+    }, delay);
+  }
+
+  _clearSetupRetry() {
+    if (!this._setupRetryTimer) return;
+    clearTimeout(this._setupRetryTimer);
+    this._setupRetryTimer = null;
+  }
+
+  _scheduleSessionRebuild(reason = 'transport-failure') {
+    if (this._manualDisconnect || !this.socket?.connected || this._sessionRebuildTimer) return;
+    this._sessionRebuildTimer = setTimeout(async () => {
+      this._sessionRebuildTimer = null;
+      if (this._manualDisconnect || !this.socket?.connected) return;
+      console.warn(`[ScreenShare] rebuilding media session reason=${reason}`);
+      this._setupGeneration += 1;
+      this._setupInFlight = null;
+      this._initialized = false;
+      this._failPendingRequests(`session rebuild (${reason})`);
+      this._resetMediaSession();
+      try {
+        await this._setupSession();
+        this._setupRetryDelay = 1000;
+      } catch (err) {
+        console.error('[ScreenShare] session rebuild failed', err);
+        this.onConnectionChange?.(false);
+        this._scheduleSetupRetry();
+      }
+    }, SESSION_REBUILD_DELAY_MS);
+  }
+
+  _clearSessionRebuild() {
+    if (!this._sessionRebuildTimer) return;
+    clearTimeout(this._sessionRebuildTimer);
+    this._sessionRebuildTimer = null;
+  }
+
+  _scheduleIceRestart(transport, delay) {
+    if (!transport || transport.closed || this._iceRestartTimers.has(transport.id)) return;
+    const timer = setTimeout(() => {
+      this._iceRestartTimers.delete(transport.id);
+      if (transport.closed || transport.connectionState === 'connected') return;
+      this._restartTransportIce(transport).catch(err => {
+        console.warn('[ScreenShare restartIce]', err.message);
+        this._scheduleSessionRebuild('ice-restart-failed');
+      });
+    }, delay);
+    this._iceRestartTimers.set(transport.id, timer);
+  }
+
+  _cancelIceRestart(transport) {
+    const timer = transport?.id ? this._iceRestartTimers.get(transport.id) : null;
+    if (!timer) return;
+    clearTimeout(timer);
+    this._iceRestartTimers.delete(transport.id);
+  }
+
+  async _restartTransportIce(transport) {
+    if (!transport || transport.closed) return;
+    const { iceParameters } = await this._request('restartIce', { transportId: transport.id });
+    if (iceParameters) await transport.restartIce({ iceParameters });
+    // restartIce の要求自体が成功しても、候補ペアが一つも通らなければ
+    // connectionstatechange が再発火しない実装がある。一定時間後も未接続なら
+    // transport を作り直し、黒画面のまま永久停止する状態を防ぐ。
+    setTimeout(() => {
+      if (
+        transport === this.sendTransport &&
+        !transport.closed &&
+        transport.connectionState !== 'connected'
+      ) this._scheduleSessionRebuild('ice-restart-did-not-connect');
+    }, 8000);
   }
 
   _armSetupWatchdog(setupGeneration) {
@@ -288,11 +445,11 @@ export class ScreenShareWebRTCManager {
     this._setupGeneration += 1;
     this._setupInFlight = null;
     this._initialized = false;
+    this._failPendingRequests(`hard reconnect (${reason})`);
+    this._clearSetupRetry();
+    this._clearSessionRebuild();
     this._clearSetupWatchdog();
-    try { this.sendTransport?.close(); } catch { /* ignore */ }
-    this.sendTransport = null;
-    this.screenProducer = null;
-    this.screenAudioProducer = null;
+    this._resetMediaSession();
     this.onConnectionChange?.(false);
 
     const socket = this.socket;
@@ -311,15 +468,22 @@ export class ScreenShareWebRTCManager {
   }
 
   async startScreenShare(track, label, audioTrack = null) {
-    if (!this.sendTransport) throw new Error('送信トランスポートが準備できていません');
+    const transport = this.sendTransport;
+    if (!transport || transport.closed) throw new Error('送信トランスポートが準備できていません');
     await this.stopScreenShare({ stopTrack: false });
+    if (transport !== this.sendTransport || transport.closed) {
+      throw new Error('送信トランスポートが再構築されました');
+    }
     this.localScreenVideoTrack = track;
     this.localScreenAudioTrack = audioTrack;
     this.screenLabel = label || track.label || '画面共有';
 
     try {
-      this.screenProducer = await this.sendTransport.produce({
+      const screenProducer = await transport.produce({
         track,
+        // transport/ICE 再構築で producer を閉じても、画面キャプチャ自体は維持して
+        // 新しい transport へ再produceする。共有停止時だけ明示的に track.stop() する。
+        stopTracks: false,
         appData: {
           source: 'screen',
           label: label || track.label || '画面共有',
@@ -330,17 +494,23 @@ export class ScreenShareWebRTCManager {
         ],
         codecOptions: { videoGoogleStartBitrate: 1200 },
       });
+      if (transport !== this.sendTransport || transport.closed) {
+        try { screenProducer.close(); } catch { /* ignore */ }
+        throw new Error('送信トランスポートが再構築されました');
+      }
+      this.screenProducer = screenProducer;
 
-      this.screenProducer.on('transportclose', () => {
-        this.screenProducer = null;
+      screenProducer.on('transportclose', () => {
+        if (this.screenProducer === screenProducer) this.screenProducer = null;
       });
-      this.screenProducer.on('trackended', () => {
+      screenProducer.on('trackended', () => {
         this.stopScreenShare().catch(() => {});
       });
 
       if (audioTrack) {
-        this.screenAudioProducer = await this.sendTransport.produce({
+        const screenAudioProducer = await transport.produce({
           track: audioTrack,
+          stopTracks: false,
           appData: {
             source: 'screen-audio',
             label: label || audioTrack.label || '画面共有音声',
@@ -350,10 +520,15 @@ export class ScreenShareWebRTCManager {
             opusDtx: 1,
           },
         });
-        this.screenAudioProducer.on('transportclose', () => {
-          this.screenAudioProducer = null;
+        if (transport !== this.sendTransport || transport.closed) {
+          try { screenAudioProducer.close(); } catch { /* ignore */ }
+          throw new Error('送信トランスポートが再構築されました');
+        }
+        this.screenAudioProducer = screenAudioProducer;
+        screenAudioProducer.on('transportclose', () => {
+          if (this.screenAudioProducer === screenAudioProducer) this.screenAudioProducer = null;
         });
-        this.screenAudioProducer.on('trackended', () => {
+        screenAudioProducer.on('trackended', () => {
           this._closeScreenAudioProducer().catch(() => {});
         });
       }
@@ -372,36 +547,36 @@ export class ScreenShareWebRTCManager {
   }
 
   async stopScreenShare({ stopTrack = true } = {}) {
+    const localVideoTrack = this.localScreenVideoTrack;
+    const localAudioTrack = this.localScreenAudioTrack;
     const audioProducer = this.screenAudioProducer;
     this.screenAudioProducer = null;
     if (audioProducer) {
-      const audioTrack = audioProducer.track;
       try {
         if (this.socket?.connected) await this._request('closeProducer', { producerId: audioProducer.id });
       } catch {
         // The server will also clean up on transport close.
       }
       try { audioProducer.close(); } catch { /* ignore */ }
-      if (stopTrack) {
-        try { audioTrack?.stop(); } catch { /* ignore */ }
-      }
     }
 
     const producer = this.screenProducer;
     this.screenProducer = null;
-    if (!producer) return;
-
-    const track = producer.track;
-    try {
-      if (this.socket?.connected) await this._request('closeProducer', { producerId: producer.id });
-    } catch {
-      // The server will also clean up on transport close.
+    if (producer) {
+      try {
+        if (this.socket?.connected) await this._request('closeProducer', { producerId: producer.id });
+      } catch {
+        // The server will also clean up on transport close.
+      }
+      try { producer.close(); } catch { /* ignore */ }
     }
-    try { producer.close(); } catch { /* ignore */ }
+
     if (stopTrack) {
-      try { track?.stop(); } catch { /* ignore */ }
-      if (this.localScreenVideoTrack === track) this.localScreenVideoTrack = null;
+      try { localVideoTrack?.stop(); } catch { /* ignore */ }
+      try { localAudioTrack?.stop(); } catch { /* ignore */ }
+      this.localScreenVideoTrack = null;
       this.localScreenAudioTrack = null;
+      this.screenLabel = '';
     }
   }
 
@@ -465,12 +640,7 @@ export class ScreenShareWebRTCManager {
         return;
       }
       if (this._setupInFlight) return; // 進行中のセットアップを待つ
-      if (Date.now() - this._lastSetupAttemptAt < 3000) return; // 再試行は3秒間隔
-      this._lastSetupAttemptAt = Date.now();
-      this._setupSession().catch(err => {
-        console.warn('[ScreenShare] setup retry failed:', err.message);
-        this.onConnectionChange?.(false);
-      });
+      this._scheduleSetupRetry();
     }
   }
 
@@ -508,33 +678,55 @@ export class ScreenShareWebRTCManager {
     return new Promise((resolve, reject) => {
       if (!this.socket?.connected) return reject(new Error('not connected'));
       let done = false;
-      const timer = setTimeout(() => {
-        if (!done) {
-          done = true;
-          reject(new Error(`${type} timeout`));
-        }
-      }, 12000);
-
-      this.socket.emit(type, data, (res) => {
+      const finish = (err, response) => {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        if (res?.error) reject(new Error(res.error));
-        else resolve(res);
+        this._pendingRequests.delete(finish);
+        if (err) reject(err);
+        else resolve(response);
+      };
+      const timer = setTimeout(() => finish(new Error(`${type} timeout`)), 12000);
+      this._pendingRequests.add(finish);
+
+      this.socket.emit(type, data, (res) => {
+        if (res?.error) finish(new Error(res.error));
+        else finish(null, res);
       });
     });
   }
 
-  disconnect() {
+  _failPendingRequests(reason) {
+    if (!this._pendingRequests.size) return;
+    const pending = Array.from(this._pendingRequests);
+    this._pendingRequests.clear();
+    for (const finish of pending) finish(new Error(reason));
+  }
+
+  disconnect({ stopTracks = true } = {}) {
     this._manualDisconnect = true;
     this._initialized = false;
+    this._setupGeneration += 1;
+    this._setupInFlight = null;
+    this._failPendingRequests('manual disconnect');
+    this._clearSetupRetry();
+    this._clearSessionRebuild();
     this._clearSetupWatchdog();
     if (this._hardReconnectTimer) {
       clearTimeout(this._hardReconnectTimer);
       this._hardReconnectTimer = null;
     }
-    this.stopScreenShare().catch(() => {});
-    try { this.sendTransport?.close(); } catch { /* ignore */ }
+    // Socket切断でサーバー側 producer は回収されるため、ここでは要求を送らない。
+    // アプリ終了時は同期的に停止し、フェイルオーバー時(stopTracks=false)は
+    // 新しいサーバーへ再produceできるようキャプチャを維持する。
+    if (stopTracks) {
+      try { this.localScreenVideoTrack?.stop(); } catch { /* ignore */ }
+      try { this.localScreenAudioTrack?.stop(); } catch { /* ignore */ }
+    }
+    this.localScreenVideoTrack = null;
+    this.localScreenAudioTrack = null;
+    this.screenLabel = '';
+    this._resetMediaSession();
     // リスナーを全て外してから切断する。外さないと、ソケットが後続の接続に
     // 再利用された場合に破棄済みハンドラが発火して重複セッションの原因になる。
     const socket = this.socket;

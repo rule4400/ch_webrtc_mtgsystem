@@ -168,24 +168,49 @@ const mediaSettings = {
  * 拠点間で UDP がブロックされる環境では TURN を設定すると到達性が上がる。
  * 環境変数:
  *   STUN_URLS   例: "stun:stun.l.google.com:19302"（カンマ区切り可）
- *   TURN_URLS   例: "turn:turn.example.com:3478?transport=udp,turn:turn.example.com:3478?transport=tcp"
+ *   TURN_URLS   例: "turn:turn.example.com:3478?transport=udp,turns:turn.example.com:443?transport=tcp"
  *   TURN_USER / TURN_PASS
  */
 function buildIceServers() {
   const servers = [];
   const stun = process.env.STUN_URLS || '';
-  for (const u of stun.split(',').map(s => s.trim()).filter(Boolean)) {
+  const validIceUrl = (url, schemes) => {
+    const match = /^(stuns?|turns?):(?:\[[0-9a-f:]+\]|[a-z0-9.-]+)(?::(\d{1,5}))?(?:\?transport=(udp|tcp))?$/i.exec(url);
+    return !!match && schemes.includes(match[1].toLowerCase()) && (!match[2] || Number(match[2]) <= 65535);
+  };
+  for (const u of stun.split(',').map(s => s.trim()).filter(u => validIceUrl(u, ['stun', 'stuns']))) {
     servers.push({ urls: u });
   }
   if (process.env.TURN_URLS) {
-    const urls = process.env.TURN_URLS.split(',').map(s => s.trim()).filter(Boolean);
-    servers.push({
-      urls,
-      username: process.env.TURN_USER || '',
-      credential: process.env.TURN_PASS || '',
-    });
+    const urls = process.env.TURN_URLS.split(',')
+      .map(s => s.trim())
+      .filter(u => validIceUrl(u, ['turn', 'turns']));
+    if (urls.length) {
+      servers.push({
+        urls,
+        username: process.env.TURN_USER || '',
+        credential: process.env.TURN_PASS || '',
+      });
+    }
   }
   return servers;
+}
+
+const iceServers = buildIceServers();
+const turnConfigured = iceServers.some(server => {
+  const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+  return urls.some(url => /^turns?:/i.test(String(url || '')));
+});
+if (!turnConfigured) {
+  console.warn('[Config] TURN_URLS 未設定: SFUへ直接到達できないUTM/NAT拠点にはメディアを中継できません。');
+} else {
+  const turnServer = iceServers.find(server => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    return urls.some(url => /^turns?:/i.test(String(url || '')));
+  });
+  if (!turnServer?.username || !turnServer?.credential) {
+    console.warn('[Config] TURN_URLS は設定されていますが TURN_USER / TURN_PASS が空です。認証必須のTURNでは接続できません。');
+  }
 }
 
 module.exports = {
@@ -199,7 +224,8 @@ module.exports = {
   buildRtcListenInfos,
 
   // クライアントへ配布する ICE サーバー
-  iceServers: buildIceServers(),
+  iceServers,
+  turnConfigured,
 
   // メディア伝送設定（getServerConfig でクライアントへ配布）
   mediaTransport: { forceTcp, preferTcp },
