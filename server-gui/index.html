@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
   <title>CHECKHOUSE Meeting System Server</title>
   <style>
     /* ─────────────────────────────────────────────────────────
@@ -1027,6 +1028,11 @@
                   <button class="btn ghost" id="recDbDirBtn" style="justify-self:start">フォルダを選択</button>
                 </div>
                 <div class="update-row">
+                  <span>ローカル一時保存先</span>
+                  <input id="recStagingDir" placeholder="空欄 = アプリデータ内 recording-staging/">
+                  <button class="btn ghost" id="recStagingDirBtn" style="justify-self:start">フォルダを選択</button>
+                </div>
+                <div class="update-row">
                   <span>保持期間</span>
                   <input id="recRetention" type="number" min="1" max="3650" placeholder="14">
                   <span>日。経過したセグメントは1時間ごとの掃除で自動削除されます</span>
@@ -1046,11 +1052,11 @@
                   <span>圧縮（バックグラウンド）</span>
                   <select id="recCompression">
                     <option value="strong">高圧縮（480p・容量最小）</option>
-                    <option value="standard" selected>標準（720p・推奨）</option>
+                    <option value="standard">標準（720p）</option>
                     <option value="light">低圧縮（1080p・高画質）</option>
-                    <option value="none">圧縮しない（コンテナ変換のみ）</option>
+                    <option value="none" selected>圧縮しない（推奨・会議優先）</option>
                   </select>
-                  <span>セグメント完了後に自動でH.264/mp4へ再エンコードして軽量化します</span>
+                  <span>「圧縮しない」は再エンコードを避け、会議のCPU/I/Oを優先します</span>
                 </div>
                 <div class="update-row">
                   <span>画面共有も録画</span>
@@ -1071,14 +1077,14 @@
                 <div class="update-row">
                   <span>圧縮の並列数</span>
                   <select id="recConcurrency">
-                    <option value="0" selected>自動（CPUコア数から2〜4）</option>
-                    <option value="1">1（負荷最小）</option>
+                    <option value="0">自動（現在は1）</option>
+                    <option value="1" selected>1（推奨・会議優先）</option>
                     <option value="2">2</option>
                     <option value="3">3</option>
                     <option value="4">4</option>
                     <option value="6">6</option>
                   </select>
-                  <span>セグメント圧縮を並列実行します（12拠点が同時に区切りを迎えても滞留しません）</span>
+                  <span>自動も1ジョブです。会議中の負荷を実測した場合だけ増やしてください</span>
                 </div>
                 <div class="update-row">
                   <span>最低空き容量</span>
@@ -1096,7 +1102,7 @@
                     <input type="checkbox" id="recTimestamp" style="width:16px;height:16px">
                     <span>映像の右下にタイムスタンプ(年月日 時分秒)を表示する</span>
                   </label>
-                  <span>監視カメラと同様の日時表示。圧縮処理時に映像へ焼き込まれます</span>
+                  <span>ONにすると「圧縮しない」選択時も映像の再エンコードが必要です</span>
                 </div>
                 <div class="update-row">
                   <span>ffmpeg パス</span>
@@ -1109,8 +1115,9 @@
                 <button class="btn ghost" id="openRecordingsBtn2">📹 録画タイムラインを開く</button>
               </div>
               <div class="settings-help">
-                保存先にはNAS等のネットワークドライブ(マウント済みのパス。例: /Volumes/nas/recordings、\\NAS\recordings)も指定できます。
-                保存先が一時的に切断されても録画機能は停止せず、復旧後に自動で再開します。
+                会議の安定性を優先するため、取込み中の映像は「ローカル一時保存先」に書き、セグメント確定後に録画データ保存先へ保存します。
+                一時保存先はNASではなくサーバー内蔵SSDを指定し、通常は空欄（アプリデータ配下）のままにしてください。
+                最終保存先にはNAS等のマウント済みパス（例: /Volumes/nas/recordings、\\NAS\recordings）も指定できます。NASが利用できない間は新規録画を停め、復旧後に自動再開します。
                 過去の映像は「録画を見る」からブラウザで拠点別・複数拠点同時に再生できるほか、
                 専用アプリ「CHECKHOUSE Recording Viewer」でもサーバーまたはNAS上のデータを直接確認できます。
               </div>
@@ -1140,12 +1147,12 @@
                 </div>
                 <div class="update-row">
                   <span>閲覧用</span>
-                  <input id="verViewer" placeholder="0.1.0">
+                  <input id="verViewer" placeholder="0.1.1">
                   <input id="urlViewer" placeholder="https://...">
                 </div>
                 <div class="update-row">
                   <span>画面共有用</span>
-                  <input id="verScreenShare" placeholder="0.1.0">
+                  <input id="verScreenShare" placeholder="0.2.1">
                   <input id="urlScreenShare" placeholder="https://...">
                 </div>
               </div>
@@ -1210,6 +1217,7 @@
     const recEnabledLabel = document.getElementById('recEnabledLabel');
     const recDir = document.getElementById('recDir');
     const recDbDir = document.getElementById('recDbDir');
+    const recStagingDir = document.getElementById('recStagingDir');
     const recRetention = document.getElementById('recRetention');
     const recSegment = document.getElementById('recSegment');
     const recCompression = document.getElementById('recCompression');
@@ -1223,6 +1231,7 @@
     const saveRecordingBtn = document.getElementById('saveRecordingBtn');
     const recDirBtn = document.getElementById('recDirBtn');
     const recDbDirBtn = document.getElementById('recDbDirBtn');
+    const recStagingDirBtn = document.getElementById('recStagingDirBtn');
     const openRecordingsBtn = document.getElementById('openRecordingsBtn');
     const openRecordingsBtn2 = document.getElementById('openRecordingsBtn2');
     const mRecording = document.getElementById('mRecording');
@@ -1250,7 +1259,7 @@
     let lastStatsAt = 0;
     let systemSettings = {
       channels: [{ id: 'general', name: '一般' }],
-      latestVersions: { client: '0.4.1', viewer: '0.1.0', 'screen-share': '0.2.1' },
+      latestVersions: { client: '0.6.0', viewer: '0.1.1', 'screen-share': '0.2.1' },
       updatePackages: {},
       network: {
         rtcPort: '', extraTcpPorts: '', announcedIp: '',
@@ -1425,14 +1434,15 @@
       recEnabledLabel.innerText = rec.enabled ? '有効' : '無効';
       recDir.value = rec.recordingsDir || '';
       recDbDir.value = rec.dbDir || '';
+      recStagingDir.value = rec.stagingDir || '';
       recRetention.value = rec.retentionDays || 14;
       recSegment.value = String(rec.segmentSeconds || 300);
-      recCompression.value = rec.compressionMode || 'standard';
+      recCompression.value = rec.compressionMode || 'none';
       recScreen.checked = !!rec.recordScreen;
       recAudio.checked = rec.recordAudio === undefined ? true : !!rec.recordAudio;
-      recTimestamp.checked = rec.timestampOverlay === undefined ? true : !!rec.timestampOverlay;
+      recTimestamp.checked = rec.timestampOverlay === undefined ? false : !!rec.timestampOverlay;
       recFfmpeg.value = rec.ffmpegPath || '';
-      recConcurrency.value = String(rec.compressionConcurrency || 0);
+      recConcurrency.value = String(rec.compressionConcurrency === undefined ? 1 : rec.compressionConcurrency);
       recMinFree.value = rec.minFreeGb || 10;
     }
 
@@ -1441,6 +1451,7 @@
         enabled: recEnabled.checked,
         recordingsDir: recDir.value.trim(),
         dbDir: recDbDir.value.trim(),
+        stagingDir: recStagingDir.value.trim(),
         retentionDays: Number(recRetention.value) || 14,
         segmentSeconds: Number(recSegment.value) || 300,
         compressionMode: recCompression.value,
@@ -1448,7 +1459,7 @@
         recordAudio: recAudio.checked,
         timestampOverlay: recTimestamp.checked,
         ffmpegPath: recFfmpeg.value.trim(),
-        compressionConcurrency: Number(recConcurrency.value) || 0,
+        compressionConcurrency: Number(recConcurrency.value || 1),
         minFreeGb: Number(recMinFree.value) || 10,
       };
     }
@@ -1475,6 +1486,10 @@
     recDbDirBtn.addEventListener('click', async () => {
       const dir = await window.api.selectAnyFolder('録画データベースの保存先を選択');
       if (dir) recDbDir.value = dir;
+    });
+    recStagingDirBtn.addEventListener('click', async () => {
+      const dir = await window.api.selectAnyFolder('録画のローカル一時保存先を選択（サーバー内蔵SSD推奨）');
+      if (dir) recStagingDir.value = dir;
     });
 
     async function openRecordingsUi() {
@@ -1517,9 +1532,9 @@
         updateFolder: systemSettings.updateFolder || '',
         latestVersions: {
           ...(systemSettings.latestVersions || {}),
-          client: verClient.value.trim() || '0.1.0',
-          viewer: verViewer.value.trim() || '0.1.0',
-          'screen-share': verScreenShare.value.trim() || '0.1.0',
+          client: verClient.value.trim() || '0.6.0',
+          viewer: verViewer.value.trim() || '0.1.1',
+          'screen-share': verScreenShare.value.trim() || '0.2.1',
         },
         updatePackages: {
           ...(systemSettings.updatePackages || {}),

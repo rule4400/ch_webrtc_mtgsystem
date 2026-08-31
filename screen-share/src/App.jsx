@@ -14,6 +14,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import packageInfo from '../package.json';
 import {
   AppWindow, Download, Monitor, MonitorUp, RefreshCw, Settings,
   Square, Volume2, VolumeX, X, ChevronDown,
@@ -21,7 +22,7 @@ import {
 import { ScreenShareWebRTCManager } from './services/screen-share-webrtc';
 import { playSystemSound } from './services/system-sounds';
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = packageInfo.version;
 const APP_TYPE = 'screen-share';
 const CONFIG_STORAGE_KEY = 'sfu_screen_share_config';
 
@@ -36,6 +37,7 @@ const RESOLUTION_OPTIONS = [
 const DEFAULT_CONFIG = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
+  authToken: '',
   // 保険用サブサーバー（クライアントと同じ考え方。到達不能が続くと自動切替）
   subServerIp: '',
   subServerPort: '3000',
@@ -84,6 +86,7 @@ function sanitizeConfig(input) {
     // サブ未登録なら必ずメインに戻す（クライアントと同じ）
     activeServer: raw.activeServer === 'sub' && subServerIp ? 'sub' : 'main',
     displayName: String(raw.displayName || DEFAULT_CONFIG.displayName).trim() || DEFAULT_CONFIG.displayName,
+    authToken: typeof raw.authToken === 'string' ? raw.authToken.trim().slice(0, 2048) : '',
     channelId: String(raw.channelId || DEFAULT_CONFIG.channelId).trim() || DEFAULT_CONFIG.channelId,
     shareResolution: RESOLUTION_OPTIONS.some(option => option.id === raw.shareResolution)
       ? raw.shareResolution
@@ -514,6 +517,7 @@ export default function App() {
     await manager.connect(serverUrlFromConfig(clean), clean.displayName, {
       appVersion: APP_VERSION,
       channelId: clean.channelId,
+      authToken: clean.authToken,
     });
     if (connectSeqRef.current !== seq) return;
     setStatus('connected');
@@ -876,7 +880,8 @@ export default function App() {
 
     const serverChanged =
       serverUrlFromConfig(previous) !== serverUrlFromConfig(next) ||
-      previous.displayName !== next.displayName;
+      previous.displayName !== next.displayName ||
+      previous.authToken !== next.authToken;
     if (serverChanged) {
       await connect(next).catch(err => {
         setStatus('error');
@@ -1235,6 +1240,17 @@ export default function App() {
                     現在のサーバーに約{Math.round(FAILOVER_AFTER_MS / 1000)}秒間接続できず、
                     もう一方のサーバーが応答する場合は自動的に切り替えて再接続します。
                   </p>
+                </div>
+                <div className="field">
+                  <label>接続トークン</label>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={settingsDraft.authToken || ''}
+                    onChange={e => updateSettingsDraft('authToken', e.target.value)}
+                    placeholder="サーバーの SFU_AUTH_TOKEN"
+                  />
+                  <p className="field-help">サーバーで認証を有効にした場合のみ、他の拠点と同じ値を入力します。</p>
                 </div>
               </div>
             </div>

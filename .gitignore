@@ -8,10 +8,23 @@ release/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+*.dmp
+*.core
+core
+core.*
 
 .env
 .env.local
 .env.*.local
+.env.*
+!.env.example
+!**/.env.example
+
+# Credentials and local signing material
+*.pem
+*.key
+*.p12
+*.pfx
 
 .claude/
 
@@ -24,3 +37,17 @@ server-gui/resources/mediasoup-workers/
 
 # ffmpeg同梱バイナリ(prepare-ffmpeg.cjs が生成)
 server-gui/resources/ffmpeg/
+
+# Generated deliverables stay local or are uploaded to GitHub Releases.
+# Several files in these directories exceed GitHub's 100 MB blob limit.
+release2/
+output/
+_backup_*/
+
+# Runtime state and recordings must never enter source control.
+server/sfu-state.json
+server/recording-settings.json
+server/recordings/
+server/recording-db/
+server/ringtones/
+**/recording-staging/

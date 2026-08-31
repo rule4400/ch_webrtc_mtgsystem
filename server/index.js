@@ -38,23 +38,394 @@ const http = require('http');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 const mediasoup = require('mediasoup');
 const cors = require('cors');
 const config = require('./config');
 const serverPackage = require('./package.json');
+const {
+  assertPublishedDirectory,
+  createDirectoryGenerationGuard,
+  createPublishedFileListCache,
+  sameRootIdentity,
+  validatePublishedDirectory,
+} = require('./published-files');
+
+function envInt(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
+const AUTH_TOKEN = String(process.env.SFU_AUTH_TOKEN || '').trim();
+const ADMIN_TOKEN = String(process.env.SFU_ADMIN_TOKEN || '').trim();
+const RECORDING_ACCESS_TOKEN = String(process.env.RECORDING_ACCESS_TOKEN || '').trim();
+const REQUIRE_AUTH = /^(1|true|yes|on)$/i.test(process.env.SFU_REQUIRE_AUTH || '');
+const RECORDING_ALLOW_ANONYMOUS = /^(1|true|yes|on)$/i.test(process.env.RECORDING_ALLOW_ANONYMOUS || '');
+const RECORDING_COOKIE_SECURE = /^(1|true|yes|on)$/i.test(process.env.RECORDING_COOKIE_SECURE || '');
+const RECORDING_SESSION_TTL_MS = envInt(
+  'RECORDING_SESSION_TTL_MS',
+  8 * 60 * 60 * 1000,
+  5 * 60 * 1000,
+  24 * 60 * 60 * 1000,
+);
+const EXTRA_ALLOWED_ORIGINS = new Set(
+  String(process.env.SFU_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean),
+);
+const TRUSTED_PROXIES = String(process.env.SFU_TRUST_PROXY || '')
+  .split(',')
+  .map(value => value.trim())
+  .filter(Boolean);
+
+if (REQUIRE_AUTH && !AUTH_TOKEN) {
+  throw new Error('SFU_REQUIRE_AUTH=1 requires a non-empty SFU_AUTH_TOKEN');
+}
+if (!AUTH_TOKEN) {
+  console.warn('[Security] SFU_AUTH_TOKEN is not configured. Signaling is in compatibility mode; set SFU_REQUIRE_AUTH=1 after configuring every client.');
+}
+if (!RECORDING_ACCESS_TOKEN) {
+  console.warn(RECORDING_ALLOW_ANONYMOUS
+    ? '[Security] RECORDING_ALLOW_ANONYMOUS=1: recording playback is public to every client that can reach this server.'
+    : '[Security] RECORDING_ACCESS_TOKEN is not configured. Recording playback is disabled until a dedicated token is configured.');
+}
+
+function constantTimeEqual(actual, expected) {
+  const left = Buffer.from(String(actual || ''), 'utf8');
+  const right = Buffer.from(String(expected || ''), 'utf8');
+  if (left.length !== right.length || left.length === 0) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function bearerToken(headers = {}) {
+  const authorization = String(headers.authorization || '');
+  const match = /^Bearer\s+(.+)$/i.exec(authorization);
+  return match?.[1] || String(headers['x-sfu-token'] || '');
+}
+
+function isAllowedOrigin(origin) {
+  // Native clients and Electron net.fetch may not send Origin. Production
+  // renderers loaded from file:// normally send "null".
+  if (!origin || origin === 'null' || origin === 'file://') return true;
+  if (EXTRA_ALLOWED_ORIGINS.has(origin)) return true;
+  try {
+    const url = new URL(origin);
+    return (url.protocol === 'http:' || url.protocol === 'https:') &&
+      ['127.0.0.1', 'localhost', '::1'].includes(url.hostname) &&
+      ['5173', '5174'].includes(url.port);
+  } catch {
+    return false;
+  }
+}
+
+const corsOptions = {
+  origin(origin, callback) {
+    callback(null, isAllowedOrigin(origin));
+  },
+  methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-SFU-Token'],
+  maxAge: 600,
+};
 
 const app = express();
-app.use(cors());
+if (TRUSTED_PROXIES.length) app.set('trust proxy', TRUSTED_PROXIES);
+app.disable('x-powered-by');
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+  next();
+});
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '1mb' })); // 録画設定API(POST /recordings/api/settings)用
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*' },
+  cors: corsOptions,
+  // CORS middlewareは不許可OriginへACAOを付けないだけで、
+  // WebSocket handshake自体は通し得る。Engine.IOの入口で同じ
+  // Originポリシーを適用し、未認証互換モードでも悪意ある
+  // Webページからの直接WebSocket接続を拒否する。
+  allowRequest(req, callback) {
+    const allowed = isAllowedOrigin(req.headers.origin);
+    callback(allowed ? null : 'origin not allowed', allowed);
+  },
   pingInterval: 10000,
   pingTimeout: 30000,
   connectTimeout: 15000,
+  maxHttpBufferSize: 128 * 1024,
+  perMessageDeflate: false,
+  serveClient: false,
 });
+
+function requireAdminToken(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res.status(403).json({
+      error: 'remote administration is disabled; configure SFU_ADMIN_TOKEN',
+    });
+  }
+  if (!constantTimeEqual(bearerToken(req.headers), ADMIN_TOKEN)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  return next();
+}
+
+const recordingSessions = new Map();
+
+function cookieValue(req, name) {
+  const cookieHeader = String(req.headers.cookie || '');
+  for (const part of cookieHeader.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator <= 0) continue;
+    if (part.slice(0, separator).trim() !== name) continue;
+    try { return decodeURIComponent(part.slice(separator + 1).trim()); } catch { return ''; }
+  }
+  return '';
+}
+
+function hasRecordingBearer(req) {
+  return !!RECORDING_ACCESS_TOKEN && constantTimeEqual(
+    bearerToken(req.headers),
+    RECORDING_ACCESS_TOKEN,
+  );
+}
+
+function hasRecordingSession(req, now = Date.now()) {
+  const id = cookieValue(req, 'sfu_recording_session');
+  if (!id || id.length > 128) return false;
+  const expiresAt = recordingSessions.get(id);
+  if (!expiresAt || expiresAt <= now) {
+    if (expiresAt) recordingSessions.delete(id);
+    return false;
+  }
+  return true;
+}
+
+function requireRecordingAccess(req, res, next) {
+  if (!RECORDING_ACCESS_TOKEN) {
+    if (RECORDING_ALLOW_ANONYMOUS) return next();
+    return res.status(403).json({ error: 'recording playback is disabled; configure RECORDING_ACCESS_TOKEN' });
+  }
+  if (hasRecordingBearer(req) || hasRecordingSession(req)) return next();
+  res.setHeader('WWW-Authenticate', 'Bearer realm="recordings"');
+  return res.status(401).json({ error: 'recording access token required' });
+}
+
+function createRecordingSession(req, res) {
+  if (!RECORDING_ACCESS_TOKEN) {
+    if (RECORDING_ALLOW_ANONYMOUS) return res.json({ ok: true, required: false });
+    return res.status(403).json({ error: 'recording playback is disabled; configure RECORDING_ACCESS_TOKEN' });
+  }
+  if (!hasRecordingBearer(req)) {
+    res.setHeader('WWW-Authenticate', 'Bearer realm="recordings"');
+    return res.status(401).json({ error: 'invalid recording access token' });
+  }
+  const now = Date.now();
+  if (recordingSessions.size >= 10_000) {
+    for (const [id, expiresAt] of recordingSessions) {
+      if (expiresAt <= now || recordingSessions.size >= 9000) recordingSessions.delete(id);
+    }
+  }
+  const id = crypto.randomBytes(32).toString('base64url');
+  recordingSessions.set(id, now + RECORDING_SESSION_TTL_MS);
+  const maxAgeSec = Math.floor(RECORDING_SESSION_TTL_MS / 1000);
+  const secure = RECORDING_COOKIE_SECURE ? '; Secure' : '';
+  res.setHeader(
+    'Set-Cookie',
+    `sfu_recording_session=${encodeURIComponent(id)}; Path=/recordings; HttpOnly; SameSite=Strict; Max-Age=${maxAgeSec}${secure}`,
+  );
+  return res.json({ ok: true, required: true, expiresAt: now + RECORDING_SESSION_TTL_MS });
+}
+
+const RECORDING_QUERY_WINDOW_MS = 60_000;
+const RECORDING_QUERY_CLIENT_MAX = envInt('RECORDING_QUERY_CLIENT_MAX', 4096, 8, 65_536);
+const RECORDING_QUERY_SWEEP_MS = 5000;
+const recordingQueryClients = new Map();
+let lastRecordingQuerySweepAt = 0;
+
+function sweepRecordingQueryClients(now, force = false) {
+  if (!force && now - lastRecordingQuerySweepAt < RECORDING_QUERY_SWEEP_MS) return;
+  lastRecordingQuerySweepAt = now;
+  for (const [key, value] of recordingQueryClients) {
+    if (now - value.startedAt >= RECORDING_QUERY_WINDOW_MS) recordingQueryClients.delete(key);
+  }
+}
+
+function limitRecordingQueries(req, res, next) {
+  const address = shortString(req.ip || req.socket?.remoteAddress || 'unknown', 128);
+  const now = Date.now();
+  let previous = recordingQueryClients.get(address);
+
+  // Only admit a new source after an expiry sweep and never grow the tracking
+  // Map past its configured ceiling. This bounds both memory and sweep work
+  // even when a trusted proxy reports attacker-controlled source addresses.
+  if (!previous) {
+    sweepRecordingQueryClients(now, recordingQueryClients.size >= RECORDING_QUERY_CLIENT_MAX);
+    previous = recordingQueryClients.get(address);
+    if (!previous && recordingQueryClients.size >= RECORDING_QUERY_CLIENT_MAX) {
+      res.setHeader('Retry-After', '60');
+      return res.status(429).json({ error: 'too many recording query sources' });
+    }
+  }
+
+  const entry = !previous || now - previous.startedAt >= RECORDING_QUERY_WINDOW_MS
+    ? { startedAt: now, count: 0 }
+    : previous;
+  entry.count += 1;
+  recordingQueryClients.set(address, entry);
+  if (entry.count > 120) {
+    res.setHeader('Retry-After', '60');
+    return res.status(429).json({ error: 'too many recording queries' });
+  }
+  sweepRecordingQueryClients(now);
+  return next();
+}
+
+// ライブ視聴は書き込み中のローカルstagingを継続的に読む。会議中のディスクI/Oを
+// 守るため、旧既定(全体128/IP 16)より保守的な上限から開始する。
+const MAX_RECORDING_STREAMS = envInt('RECORDING_MAX_CONCURRENT_STREAMS', 16, 4, 4096);
+const MAX_RECORDING_STREAMS_PER_IP = envInt('RECORDING_MAX_STREAMS_PER_IP', 4, 1, 256);
+let activeRecordingStreams = 0;
+const recordingStreamsByIp = new Map();
+
+function limitRecordingStreams(req, res, next) {
+  const address = shortString(req.ip || req.socket?.remoteAddress || 'unknown', 128);
+  const addressCount = recordingStreamsByIp.get(address) || 0;
+  if (activeRecordingStreams >= MAX_RECORDING_STREAMS || addressCount >= MAX_RECORDING_STREAMS_PER_IP) {
+    res.setHeader('Retry-After', '5');
+    return res.status(503).json({ error: 'recording stream capacity reached' });
+  }
+
+  activeRecordingStreams += 1;
+  recordingStreamsByIp.set(address, addressCount + 1);
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeRecordingStreams = Math.max(0, activeRecordingStreams - 1);
+    const remaining = Math.max(0, (recordingStreamsByIp.get(address) || 1) - 1);
+    if (remaining) recordingStreamsByIp.set(address, remaining);
+    else recordingStreamsByIp.delete(address);
+  };
+  res.once('finish', release);
+  res.once('close', release);
+  return next();
+}
+
+function recordingMimeType(filePath) {
+  const extension = path.extname(String(filePath || '')).toLowerCase();
+  if (extension === '.mp4') return 'video/mp4';
+  if (extension === '.webm') return 'video/webm';
+  return 'video/x-matroska';
+}
+
+/** Chromiumが動画シークで使う1区間のbyte Rangeだけを厳密に解釈する。 */
+function parseRecordingRange(rangeHeader, totalBytes) {
+  if (rangeHeader == null || rangeHeader === '') return null;
+  const value = String(rangeHeader);
+  if (value.length > 128 || !Number.isSafeInteger(totalBytes) || totalBytes <= 0) return false;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(value);
+  if (!match || (!match[1] && !match[2])) return false;
+
+  let start;
+  let end;
+  if (!match[1]) {
+    const suffixLength = Number(match[2]);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return false;
+    start = Math.max(0, totalBytes - suffixLength);
+    end = totalBytes - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] ? Number(match[2]) : totalBytes - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) ||
+        start < 0 || end < start || start >= totalBytes) return false;
+    end = Math.min(end, totalBytes - 1);
+  }
+  return { start, end };
+}
+
+/**
+ * openMediaFile()が検証した同じFileHandleから配信する。
+ * パスを再openしないため、検証後のsymlink差し替えでルート外を
+ * 読ませるTOCTOU競合を防げる。
+ */
+async function sendOpenedRecordingFile(req, res, opened, next) {
+  const { handle, stat, filePath } = opened;
+  let stream = null;
+  let closed = false;
+  const closeHandle = () => {
+    if (closed) return;
+    closed = true;
+    handle.close().catch(() => {});
+  };
+  const abortTransfer = () => {
+    if (stream && !stream.destroyed) stream.destroy();
+    closeHandle();
+  };
+  // openMediaFile() のNAS I/O中に接続が切れている場合も、
+  // 開いた直後のFileHandleを残さない。
+  req.once('aborted', abortTransfer);
+  res.once('close', abortTransfer);
+  res.once('finish', closeHandle);
+  if (req.aborted || res.destroyed) {
+    abortTransfer();
+    return undefined;
+  }
+  try {
+    const total = Number(stat.size);
+    if (!Number.isSafeInteger(total) || total < 0) {
+      closeHandle();
+      return res.status(500).json({ error: 'invalid recording file size' });
+    }
+    const range = parseRecordingRange(req.headers.range, total);
+    res.setHeader('Content-Type', recordingMimeType(filePath));
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, no-store');
+    if (stat.mtime instanceof Date && Number.isFinite(stat.mtimeMs)) {
+      res.setHeader('Last-Modified', stat.mtime.toUTCString());
+    }
+
+    if (range === false) {
+      res.setHeader('Content-Range', `bytes */${total}`);
+      closeHandle();
+      return res.status(416).end();
+    }
+
+    const start = range ? range.start : 0;
+    const end = range ? range.end : total - 1;
+    const length = range ? end - start + 1 : total;
+    if (range) {
+      res.status(206);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+    }
+    res.setHeader('Content-Length', String(length));
+
+    if (req.method === 'HEAD' || total === 0) {
+      closeHandle();
+      return res.end();
+    }
+
+    stream = handle.createReadStream({ start, end, autoClose: false });
+    stream.once('end', closeHandle);
+    stream.once('close', closeHandle);
+    stream.once('error', err => {
+      closeHandle();
+      if (!res.destroyed) res.destroy(err);
+    });
+    stream.pipe(res);
+    return undefined;
+  } catch (err) {
+    if (stream && !stream.destroyed) stream.destroy();
+    closeHandle();
+    if (res.headersSent) res.destroy(err);
+    else next(err);
+    return undefined;
+  }
+}
 
 let workers = [];
 let nextWorkerIdx = 0;
@@ -89,6 +460,7 @@ const MEDIA_STALL_RECOVERY = !/^(0|false|no|off)$/i.test(process.env.MEDIA_STALL
 const MEDIA_STALL_CHECK_MS = Number(process.env.MEDIA_STALL_CHECK_MS) || 5000;
 const MEDIA_STALL_RESTART_MS = Number(process.env.MEDIA_STALL_RESTART_MS) || 15000;
 const MEDIA_STALL_COOLDOWN_MS = Number(process.env.MEDIA_STALL_COOLDOWN_MS) || 60000;
+const MEDIA_STATS_TIMEOUT_MS = envInt('MEDIA_STATS_TIMEOUT_MS', 1500, 250, 10000);
 // クライアント側の受信実態(テレメトリ)との突き合わせ。サーバーが下りRTPを
 // 送出できていても、受信側クライアントで「カメラ映像トラックが無い/mutedのまま」
 // が続く場合は、consumer取りこぼしや経路異常としてセッションを貼り直す。
@@ -183,6 +555,14 @@ const recording = createRecordingManager({
   getRouter: () => router,
   log: message => sendAdminLog(message),
   settingsFile: RECORDING_SETTINGS_FILE,
+  reserveTransportSlots: count => reserveRecordingTransportSlots(count),
+  releaseTransportSlots: count => releaseRecordingTransportSlots(count),
+  onClientPolicyChange: cameraKeepSendingWhenOff => {
+    io.emit('recordingPolicyChanged', {
+      cameraKeepSendingWhenOff: !!cameraKeepSendingWhenOff,
+      changedAt: Date.now(),
+    });
+  },
 });
 
 const SYSTEM_NAME = 'CHECKHOUSE Meeting System';
@@ -235,11 +615,212 @@ const peers = {};
 const MAX_DEVICE_LIST = 32;
 const MAX_MONITOR_PEERS = 32;
 const MAX_RTT_SAMPLES = 20;
+const MAX_ACTIVE_PEERS = envInt('SFU_MAX_PEERS', 200, 2, 2000);
+const MAX_RETAINED_PEERS = envInt(
+  'SFU_MAX_RETAINED_PEERS',
+  MAX_ACTIVE_PEERS + Math.min(MAX_ACTIVE_PEERS, 64),
+  MAX_ACTIVE_PEERS,
+  4000,
+);
+const MAX_PEERS_PER_IP = envInt('SFU_MAX_PEERS_PER_IP', 50, 1, 500);
+const MAX_TRANSPORTS_PER_PEER = envInt('SFU_MAX_TRANSPORTS_PER_PEER', 8, 2, 32);
+const MAX_PRODUCERS_PER_PEER = envInt('SFU_MAX_PRODUCERS_PER_PEER', 8, 2, 32);
+const MAX_CONSUMERS_PER_PEER = envInt('SFU_MAX_CONSUMERS_PER_PEER', 512, 8, 4096);
+const DYNAMIC_TRANSPORT_CAPACITY = Math.floor(
+  (config.rtcPortRange.max - config.rtcPortRange.min + 1) /
+  Math.max(1, (config.announcedIps || []).length),
+);
+const DEFAULT_MAX_TOTAL_TRANSPORTS = config.rtcPort
+  ? 1000
+  : Math.max(4, Math.min(1000, Math.floor(DYNAMIC_TRANSPORT_CAPACITY * 0.8)));
+const MAX_TOTAL_TRANSPORTS = envInt('SFU_MAX_TOTAL_TRANSPORTS', DEFAULT_MAX_TOTAL_TRANSPORTS, 4, 64000);
+// WebRtcServerを固定ポートで運用していても、録画PlainTransportはworkerのRTC
+// port rangeを使用する。録画が会議用ポートを食い尽くさないよう別枠でも制限する。
+const DEFAULT_MAX_RECORDING_TRANSPORTS = Math.max(
+  2,
+  Math.min(32, Math.floor(DYNAMIC_TRANSPORT_CAPACITY * 0.2)),
+);
+const MAX_RECORDING_TRANSPORTS = envInt(
+  'RECORDING_MAX_PLAIN_TRANSPORTS',
+  DEFAULT_MAX_RECORDING_TRANSPORTS,
+  1,
+  1024,
+);
+// 明示設定が大きすぎてもworkerのdynamic rangeの20%は必ず会議/復旧用に残す。
+const HARD_MAX_RECORDING_TRANSPORTS = Math.max(1, Math.floor(DYNAMIC_TRANSPORT_CAPACITY * 0.8));
+const MAX_TOTAL_PRODUCERS = envInt('SFU_MAX_TOTAL_PRODUCERS', 1000, 2, 64000);
+const MAX_TOTAL_CONSUMERS = envInt('SFU_MAX_TOTAL_CONSUMERS', 10000, 8, 250000);
+const CONSUMER_RESUME_TIMEOUT_MS = envInt('SFU_CONSUMER_RESUME_TIMEOUT_MS', 20_000, 5_000, 120_000);
+const TRANSPORT_ACCEPT_TIMEOUT_MS = envInt(
+  'SFU_TRANSPORT_ACCEPT_TIMEOUT_MS',
+  envInt('SFU_TRANSPORT_CONNECT_TIMEOUT_MS', 20_000, 5_000, 120_000),
+  5_000,
+  120_000,
+);
+const MAX_PENDING_CALLS = envInt('SFU_MAX_PENDING_CALLS', 256, 8, 4096);
+const MAX_PENDING_CALLS_PER_PEER = envInt('SFU_MAX_PENDING_CALLS_PER_PEER', 4, 1, 32);
+const MAX_PRIVATE_SESSIONS = envInt('SFU_MAX_PRIVATE_SESSIONS', 64, 2, 1024);
+const SOCKET_RATE_CAPACITY = envInt('SFU_SOCKET_RATE_CAPACITY', 300, 30, 5000);
+const SOCKET_RATE_REFILL_PER_SEC = envInt('SFU_SOCKET_RATE_REFILL_PER_SEC', 30, 5, 500);
+const connectionsByIp = new Map();
+const pendingResourceCreates = { transports: 0, producers: 0, consumers: 0 };
+let recordingTransportCount = 0;
+const consumerResumeTimers = new WeakMap();
+const transportAcceptanceTimers = new WeakMap();
 
-// アップデート配布フォルダ（server-gui から set-update-dir で指定される）
-let updateDir = process.env.UPDATE_DIR && fs.existsSync(process.env.UPDATE_DIR)
-  ? process.env.UPDATE_DIR
-  : null;
+function currentServerResourceCount(mapName) {
+  let count = 0;
+  for (const peer of Object.values(peers)) count += peer[mapName]?.size || 0;
+  return count;
+}
+
+function serverResourceLoad(mapName) {
+  return currentServerResourceCount(mapName) + (pendingResourceCreates[mapName] || 0) +
+    (mapName === 'transports' ? recordingTransportCount : 0);
+}
+
+function reserveRecordingTransportSlots(count) {
+  const requested = Math.max(0, Math.trunc(Number(count) || 0));
+  if (!requested || recordingTransportCount + requested > Math.min(
+    MAX_RECORDING_TRANSPORTS,
+    HARD_MAX_RECORDING_TRANSPORTS,
+  ) ||
+      serverResourceLoad('transports') + requested > MAX_TOTAL_TRANSPORTS) return false;
+  recordingTransportCount += requested;
+  return true;
+}
+
+function releaseRecordingTransportSlots(count) {
+  recordingTransportCount = Math.max(0, recordingTransportCount - Math.max(0, Math.trunc(Number(count) || 0)));
+}
+
+function reserveServerResource(mapName, max) {
+  if (serverResourceLoad(mapName) >= max) return false;
+  pendingResourceCreates[mapName] += 1;
+  return true;
+}
+
+function releaseServerResourceReservation(mapName) {
+  pendingResourceCreates[mapName] = Math.max(0, pendingResourceCreates[mapName] - 1);
+}
+
+function clearConsumerResumeDeadline(consumer) {
+  const timer = consumer && consumerResumeTimers.get(consumer);
+  if (timer) clearTimeout(timer);
+  if (consumer) consumerResumeTimers.delete(consumer);
+}
+
+function closePeerConsumer(peer, consumer) {
+  if (!consumer) return;
+  clearConsumerResumeDeadline(consumer);
+  if (peer?.consumers.get(consumer.id) === consumer) peer.consumers.delete(consumer.id);
+  try { consumer.close(); } catch (_) {}
+}
+
+function armConsumerResumeDeadline(peer, consumer) {
+  clearConsumerResumeDeadline(consumer);
+  const timer = setTimeout(() => {
+    consumerResumeTimers.delete(consumer);
+    if (
+      peer?.consumers.get(consumer.id) === consumer &&
+      !consumer.closed && !consumer.appData?.resumedByClient
+    ) {
+      closePeerConsumer(peer, consumer);
+    }
+  }, CONSUMER_RESUME_TIMEOUT_MS);
+  timer.unref?.();
+  consumerResumeTimers.set(consumer, timer);
+}
+
+function socketAddress(socket) {
+  return shortString(socket.handshake?.address || socket.conn?.remoteAddress || 'unknown', 128);
+}
+
+function socketAuthToken(socket) {
+  const handshakeToken = shortString(asObject(socket.handshake?.auth).token, 2048);
+  return handshakeToken || bearerToken(socket.handshake?.headers || {});
+}
+
+io.use((socket, next) => {
+  if (AUTH_TOKEN && !constantTimeEqual(socketAuthToken(socket), AUTH_TOKEN)) {
+    const error = new Error('unauthorized');
+    error.data = { code: 'AUTH_REQUIRED' };
+    return next(error);
+  }
+
+  const address = socketAddress(socket);
+  const activeCount = Object.values(peers).filter(peer => peer.socket?.connected).length;
+  if (activeCount >= MAX_ACTIVE_PEERS) {
+    const error = new Error('server capacity reached');
+    error.data = { code: 'PEER_LIMIT' };
+    return next(error);
+  }
+  if ((connectionsByIp.get(address) || 0) >= MAX_PEERS_PER_IP) {
+    const error = new Error('client address capacity reached');
+    error.data = { code: 'PEER_IP_LIMIT' };
+    return next(error);
+  }
+  // 切断後のgrace peerも上限に含める。connectedだけ数えると、
+  // connect→metadata→disconnectの反復で5分間の仮セッションを無制限に蓄積できる。
+  if (Object.keys(peers).length >= MAX_RETAINED_PEERS) {
+    const error = new Error('retained session capacity reached');
+    error.data = { code: 'RETAINED_PEER_LIMIT' };
+    return next(error);
+  }
+  const retainedForAddress = Object.values(peers)
+    .filter(peer => peer.securityAddress === address).length;
+  if (retainedForAddress >= MAX_PEERS_PER_IP) {
+    const error = new Error('client address retained session capacity reached');
+    error.data = { code: 'RETAINED_PEER_IP_LIMIT' };
+    return next(error);
+  }
+  socket.data.securityAddress = address;
+  return next();
+});
+
+function installSocketRateLimit(socket) {
+  let tokens = SOCKET_RATE_CAPACITY;
+  let updatedAt = Date.now();
+  const expensiveEventCost = {
+    createWebRtcTransport: 20,
+    connectTransport: 5,
+    produce: 15,
+    consume: 8,
+    restartIce: 10,
+    clientTelemetry: 5,
+    callPeer: 20,
+    createChannel: 30,
+    updateChannel: 20,
+    deleteChannel: 30,
+    movePeerToChannel: 10,
+  };
+
+  socket.use((packet, next) => {
+    const now = Date.now();
+    tokens = Math.min(
+      SOCKET_RATE_CAPACITY,
+      tokens + ((now - updatedAt) / 1000) * SOCKET_RATE_REFILL_PER_SEC,
+    );
+    updatedAt = now;
+    const eventName = shortString(packet?.[0], 64);
+    const cost = expensiveEventCost[eventName] || 1;
+    if (tokens < cost) {
+      const error = new Error('rate limit exceeded');
+      error.data = { code: 'RATE_LIMITED' };
+      return next(error);
+    }
+    tokens -= cost;
+    return next();
+  });
+}
+
+// アップデート配布フォルダ（server-gui から set-update-dir で指定される）。
+// NAS が遅い/切断中でも SFU の event loop を止めないよう、検証と走査は後で
+// 非同期に行う。世代番号により、遅く完了した古い選択結果も破棄する。
+const initialUpdateDir = String(process.env.UPDATE_DIR || '').slice(0, 1024).trim();
+const updateDirectoryGuard = createDirectoryGenerationGuard();
+let updateDir = null;
+let updateDirIdentity = null;
 
 // ── Workers ──────────────────────────────────────────────
 
@@ -354,12 +935,17 @@ async function recoverMediaLayer() {
 
 function resetPeerMedia(peer) {
   if (!peer) return;
+  peer.mediaGeneration = (peer.mediaGeneration || 0) + 1;
+  for (const consumer of peer.consumers.values()) clearConsumerResumeDeadline(consumer);
   for (const transport of peer.transports.values()) {
     try { transport.close(); } catch (_) {}
   }
   peer.transports.clear();
   peer.producers.clear();
   peer.consumers.clear();
+  peer.pendingTransports?.clear();
+  peer.pendingProducers?.clear();
+  peer.pendingConsumes?.clear();
   // consume欠落の追跡は貼り直し後にゼロから数え直す（即再発火の防止）
   if (peer.missingConsumers) peer.missingConsumers.clear();
 }
@@ -576,33 +1162,47 @@ function resolveUpdateUrl(url) {
   return `http://${host}:${config.listenPort}${pathname}`;
 }
 
-function getSystemStateSnapshot() {
+function getSystemStateSnapshot(socketId = '') {
   const updatePackages = {};
   for (const [appType, pkg] of Object.entries(systemState.updatePackages || {})) {
     updatePackages[appType] = { ...pkg, url: resolveUpdateUrl(pkg.url) };
   }
+  const visiblePrivateSession = socketId ? getPrivateSessionForSocket(socketId) : null;
   return {
     ...systemState,
-    channels: getAllChannels(),
+    // Private call channels are only disclosed to their members. Registered
+    // channels remain globally visible as before.
+    channels: visiblePrivateSession
+      ? [...systemState.channels, publicPrivateChannel(visiblePrivateSession)]
+      : [...systemState.channels],
     updatePackages,
     serverVersion: SERVER_APP_VERSION,
   };
 }
 
 function broadcastSystemState() {
-  const snapshot = getSystemStateSnapshot();
-  io.emit('systemStateUpdated', snapshot);
-  return snapshot;
+  for (const [socketId, peer] of Object.entries(peers)) {
+    if (peer.socket?.connected) peer.socket.emit('systemStateUpdated', getSystemStateSnapshot(socketId));
+  }
+  return getSystemStateSnapshot();
 }
 
 function emitPeerChannelChanged(socketId, peer) {
   if (!peer) return;
-  io.emit('peerChannelChanged', {
+  const payload = {
     socketId,
     channelId: peer.channelId,
     locationName: peer.locationName,
     serverTime: Date.now(),
-  });
+  };
+  const privateSession = getPrivateSessionForSocket(socketId);
+  if (privateSession) {
+    for (const memberSocketId of privateSession.members.keys()) {
+      peers[memberSocketId]?.socket?.emit('peerChannelChanged', payload);
+    }
+    return;
+  }
+  io.emit('peerChannelChanged', payload);
 }
 
 function getPrivateSessionForSocket(socketId) {
@@ -627,10 +1227,66 @@ function getPrivateCallForSocket(socketId) {
   };
 }
 
+function canPeerAccessProducer(requesterSocketId, ownerSocketId) {
+  if (!requesterSocketId || !ownerSocketId || requesterSocketId === ownerSocketId) return false;
+  const ownerPrivateSession = getPrivateSessionForSocket(ownerSocketId);
+  if (!ownerPrivateSession) return true;
+  return ownerPrivateSession.members.has(requesterSocketId);
+}
+
+function emitProducerEvent(ownerSocketId, eventName, payload) {
+  const ownerPrivateSession = getPrivateSessionForSocket(ownerSocketId);
+  if (!ownerPrivateSession) {
+    peers[ownerSocketId]?.socket?.broadcast.emit(eventName, payload);
+    return;
+  }
+  for (const memberSocketId of ownerPrivateSession.members.keys()) {
+    if (memberSocketId === ownerSocketId) continue;
+    peers[memberSocketId]?.socket?.emit(eventName, payload);
+  }
+}
+
+function emitAccessibleProducersTo(targetSocketId) {
+  const target = peers[targetSocketId]?.socket;
+  if (!target?.connected) return;
+  for (const [ownerSocketId, ownerPeer] of Object.entries(peers)) {
+    if (!canPeerAccessProducer(targetSocketId, ownerSocketId)) continue;
+    for (const [producerId, entry] of ownerPeer.producers) {
+      target.emit('newProducer', {
+        producerId,
+        socketId: ownerSocketId,
+        locationName: ownerPeer.locationName,
+        kind: entry.kind,
+        paused: !!entry.paused,
+        source: entry.source,
+        appData: entry.appData,
+        channelId: ownerPeer.channelId,
+        appType: ownerPeer.appType,
+      });
+    }
+  }
+}
+
+function enforcePrivateMediaAcl() {
+  for (const [requesterSocketId, requesterPeer] of Object.entries(peers)) {
+    for (const [consumerId, consumer] of requesterPeer.consumers) {
+      const owner = findProducerOwner(consumer.producerId);
+      if (!owner || canPeerAccessProducer(requesterSocketId, owner.peerId)) continue;
+      try { consumer.close(); } catch (_) {}
+      requesterPeer.consumers.delete(consumerId);
+      requesterPeer.socket?.emit('producerClosed', {
+        producerId: consumer.producerId,
+        socketId: owner.peerId,
+        reason: 'private-channel-acl',
+      });
+    }
+  }
+}
+
 function emitSelfSystemState(socketId, peer) {
   if (!peer?.socket) return;
   peer.socket.emit('systemStateUpdated', {
-    ...getSystemStateSnapshot(),
+    ...getSystemStateSnapshot(socketId),
     self: {
       socketId,
       channelId: peer.channelId,
@@ -675,7 +1331,11 @@ function assignPeerChannel(socketId, channelId, source = 'server') {
   const nextChannelId = normalizeChannelId(channelId);
   const changed = peer.channelId !== nextChannelId;
   peer.channelId = nextChannelId;
-  if (changed) emitPeerChannelChanged(socketId, peer);
+  if (changed) {
+    emitPeerChannelChanged(socketId, peer);
+    enforcePrivateMediaAcl();
+    emitAccessibleProducersTo(socketId);
+  }
   emitSelfSystemState(socketId, peer);
   sendAdminLog(`[Channel] set peer=${socketId} channel=${nextChannelId} source=${source}`);
   return { ok: true, channelId: nextChannelId };
@@ -783,6 +1443,9 @@ function ensurePrivateSessionForCaller(socketId, source = 'server') {
   const existingSession = getPrivateSessionForSocket(socketId);
   if (existingSession) {
     return { ok: true, session: existingSession, created: false };
+  }
+  if (privateSessions.size >= MAX_PRIVATE_SESSIONS) {
+    return { ok: false, error: 'private session limit reached' };
   }
 
   const channelId = createPrivateChannelId();
@@ -922,6 +1585,94 @@ function sanitizeDeviceList(devices) {
   });
 }
 
+function boundedNumber(value, min, max, fallback = null) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(max, Math.max(min, numeric));
+}
+
+function sanitizeTrackReport(value) {
+  const track = asObject(value);
+  const readyState = ['live', 'ended', 'missing'].includes(track.readyState)
+    ? track.readyState
+    : 'unknown';
+  return {
+    present: !!track.present,
+    readyState,
+    enabled: !!track.enabled,
+    muted: !!track.muted,
+    label: shortString(track.label, 160),
+  };
+}
+
+function sanitizeLocalMedia(value) {
+  const media = asObject(value);
+  const profile = asObject(media.audioProfile);
+  return {
+    cameraEnabled: !!media.cameraEnabled,
+    micEnabled: !!media.micEnabled,
+    speakerMuted: !!media.speakerMuted,
+    screenSharing: !!media.screenSharing,
+    screenSource: shortString(media.screenSource, 160),
+    video: sanitizeTrackReport(media.video),
+    audio: sanitizeTrackReport(media.audio),
+    screen: sanitizeTrackReport(media.screen),
+    screenAudio: sanitizeTrackReport(media.screenAudio),
+    error: shortString(media.error, 512),
+    audioProfile: {
+      mode: shortString(profile.mode, 32),
+      localSpeaking: !!profile.localSpeaking,
+      audiblePeerCount: Math.trunc(boundedNumber(profile.audiblePeerCount, 0, MAX_MONITOR_PEERS, 0)),
+      remoteAudioVolume: boundedNumber(profile.remoteAudioVolume, 0, 10, 0),
+    },
+  };
+}
+
+function sanitizeConnectionReport(value) {
+  const connection = asObject(value);
+  const ackAt = boundedNumber(connection.lastTelemetryAckAt, 0, Number.MAX_SAFE_INTEGER, null);
+  return {
+    appStatus: shortString(connection.appStatus, 32),
+    telemetryRttMs: boundedNumber(connection.telemetryRttMs, 0, 60_000, null),
+    lastTelemetryAckAt: ackAt == null ? null : Math.trunc(ackAt),
+  };
+}
+
+function sanitizeTransportReport(value) {
+  const transports = asObject(value);
+  const state = input => {
+    const normalized = shortString(input, 24);
+    return ['new', 'connecting', 'connected', 'disconnected', 'failed', 'closed', 'none'].includes(normalized)
+      ? normalized
+      : 'unknown';
+  };
+  return {
+    socketConnected: !!transports.socketConnected,
+    sendState: state(transports.sendState),
+    recvState: state(transports.recvState),
+    sendClosed: !!transports.sendClosed,
+    recvClosed: !!transports.recvClosed,
+  };
+}
+
+function sanitizeConsumerReport(values) {
+  if (!Array.isArray(values)) return [];
+  return values.slice(0, MAX_MONITOR_PEERS).map(value => {
+    const consumer = asObject(value);
+    return {
+      producerId: shortString(consumer.producerId, 128),
+      id: shortString(consumer.id, 128),
+      kind: ['audio', 'video'].includes(consumer.kind) ? consumer.kind : 'unknown',
+      closed: !!consumer.closed,
+      paused: !!consumer.paused,
+      trackReadyState: ['live', 'ended', 'missing'].includes(consumer.trackReadyState)
+        ? consumer.trackReadyState
+        : 'unknown',
+      trackMuted: !!consumer.trackMuted,
+    };
+  });
+}
+
 function sanitizeTelemetry(report) {
   const data = asObject(report);
   const devices = asObject(data.devices);
@@ -941,8 +1692,8 @@ function sanitizeTelemetry(report) {
         audioPaused: !!item.audioPaused,
         receivingVideo: !!item.receivingVideo,
         receivingAudio: !!item.receivingAudio,
-        video: asObject(item.video),
-        audio: asObject(item.audio),
+        video: sanitizeTrackReport(item.video),
+        audio: sanitizeTrackReport(item.audio),
       };
     })
     : [];
@@ -953,7 +1704,7 @@ function sanitizeTelemetry(report) {
     locationName: shortString(data.locationName || '', 128),
     channelId: normalizeChannelId(data.channelId),
     status: shortString(data.status || '', 32),
-    clientTime: Number.isFinite(data.clientTime) ? data.clientTime : null,
+    clientTime: Number.isSafeInteger(data.clientTime) ? data.clientTime : null,
     devices: {
       video: sanitizeDeviceList(devices.video),
       audioInput: sanitizeDeviceList(devices.audioInput),
@@ -964,16 +1715,16 @@ function sanitizeTelemetry(report) {
       audioInput: shortString(selectedDevices.audioInput, 256),
       audioOutput: shortString(selectedDevices.audioOutput, 256),
     },
-    localMedia,
+    localMedia: sanitizeLocalMedia(localMedia),
     remoteMonitor: {
-      peerCount: Number(remoteMonitor.peerCount) || monitorPeers.length,
-      receivingVideoCount: Number(remoteMonitor.receivingVideoCount) || 0,
-      receivingAudioCount: Number(remoteMonitor.receivingAudioCount) || 0,
+      peerCount: Math.trunc(boundedNumber(remoteMonitor.peerCount, 0, MAX_ACTIVE_PEERS, monitorPeers.length)),
+      receivingVideoCount: Math.trunc(boundedNumber(remoteMonitor.receivingVideoCount, 0, MAX_MONITOR_PEERS, 0)),
+      receivingAudioCount: Math.trunc(boundedNumber(remoteMonitor.receivingAudioCount, 0, MAX_MONITOR_PEERS, 0)),
       peers: monitorPeers,
     },
-    connection,
-    transports,
-    consumers: Array.isArray(data.consumers) ? data.consumers.slice(0, MAX_MONITOR_PEERS) : [],
+    connection: sanitizeConnectionReport(connection),
+    transports: sanitizeTransportReport(transports),
+    consumers: sanitizeConsumerReport(data.consumers),
   };
 }
 
@@ -1110,7 +1861,6 @@ function localIpv4Addresses() {
 const dgram = require('dgram');
 const net = require('net');
 const tls = require('tls');
-const crypto = require('crypto');
 const ICE_PROBE_INTERVAL_MS = Number(process.env.ICE_PROBE_INTERVAL_MS) || 60000;
 let iceProbeResults = [];
 
@@ -1265,6 +2015,8 @@ function getStatsSnapshot() {
     peerCount: Object.keys(peers).length,
     totalProducers,
     totalConsumers,
+    recordingPlainTransportCount: recordingTransportCount,
+    maxRecordingPlainTransports: Math.min(MAX_RECORDING_TRANSPORTS, HARD_MAX_RECORDING_TRANSPORTS),
     healthCounts,
     clients,
     workerPids: workers.map(w => w.pid),
@@ -1292,24 +2044,108 @@ function getStatsSnapshot() {
   };
 }
 
+let publicHealthCache = null;
+function getPublicHealthSnapshot(now = Date.now()) {
+  if (publicHealthCache && now - publicHealthCache.at < 1000) return publicHealthCache.data;
+  let totalProducers = 0;
+  let totalConsumers = 0;
+  for (const peer of Object.values(peers)) {
+    totalProducers += peer.producers.size;
+    totalConsumers += peer.consumers.size;
+  }
+  const data = {
+    status: recovering ? 'recovering' : 'ok',
+    uptimeSec: Math.round(process.uptime()),
+    peerCount: Object.keys(peers).length,
+    totalProducers,
+    totalConsumers,
+    ready: !!router && workers.length > 0 && !recovering,
+  };
+  publicHealthCache = { at: now, data };
+  return data;
+}
+
 // ── アップデートファイル配信 ──────────────────────────────
 // server-gui で選択されたフォルダ内のビルド済みパッケージを配布する。
 
-function listUpdateFiles() {
-  if (!updateDir || !fs.existsSync(updateDir)) return [];
+const UPDATE_FILE_EXT = /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i;
+const updateFileListCache = createPublishedFileListCache(UPDATE_FILE_EXT);
+
+async function listUpdateFiles(rootDir = updateDir, rootIdentity = updateDirIdentity) {
+  return updateFileListCache.list(rootDir, { expectedRootIdentity: rootIdentity });
+}
+
+/**
+ * アップデート配布先を非同期検証し、最新の選択だけを反映する。
+ * 同じ NAS 上の古い走査が後から完了しても updateDir を巻き戻さない。
+ */
+async function configureUpdateDirectory(rawDir, source = 'server-gui') {
+  const ticket = updateDirectoryGuard.begin();
+  const selected = shortString(rawDir, 1024).trim();
+
+  if (!selected) {
+    if (updateDirectoryGuard.isCurrent(ticket)) {
+      updateDir = null;
+      updateDirIdentity = null;
+      updateFileListCache.invalidate();
+      sendAdminLog(`[Updates] 配布フォルダを解除しました source=${source}`);
+    }
+    return { stale: !updateDirectoryGuard.isCurrent(ticket), directory: null, files: [] };
+  }
+
   try {
-    return fs.readdirSync(updateDir)
-      // macOS の AppleDouble(._*)や .DS_Store 等の隠しファイルは配布対象外。
-      // ._foo.dmg は拡張子が一致してしまい、本物の代わりに配布登録されると
-      // ダウンロードが dotfile 拒否(404 NotFoundError)になる（実障害の原因）。
-      .filter(name => !name.startsWith('.') && /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i.test(name))
-      .map(name => {
-        const stat = fs.statSync(path.join(updateDir, name));
-        return { name, size: stat.size, mtimeMs: stat.mtimeMs };
-      });
+    const scan = await validatePublishedDirectory(selected, UPDATE_FILE_EXT);
+    if (!updateDirectoryGuard.isCurrent(ticket)) return { stale: true, ...scan };
+    updateDir = scan.directory;
+    updateDirIdentity = scan.rootIdentity;
+    // The validation scan already produced a safe list. Seed the short cache so
+    // the first public request does not immediately walk the NAS again.
+    updateFileListCache.prime(scan.directory, scan.files, scan.rootIdentity);
+    sendAdminLog(`[Updates] 配布フォルダを設定: ${scan.directory} (${scan.files.length}ファイル) source=${source}`);
+    return { stale: false, ...scan };
   } catch (err) {
-    console.error('[Updates] list failed:', err.message);
-    return [];
+    if (!updateDirectoryGuard.isCurrent(ticket)) return { stale: true, error: err };
+    sendAdminLog(`[Updates] 配布フォルダを設定できません: ${selected} (${err.message}) source=${source}`);
+    return { stale: false, error: err };
+  }
+}
+
+/**
+ * 公開ディレクトリ直下の通常ファイルだけを解決する。
+ * path.basename だけでは、攻撃者が配布フォルダーに置いた symlink を介して
+ * 任意ファイルを読み出せるため、symlink を明示的に拒否する。
+ */
+async function openPublishedFile(rootDir, requestedName, expectedRootIdentity = null) {
+  if (!rootDir) return null;
+  const rawName = String(requestedName || '');
+  const name = path.basename(rawName);
+  if (!name || name !== rawName || name.startsWith('.') || name.length > 512) return null;
+  let handle = null;
+  try {
+    const rootBefore = await assertPublishedDirectory(rootDir, expectedRootIdentity);
+    const candidate = path.resolve(rootBefore.path, name);
+    if (path.dirname(candidate) !== rootBefore.path) return null;
+    const pathStat = await fs.promises.lstat(candidate);
+    const fileReal = await fs.promises.realpath(candidate);
+    const relative = path.relative(rootBefore.realpath, fileReal);
+    if (!pathStat.isFile() || pathStat.isSymbolicLink() || !relative ||
+        relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+
+    handle = await fs.promises.open(fileReal, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const openedStat = await handle.stat();
+    if (!openedStat.isFile() || pathStat.dev !== openedStat.dev || pathStat.ino !== openedStat.ino) {
+      await handle.close().catch(() => {});
+      return null;
+    }
+    const rootAfter = await assertPublishedDirectory(rootBefore.path, expectedRootIdentity || rootBefore);
+    if (!sameRootIdentity(rootBefore, rootAfter)) {
+      await handle.close().catch(() => {});
+      return null;
+    }
+    return { handle, stat: openedStat, filePath: fileReal };
+  } catch {
+    await handle?.close().catch(() => {});
+    return null;
   }
 }
 
@@ -1320,44 +2156,100 @@ function listUpdateFiles() {
  * 置かれた配布ディレクトリなど）既定設定で 404 NotFoundError を投げる。
  * 手動配信にすることでファイル名・配置場所に依存せず確実に配布できる。
  */
-function sendDownload(req, res, filePath, fileName) {
-  let stat;
-  try {
-    stat = fs.statSync(filePath);
-  } catch {
-    return res.status(404).json({ error: 'file not found' });
+async function sendOpenedDownload(req, res, opened, fileName, next) {
+  const { handle, stat } = opened;
+  let stream = null;
+  let closePromise = null;
+  const closeHandle = () => {
+    if (!closePromise) closePromise = handle.close().catch(() => {});
+    return closePromise;
+  };
+  const abortTransfer = () => {
+    if (stream && !stream.destroyed) stream.destroy();
+    void closeHandle();
+  };
+  req.once('aborted', abortTransfer);
+  res.once('close', abortTransfer);
+  res.once('finish', closeHandle);
+
+  if (req.aborted || res.destroyed) {
+    abortTransfer();
+    return undefined;
   }
-  if (!stat.isFile()) return res.status(404).json({ error: 'file not found' });
 
-  // 非ASCIIファイル名は RFC 5987 (filename*) で渡し、filename には安全な代替名を入れる
-  const asciiName = fileName.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
-  res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Length', stat.size);
-  res.setHeader('Content-Disposition', `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
-  if (req.method === 'HEAD') return res.end();
+  try {
+    if (!['GET', 'HEAD'].includes(req.method)) {
+      await closeHandle();
+      res.setHeader('Allow', 'GET, HEAD');
+      return res.status(405).end();
+    }
+    if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
+      await closeHandle();
+      return res.status(500).json({ error: 'invalid file size' });
+    }
 
-  const stream = fs.createReadStream(filePath);
-  stream.on('error', (err) => {
-    console.error('[Download] stream failed:', err.message);
-    if (!res.headersSent) res.status(500).json({ error: 'read failed' });
-    else res.destroy();
-  });
-  stream.pipe(res);
+    // 非ASCIIファイル名は RFC 5987 (filename*) で渡し、filename には安全な代替名を入れる
+    const asciiName = fileName.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_');
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', String(stat.size));
+    res.setHeader('Content-Disposition', `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+    if (req.method === 'HEAD' || stat.size === 0) {
+      await closeHandle();
+      return res.end();
+    }
+
+    stream = handle.createReadStream({ autoClose: false });
+    stream.once('end', closeHandle);
+    stream.once('close', closeHandle);
+    stream.once('error', err => {
+      void closeHandle();
+      if (!res.destroyed) res.destroy(err);
+    });
+    stream.pipe(res);
+    return undefined;
+  } catch (err) {
+    if (stream && !stream.destroyed) stream.destroy();
+    await closeHandle();
+    if (res.headersSent) res.destroy(err);
+    else next(err);
+    return undefined;
+  }
 }
 
-app.get('/updates', (_, res) => {
-  res.json({ updateDir: updateDir || null, files: listUpdateFiles() });
+app.get('/updates', async (_req, res, next) => {
+  // サーバーの絶対パスはクライアントに不要で、環境情報の漏えいになる。
+  const rootDir = updateDir;
+  const rootIdentity = updateDirIdentity;
+  try {
+    res.json({ configured: !!rootDir, files: await listUpdateFiles(rootDir, rootIdentity) });
+  } catch (err) {
+    if (err?.code === 'PUBLISHED_ROOT_CHANGED') {
+      return res.status(409).json({ error: 'update directory changed; select it again' });
+    }
+    next(err);
+    return undefined;
+  }
 });
 
-app.get('/updates/:filename', (req, res) => {
-  if (!updateDir) return res.status(404).json({ error: 'update dir not configured' });
-  const fileName = path.basename(String(req.params.filename || ''));
-  const filePath = path.join(updateDir, fileName);
-  if (!fileName || fileName.startsWith('.') || !filePath.startsWith(updateDir) || !fs.existsSync(filePath)) {
-    console.warn(`[Updates] download not found: "${fileName}" dir=${updateDir}`);
+app.get('/updates/:filename', async (req, res, next) => {
+  const rootDir = updateDir;
+  const rootIdentity = updateDirIdentity;
+  if (!rootDir) return res.status(404).json({ error: 'update dir not configured' });
+  const fileName = String(req.params.filename || '');
+  if (!UPDATE_FILE_EXT.test(fileName)) {
+    console.warn(`[Updates] download not found: "${fileName}" dir=${rootDir}`);
     return res.status(404).json({ error: 'file not found', fileName });
   }
-  sendDownload(req, res, filePath, fileName);
+  try {
+    const opened = await openPublishedFile(rootDir, fileName, rootIdentity);
+    if (!opened) {
+      console.warn(`[Updates] download not found: "${fileName}" dir=${rootDir}`);
+      return res.status(404).json({ error: 'file not found', fileName });
+    }
+    return await sendOpenedDownload(req, res, opened, fileName, next);
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // ── 通知音（着信音）配信 ──────────────────────────────────
@@ -1367,39 +2259,64 @@ app.get('/updates/:filename', (req, res) => {
 // RINGTONES_DIR が userData 配下に設定され、サーバー更新後もファイルが残る。
 const RINGTONE_FILE_EXT = /\.(mp3|wav|ogg|m4a|aac)$/i;
 const ringtonesDir = process.env.RINGTONES_DIR || path.join(__dirname, 'ringtones');
-try {
-  fs.mkdirSync(ringtonesDir, { recursive: true });
-} catch (err) {
-  console.warn('[Ringtones] ディレクトリを作成できません:', err.message);
-}
+const ringtoneFileListCache = createPublishedFileListCache(RINGTONE_FILE_EXT);
+let ringtonesDirIdentity = null;
+let ringtonesInitialization = null;
 
-function listRingtones() {
-  if (!ringtonesDir || !fs.existsSync(ringtonesDir)) return [];
+async function ensureRingtonesDirectory() {
+  if (ringtonesDirIdentity) {
+    await assertPublishedDirectory(ringtonesDir, ringtonesDirIdentity);
+    return ringtonesDirIdentity;
+  }
+  if (ringtonesInitialization) return ringtonesInitialization;
+
+  const flight = (async () => {
+    await fs.promises.mkdir(ringtonesDir, { recursive: true });
+    const scan = await validatePublishedDirectory(ringtonesDir, RINGTONE_FILE_EXT);
+    if (!ringtonesDirIdentity) {
+      ringtonesDirIdentity = scan.rootIdentity;
+      ringtoneFileListCache.prime(scan.directory, scan.files, scan.rootIdentity);
+    }
+    return ringtonesDirIdentity;
+  })();
+  ringtonesInitialization = flight;
   try {
-    return fs.readdirSync(ringtonesDir)
-      .filter(name => !name.startsWith('.') && RINGTONE_FILE_EXT.test(name))
-      .map(name => {
-        const stat = fs.statSync(path.join(ringtonesDir, name));
-        return { name, size: stat.size, mtimeMs: stat.mtimeMs };
-      })
-      .sort((a, b) => a.name.localeCompare(b.name, 'ja'));
-  } catch (err) {
-    console.error('[Ringtones] list failed:', err.message);
-    return [];
+    return await flight;
+  } finally {
+    if (ringtonesInitialization === flight) ringtonesInitialization = null;
   }
 }
 
-app.get('/ringtones', (_, res) => {
-  res.json({ dir: ringtonesDir, files: listRingtones() });
+async function listRingtones() {
+  const rootIdentity = await ensureRingtonesDirectory();
+  return ringtoneFileListCache.list(ringtonesDir, { expectedRootIdentity: rootIdentity });
+}
+
+app.get('/ringtones', async (_req, res, next) => {
+  try {
+    res.json({ files: await listRingtones() });
+  } catch (err) {
+    if (err?.code === 'PUBLISHED_ROOT_CHANGED') {
+      return res.status(409).json({ error: 'ringtone directory changed; restart the server' });
+    }
+    next(err);
+    return undefined;
+  }
 });
 
-app.get('/ringtones/:filename', (req, res) => {
-  const fileName = path.basename(String(req.params.filename || ''));
-  const filePath = path.join(ringtonesDir, fileName);
-  if (!fileName || fileName.startsWith('.') || !RINGTONE_FILE_EXT.test(fileName) || !filePath.startsWith(ringtonesDir) || !fs.existsSync(filePath)) {
+app.get('/ringtones/:filename', async (req, res, next) => {
+  const fileName = String(req.params.filename || '');
+  if (!RINGTONE_FILE_EXT.test(fileName)) {
     return res.status(404).json({ error: 'ringtone not found' });
   }
-  sendDownload(req, res, filePath, fileName);
+  try {
+    const rootIdentity = await ensureRingtonesDirectory();
+    const opened = await openPublishedFile(ringtonesDir, fileName, rootIdentity);
+    if (!opened) return res.status(404).json({ error: 'ringtone not found' });
+    return await sendOpenedDownload(req, res, opened, fileName, next);
+  } catch (err) {
+    return next(err);
+  }
 });
 
 // ── 録画: タイムライン再生UI と API ───────────────────────
@@ -1412,27 +2329,77 @@ app.get('/recordings', (_, res) => {
   res.sendFile(path.join(__dirname, 'public', 'recordings.html'));
 });
 
-app.get('/recordings/api/status', (_, res) => {
-  res.json(recording.getStatus());
+app.post('/recordings/api/session', limitRecordingQueries, createRecordingSession);
+
+function publicRecordingSegment(segment) {
+  const item = asObject(segment);
+  return {
+    id: shortString(item.id, 256),
+    key: shortString(item.key, 128),
+    locKey: shortString(item.locKey, 64),
+    source: ['camera', 'screen'].includes(item.source) ? item.source : 'camera',
+    startMs: Number(item.startMs) || 0,
+    durationMs: Number(item.durationMs) || 0,
+    size: Number(item.size) || 0,
+    codec: shortString(item.codec, 32),
+    audio: !!item.audio,
+    status: shortString(item.status, 32),
+    mediaUrl: `/recordings/media/${encodeURIComponent(shortString(item.id, 256))}`,
+  };
+}
+
+function publicLiveSession(session) {
+  const item = asObject(session);
+  return {
+    key: shortString(item.key, 128),
+    locKey: shortString(item.locKey, 64),
+    source: ['camera', 'screen'].includes(item.source) ? item.source : 'camera',
+    locationName: shortString(item.locationName, 128),
+    hasAudio: !!item.hasAudio,
+    startedAt: Number(item.startedAt) || 0,
+    liveUrl: shortString(item.liveUrl, 512),
+  };
+}
+
+app.get('/recordings/api/status', requireRecordingAccess, (_, res) => {
+  // 保存先や ffmpeg の絶対パスは公開APIに出さない。
+  const {
+    recordingsDir: _recordingsDir,
+    recordingSocketIds: _recordingSocketIds,
+    storageError: _storageError,
+    ...publicStatus
+  } = recording.getStatusSummary();
+  res.json(publicStatus);
 });
 
-app.get('/recordings/api/locations', (_, res) => {
-  res.json({ locations: recording.listLocations(), serverTime: Date.now() });
+app.get('/recordings/api/locations', requireRecordingAccess, limitRecordingQueries, async (_req, res, next) => {
+  try {
+    res.json({ locations: await recording.listLocations(), serverTime: Date.now() });
+  } catch (err) {
+    next(err);
+  }
 });
 
-app.get('/recordings/api/segments', (req, res) => {
-  const keys = String(req.query.keys || '').split(',').map(s => s.trim()).filter(Boolean);
-  const segments = recording.querySegments({
-    keys: keys.length ? keys : null,
-    fromMs: Number(req.query.from),
-    toMs: Number(req.query.to),
-  }).map(seg => ({ ...seg, mediaUrl: `/recordings/media/${encodeURIComponent(seg.id)}` }));
-  res.json({ segments });
+app.get('/recordings/api/segments', requireRecordingAccess, limitRecordingQueries, async (req, res) => {
+  try {
+    const keys = String(req.query.keys || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 64);
+    const segments = (await recording.querySegments({
+      keys: keys.length ? keys : null,
+      fromMs: Number(req.query.from),
+      toMs: Number(req.query.to),
+    })).map(publicRecordingSegment);
+    res.json({ segments });
+  } catch (err) {
+    res.status(400).json({ error: err.message || 'invalid recording query window' });
+  }
 });
 
-app.post('/recordings/api/settings', (req, res) => {
+app.post('/recordings/api/settings', requireAdminToken, (req, res) => {
   try {
     const settings = recording.applySettings(asObject(req.body));
+    if (process.send) {
+      safeProcessSend({ type: 'recording-settings-changed', settings, source: 'recording-api' });
+    }
     res.json({ ok: true, settings, status: recording.getStatus() });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1444,61 +2411,155 @@ app.post('/recordings/api/settings', (req, res) => {
 // クライアントはバッファ末尾へシークすることで数秒遅れのリアルタイム視聴になる。
 // セグメントが切り替わる(既定5分ごと)とストリームは終了し、クライアントが再接続する。
 
-app.get('/recordings/api/live', (_, res) => {
-  res.json({ sessions: recording.getLiveSessions(), serverTime: Date.now() });
+app.get('/recordings/api/live', requireRecordingAccess, (_, res) => {
+  res.json({ sessions: recording.getLiveSessions().map(publicLiveSession), serverTime: Date.now() });
 });
 
-app.get('/recordings/live/:producerId', (req, res) => {
-  const producerId = String(req.params.producerId || '');
-  const live = recording.resolveLiveFile(producerId);
-  if (!live) return res.status(404).json({ error: 'live session not found' });
-
-  res.writeHead(200, {
-    'Content-Type': live.mime,
-    'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': '*',
-  });
-
+/**
+ * openLiveFile() が検証した同じFileHandleだけから、追記分を繰り返し配信する。
+ * パスをpumpごとに再openしないため、セグメント名がsymlink/別inodeに
+ * 差し替えられても、途中から別ファイルのバイトが混ざらない。
+ */
+async function sendOpenedLiveRecording(req, res, live, producerId) {
+  const { handle } = live;
   let position = 0;
   let closed = false;
   let idleTicks = 0;
-  req.on('close', () => { closed = true; });
+  let currentStream = null;
+  let pumpTimer = null;
+  let closePromise = null;
 
-  const pump = () => {
-    if (closed) return;
-    fs.stat(live.filePath, (err, stat) => {
-      if (closed) return;
-      if (err) { res.end(); return; }
-      if (stat.size > position) {
-        idleTicks = 0;
-        const stream = fs.createReadStream(live.filePath, { start: position, end: stat.size - 1 });
-        position = stat.size;
-        stream.pipe(res, { end: false });
-        stream.on('end', () => setTimeout(pump, 500));
-        stream.on('error', () => res.end());
-        return;
-      }
-      // 書き込みが進んでいない: セグメント切替/セッション終了なら閉じる(クライアントが再接続)
-      const current = recording.resolveLiveFile(producerId);
-      if (!current || current.filePath !== live.filePath) { res.end(); return; }
-      idleTicks += 1;
-      if (idleTicks > 60) { res.end(); return; } // 30秒無更新(RTP停滞)は一旦切る
-      setTimeout(pump, 500);
-    });
+  const closeHandle = () => {
+    if (!closePromise) closePromise = handle.close().catch(() => {});
+    return closePromise;
   };
-  pump();
+  const closeLiveStream = () => {
+    if (!closed) {
+      closed = true;
+      if (pumpTimer) {
+        clearTimeout(pumpTimer);
+        pumpTimer = null;
+      }
+      if (currentStream && !currentStream.destroyed) currentStream.destroy();
+      currentStream = null;
+    }
+    return closeHandle();
+  };
+  const finishLiveStream = () => {
+    void closeLiveStream();
+    if (!res.writableEnded && !res.destroyed) res.end();
+  };
+
+  req.once('aborted', closeLiveStream);
+  res.once('finish', closeLiveStream);
+  res.once('close', closeLiveStream);
+  if (req.aborted || res.destroyed) {
+    await closeLiveStream();
+    return undefined;
+  }
+
+  try {
+    res.writeHead(200, {
+      'Content-Type': live.mime,
+      'Cache-Control': 'no-store',
+    });
+    if (req.method === 'HEAD') {
+      await closeLiveStream();
+      res.end();
+      return undefined;
+    }
+
+    const schedulePump = () => {
+      if (closed || pumpTimer) return;
+      pumpTimer = setTimeout(() => {
+        pumpTimer = null;
+        void pump();
+      }, 500);
+      pumpTimer.unref?.();
+    };
+
+    const pump = async () => {
+      if (closed) return;
+      try {
+        const stat = await handle.stat();
+        if (closed) return;
+        if (!stat.isFile() || stat.size < position) {
+          finishLiveStream();
+          return;
+        }
+        if (stat.size > position) {
+          idleTicks = 0;
+          const stream = handle.createReadStream({
+            start: position,
+            end: stat.size - 1,
+            autoClose: false,
+          });
+          currentStream = stream;
+          position = stat.size;
+          stream.once('end', () => {
+            if (currentStream === stream) currentStream = null;
+            schedulePump();
+          });
+          stream.once('close', () => {
+            if (currentStream === stream) currentStream = null;
+          });
+          stream.once('error', finishLiveStream);
+          stream.pipe(res, { end: false });
+          return;
+        }
+
+        // 書き込みが進んでいない: セグメント切替/セッション終了なら閉じる。
+        // resolveLiveFileは現在名の確認だけに使い、データは必ず検証済みhandleから読む。
+        const current = await recording.resolveLiveFile(producerId);
+        if (!current || path.resolve(current.filePath) !== live.logicalPath) {
+          finishLiveStream();
+          return;
+        }
+        idleTicks += 1;
+        if (idleTicks > 60) {
+          finishLiveStream();
+          return;
+        } // 30秒無更新(RTP停滞)は一旦切る
+        schedulePump();
+      } catch {
+        finishLiveStream();
+      }
+    };
+    void pump();
+    return undefined;
+  } catch (err) {
+    await closeLiveStream();
+    throw err;
+  }
+}
+
+app.get('/recordings/live/:producerId', requireRecordingAccess, limitRecordingStreams, async (req, res, next) => {
+  try {
+    const producerId = String(req.params.producerId || '');
+    const live = await recording.openLiveFile(producerId);
+    if (!live) return res.status(404).json({ error: 'live session not found' });
+    return await sendOpenedLiveRecording(req, res, live, producerId);
+  } catch (err) {
+    return next(err);
+  }
 });
 
-app.get('/recordings/media/:id', (req, res) => {
-  const abs = recording.resolveMediaPath(String(req.params.id || ''));
-  if (!abs || !fs.existsSync(abs)) return res.status(404).json({ error: 'segment not found' });
-  // sendFile は Range リクエストに対応しており、タイムラインのシークに必要
-  res.sendFile(abs, { acceptRanges: true, dotfiles: 'deny' }, err => {
-    if (err && !res.headersSent) res.status(err.status || 500).end();
-  });
+app.get('/recordings/media/:id', requireRecordingAccess, limitRecordingStreams, async (req, res, next) => {
+  try {
+    const opened = await recording.openMediaFile(String(req.params.id || ''));
+    if (!opened) return res.status(404).json({ error: 'segment not found' });
+    return await sendOpenedRecordingFile(req, res, opened, next);
+  } catch (err) {
+    return next(err);
+  }
 });
 
-app.get('/health', (_, res) => res.json(getStatsSnapshot()));
+app.get('/health', (_, res) => {
+  // 詳細スナップショットには拠点名、IP/ポート構成、PID、録画パスが
+  // 含まれる。死活監視用の公開エンドポイントは集計値のみ返す。
+  res.json(getPublicHealthSnapshot());
+});
+app.get('/health/details', requireAdminToken, (_, res) => res.json(getStatsSnapshot()));
 app.get('/ready', (_, res) => {
   const ready = !!router && workers.length > 0 && !recovering;
   res.status(ready ? 200 : 503).json({
@@ -1520,7 +2581,6 @@ app.get('/presence', (_, res) => {
   let clientCount = 0;
   let clientAppCount = 0;
   let screenAppCount = 0;
-  const locations = [];
   const now = Date.now();
   for (const peer of Object.values(peers)) {
     if (!peer.socket?.connected || !peer.metadataReady) continue;
@@ -1533,7 +2593,6 @@ app.get('/presence', (_, res) => {
     clientCount += 1;
     if (appType === 'client') clientAppCount += 1;
     else screenAppCount += 1;
-    if (locations.length < 32) locations.push(peer.locationName);
   }
   res.json({
     ok: true,
@@ -1542,7 +2601,6 @@ app.get('/presence', (_, res) => {
     // こちらを使う（screen-share を拠点と数えると空の会議室へ寄ってしまうため）。
     clientAppCount,
     screenAppCount,
-    locations,
     ready: !!router && workers.length > 0 && !recovering,
     uptimeSec: Math.round(process.uptime()),
     serverTime: Date.now(),
@@ -1691,6 +2749,21 @@ function emitIncomingCall(socketId, payload, source = 'server') {
     return { ok: false, error: 'client not connected' };
   }
 
+  if (pendingCalls.size >= MAX_PENDING_CALLS) {
+    sendAdminLog(`[Call] rejected source=${source} target=${socketId} error=server call capacity reached`);
+    return { ok: false, error: 'call capacity reached' };
+  }
+  const fromSocketId = shortString(payload.fromSocketId, 128);
+  if (fromSocketId) {
+    let activeFromCaller = 0;
+    for (const pending of pendingCalls.values()) {
+      if (pending.fromSocketId === fromSocketId) activeFromCaller += 1;
+    }
+    if (activeFromCaller >= MAX_PENDING_CALLS_PER_PEER) {
+      return { ok: false, error: 'caller has too many pending calls' };
+    }
+  }
+
   const issuedAt = Date.now();
   const sourcePeer = payload.fromSocketId ? peers[payload.fromSocketId] : null;
   const rawFromChannelId = stableId(payload.fromChannelId || sourcePeer?.channelId, '');
@@ -1699,7 +2772,7 @@ function emitIncomingCall(socketId, payload, source = 'server') {
     : null;
   const callPayload = {
     callId: shortString(payload.callId || `call-${issuedAt}-${Math.random().toString(36).slice(2, 8)}`, 80),
-    fromSocketId: shortString(payload.fromSocketId, 128),
+    fromSocketId,
     fromName: shortString(payload.fromName || '呼び出し', 128),
     fromAppType: shortString(payload.fromAppType || 'client', 24),
     fromChannelId: fromChannel?.id || '',
@@ -1710,6 +2783,10 @@ function emitIncomingCall(socketId, payload, source = 'server') {
     targetName: targetPeer.locationName,
     serverTime: issuedAt,
   };
+
+  if (pendingCalls.has(callPayload.callId)) {
+    return { ok: false, error: 'callId already exists' };
+  }
 
   // 応答待ちとして登録（旧クライアントが callAck を返さなくてもタイムアウトで確実に終了する）
   pendingCalls.set(callPayload.callId, {
@@ -1850,16 +2927,19 @@ function checkResourcePressure() {
   const rssMb = Math.round(process.memoryUsage().rss / 1024 / 1024);
   const warnOk = now - resourceWarnedAt >= 300000; // 警告は5分に1回まで
 
-  // RTCポート範囲の逼迫（固定ポートモード時は対象外）。transport 1つにつき
-  // announced IP の数だけポートを消費するため、リークや拠点増で枯渇しうる。
-  if (!config.rtcPort && warnOk) {
-    let transportCount = 0;
-    for (const peer of Object.values(peers)) transportCount += peer.transports.size;
+  // WebRTC transportは動的モードでannounced IP数ぶん、録画PlainTransportは
+  // 固定ポートモードでもdynamic rangeから1本につき1ポートを消費する。
+  if (warnOk) {
+    let peerTransportCount = 0;
+    for (const peer of Object.values(peers)) peerTransportCount += peer.transports.size;
     const capacity = config.rtcPortRange.max - config.rtcPortRange.min + 1;
-    const used = transportCount * Math.max(1, (config.announcedIps || []).length);
+    const peerUsed = config.rtcPort
+      ? 0
+      : peerTransportCount * Math.max(1, (config.announcedIps || []).length);
+    const used = peerUsed + recordingTransportCount;
     if (used >= capacity * 0.8) {
       resourceWarnedAt = now;
-      sendAdminLog(`[Resource] RTCポート範囲が逼迫しています: 推定使用 ${used}/${capacity}。RTC_PORT(固定ポート)への移行かポート範囲の拡大を検討してください`);
+      sendAdminLog(`[Resource] RTCポート範囲が逼迫しています: 推定使用 ${used}/${capacity} (録画=${recordingTransportCount})。録画上限またはポート範囲を見直してください`);
     }
   }
 
@@ -1924,8 +3004,19 @@ routineRestartTimer.unref?.();
 
 // ── メディアフロー監視（上りRTPが実際に届いているかの確認と自動復旧）─────────
 
+function settleWithin(promise, timeoutMs, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer.unref?.();
+    Promise.resolve(promise).then(
+      value => { clearTimeout(timer); resolve(value); },
+      error => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 async function sampleProducerInboundBytes(producer) {
-  const stats = await producer.getStats();
+  const stats = await settleWithin(producer.getStats(), MEDIA_STATS_TIMEOUT_MS, 'producer.getStats');
   let bytes = 0;
   for (const item of stats) {
     if (item.type === 'inbound-rtp') bytes += Number(item.byteCount) || 0;
@@ -1935,7 +3026,7 @@ async function sampleProducerInboundBytes(producer) {
 
 /** consumer(下りRTP)の送信済みバイト数を取得する */
 async function sampleConsumerOutboundBytes(consumer) {
-  const stats = await consumer.getStats();
+  const stats = await settleWithin(consumer.getStats(), MEDIA_STATS_TIMEOUT_MS, 'consumer.getStats');
   let bytes = 0;
   for (const item of stats) {
     if (item.type === 'outbound-rtp') bytes += Number(item.byteCount) || 0;
@@ -2174,6 +3265,10 @@ async function checkMediaFlow(now = Date.now()) {
         const missing = peer.missingConsumers || (peer.missingConsumers = new Map());
         for (const [producerId, { ownerId, ownerPeer, entry }] of producerOwners) {
           if (ownerId === socketId) continue;
+          if (!canPeerAccessProducer(socketId, ownerId)) {
+            missing.delete(producerId);
+            continue;
+          }
           if (consumed.has(producerId)) {
             missing.delete(producerId);
             continue;
@@ -2234,6 +3329,23 @@ mediaFlowTimer.unref?.();
 
 // ── Transport ─────────────────────────────────────────────
 
+function clearTransportAcceptanceDeadline(transport) {
+  const timer = transportAcceptanceTimers.get(transport);
+  if (timer) clearTimeout(timer);
+  transportAcceptanceTimers.delete(transport);
+}
+
+function armTransportAcceptanceDeadline(transport) {
+  clearTransportAcceptanceDeadline(transport);
+  const timer = setTimeout(() => {
+    if (transportAcceptanceTimers.get(transport) !== timer) return;
+    transportAcceptanceTimers.delete(transport);
+    if (!transport.closed) transport.close();
+  }, TRANSPORT_ACCEPT_TIMEOUT_MS);
+  timer.unref?.();
+  transportAcceptanceTimers.set(transport, timer);
+}
+
 async function createWebRtcTransport(router, forceTcp = false, peer = null) {
   const { listenIps, initialAvailableOutgoingBitrate } = config.mediasoup.webRtcTransport;
   // クライアントの要求(forceTcp)・サーバー設定(FORCE_TCP/PREFER_TCP)・
@@ -2252,7 +3364,9 @@ async function createWebRtcTransport(router, forceTcp = false, peer = null) {
   if (webRtcServer && !webRtcServer.closed) options.webRtcServer = webRtcServer;
   else options.listenIps = listenIps;
   const transport = await router.createWebRtcTransport(options);
-  transport.on('dtlsstatechange', state => { if (state === 'closed') transport.close(); });
+  transport.on('dtlsstatechange', state => {
+    if ((state === 'failed' || state === 'closed') && !transport.closed) transport.close();
+  });
 
   // ICEが disconnected のまま一定時間復帰しなければ強制クローズする。
   // クライアントの再接続/自己回復に任せることで、劣化経路で残り続ける
@@ -2272,6 +3386,7 @@ async function createWebRtcTransport(router, forceTcp = false, peer = null) {
   });
 
   transport.on('close', () => {
+    clearTransportAcceptanceDeadline(transport);
     if (iceDisconnectTimer) { clearTimeout(iceDisconnectTimer); iceDisconnectTimer = null; }
     peer?.transports.delete(transport.id);
     console.log('[Transport] closed');
@@ -2284,8 +3399,18 @@ async function createWebRtcTransport(router, forceTcp = false, peer = null) {
 io.on('connection', async socket => {
   console.log(`[+] connect  ${socket.id}`);
 
+  const securityAddress = socket.data.securityAddress || socketAddress(socket);
+  connectionsByIp.set(securityAddress, (connectionsByIp.get(securityAddress) || 0) + 1);
+  socket.once('disconnect', () => {
+    const nextCount = Math.max(0, (connectionsByIp.get(securityAddress) || 1) - 1);
+    if (nextCount === 0) connectionsByIp.delete(securityAddress);
+    else connectionsByIp.set(securityAddress, nextCount);
+  });
+  installSocketRateLimit(socket);
+
   peers[socket.id] = {
     socket,
+    securityAddress,
     locationName: '接続中...',
     appType: 'client',
     appVersion: '',
@@ -2300,6 +3425,7 @@ io.on('connection', async socket => {
     telemetryRecoveryAt: 0,
     mediaStallRecoveryAt: 0,
     mediaStallStrikes: 0,
+    mediaGeneration: 0,
     mediaRecovering: false,   // 復旧中（本人=スピナー、他拠点=「サーバー接続中」表示）
     mediaRecoveringSince: 0,
     socketDisconnectedAt: null, // 切断猶予(仮セッション)の開始時刻
@@ -2312,6 +3438,9 @@ io.on('connection', async socket => {
     transports: new Map(),
     producers: new Map(),
     consumers: new Map(),
+    pendingTransports: new Set(),
+    pendingProducers: new Set(),
+    pendingConsumes: new Map(),
     viewerPresenceActive: false,
   };
 
@@ -2411,7 +3540,7 @@ io.on('connection', async socket => {
         });
       }
       socket.emit('systemStateUpdated', {
-        ...getSystemStateSnapshot(),
+        ...getSystemStateSnapshot(socket.id),
         self: {
           socketId: socket.id,
           channelId: peer.channelId,
@@ -2432,7 +3561,9 @@ io.on('connection', async socket => {
     peer.telemetry = clean;
     peer.appType = clean.appType || peer.appType || 'client';
     peer.appVersion = clean.appVersion || peer.appVersion || '';
-    peer.channelId = clean.channelId || peer.channelId || DEFAULT_CHANNELS[0].id;
+    // Channel membership is authoritative server state. Delayed telemetry from
+    // before a move/private call must never roll it back or join a guessed
+    // private channel.
     if (clean.locationName) peer.locationName = clean.locationName;
     if (Number.isFinite(clean.connection?.telemetryRttMs)) {
       peer.rttMs = Math.round(clean.connection.telemetryRttMs);
@@ -2475,7 +3606,7 @@ io.on('connection', async socket => {
   socket.on('getSystemState', (_, callback) => {
     const peer = peers[socket.id];
     safeCallback(callback, {
-      ...getSystemStateSnapshot(),
+      ...getSystemStateSnapshot(socket.id),
       self: peer ? {
         socketId: socket.id,
         channelId: peer.channelId,
@@ -2493,7 +3624,7 @@ io.on('connection', async socket => {
     safeCallback(callback, {
       ok: result.ok,
       channelId: result.channelId,
-      systemState: getSystemStateSnapshot(),
+      systemState: getSystemStateSnapshot(socket.id),
     });
   });
 
@@ -2509,7 +3640,7 @@ io.on('connection', async socket => {
       return safeCallback(callback, {
         ok: true,
         channel: existing,
-        systemState: getSystemStateSnapshot(),
+        systemState: getSystemStateSnapshot(socket.id),
       });
     }
 
@@ -2579,7 +3710,7 @@ io.on('connection', async socket => {
       ok: true,
       targetSocketId,
       channelId: result.channelId,
-      systemState: getSystemStateSnapshot(),
+      systemState: getSystemStateSnapshot(socket.id),
     });
   });
 
@@ -2678,14 +3809,47 @@ io.on('connection', async socket => {
 
   // ── Transport 生成 ──
   socket.on('createWebRtcTransport', async (payload = {}, callback) => {
+    let resourceReserved = false;
+    let peerReservation = null;
     try {
       const peer = getPeerForRequest(socket, callback);
       if (!peer) return;
-      if (!router) return safeCallback(callback, { error: 'router not ready' });
-      const { forceTcp } = asObject(payload);
-      const transport = await createWebRtcTransport(router, !!forceTcp, peer);
+      const currentRouter = router;
+      const mediaGeneration = peer.mediaGeneration;
+      if (!currentRouter || recovering) return safeCallback(callback, { error: 'router not ready' });
+      if (peer.transports.size + peer.pendingTransports.size >= MAX_TRANSPORTS_PER_PEER) {
+        return safeCallback(callback, { error: 'transport limit reached' });
+      }
+      const pendingToken = {};
+      peer.pendingTransports.add(pendingToken);
+      peerReservation = { peer, pendingToken };
+      if (!reserveServerResource('transports', MAX_TOTAL_TRANSPORTS)) {
+        return safeCallback(callback, { error: 'server transport capacity reached' });
+      }
+      resourceReserved = true;
+      const request = asObject(payload);
+      const { forceTcp } = request;
+      const expectsClientAcceptance = request.supportsTransportLease === true;
+      const transport = await createWebRtcTransport(currentRouter, !!forceTcp, peer);
+      releaseServerResourceReservation('transports');
+      resourceReserved = false;
+      if (
+        peers[socket.id] !== peer || !socket.connected ||
+        peer.mediaGeneration !== mediaGeneration || router !== currentRouter ||
+        recovering || transport.closed ||
+        peer.transports.size + peer.pendingTransports.size > MAX_TRANSPORTS_PER_PEER ||
+        serverResourceLoad('transports') >= MAX_TOTAL_TRANSPORTS
+      ) {
+        try { transport.close(); } catch (_) {}
+        return safeCallback(callback, { error: 'session changed while creating transport' });
+      }
       peer.transports.set(transport.id, transport);
+      // 更新済みクライアントが「ローカルtransportの生成完了」を返すまでだけ
+      // 期限を設ける。ACK喪失の孤児は回収しつつ、空室で正常に待機する
+      // lazy send/recv transportをDTLS未接続だけで閉じない。旧クライアントは期限対象外。
+      if (expectsClientAcceptance) armTransportAcceptanceDeadline(transport);
       safeCallback(callback, {
+        transportLeaseRequired: expectsClientAcceptance,
         params: {
           id:              transport.id,
           iceParameters:   transport.iceParameters,
@@ -2696,7 +3860,20 @@ io.on('connection', async socket => {
     } catch (err) {
       console.error('[createWebRtcTransport]', err);
       safeCallback(callback, { error: err.message });
+    } finally {
+      if (resourceReserved) releaseServerResourceReservation('transports');
+      if (peerReservation) peerReservation.peer.pendingTransports.delete(peerReservation.pendingToken);
     }
+  });
+
+  socket.on('acceptTransport', (payload = {}, callback) => {
+    const peer = getPeerForRequest(socket, callback);
+    if (!peer) return;
+    const transportId = shortString(asObject(payload).transportId, 128);
+    const transport = peer.transports.get(transportId);
+    if (!transport || transport.closed) return safeCallback(callback, { error: 'transport not found' });
+    clearTransportAcceptanceDeadline(transport);
+    safeCallback(callback, { ok: true });
   });
 
   // ── Transport 明示クローズ ──
@@ -2724,10 +3901,7 @@ io.on('connection', async socket => {
     if (!peer) return;
     const { consumerId } = asObject(payload);
     const consumer = peer.consumers.get(consumerId);
-    if (consumer) {
-      try { consumer.close(); } catch (_) {}
-      peer.consumers.delete(consumerId);
-    }
+    if (consumer) closePeerConsumer(peer, consumer);
     safeCallback(callback, { ok: true });
   });
 
@@ -2736,6 +3910,7 @@ io.on('connection', async socket => {
     try {
       const peer = getPeerForRequest(socket, callback);
       if (!peer) return;
+      const mediaGeneration = peer.mediaGeneration;
       const { transportId, dtlsParameters } = asObject(payload);
       const transport = peer.transports.get(transportId);
       if (!transport) return safeCallback(callback, { error: 'transport not found' });
@@ -2743,6 +3918,14 @@ io.on('connection', async socket => {
       // ここまで来てもメディアが確立しない＝シグナリングは通るがUDPが遮断されている。
       transport.appData.connectRequestedAt = Date.now();
       await transport.connect({ dtlsParameters });
+      if (
+        peers[socket.id] !== peer || !socket.connected ||
+        peer.mediaGeneration !== mediaGeneration ||
+        peer.transports.get(transportId) !== transport || transport.closed
+      ) {
+        try { transport.close(); } catch (_) {}
+        return safeCallback(callback, { error: 'session changed while connecting transport' });
+      }
       safeCallback(callback, {});
     } catch (err) {
       safeCallback(callback, { error: err.message });
@@ -2751,22 +3934,49 @@ io.on('connection', async socket => {
 
   // ── Produce（映像/音声の送信開始）──
   socket.on('produce', async (payload = {}, callback) => {
+    let resourceReserved = false;
+    let peerReservation = null;
     try {
       const peer = getPeerForRequest(socket, callback);
       if (!peer) return;
+      const mediaGeneration = peer.mediaGeneration;
+      if (peer.producers.size + peer.pendingProducers.size >= MAX_PRODUCERS_PER_PEER) {
+        return safeCallback(callback, { error: 'producer limit reached' });
+      }
+      const pendingToken = {};
+      peer.pendingProducers.add(pendingToken);
+      peerReservation = { peer, pendingToken };
       const { transportId, kind, rtpParameters } = asObject(payload);
       const appData = asObject(payload.appData);
       if (!['audio', 'video'].includes(kind)) return safeCallback(callback, { error: 'invalid producer kind' });
       const transport = peer.transports.get(transportId);
-      if (!transport) return safeCallback(callback, { error: 'transport not found' });
+      if (!transport || transport.closed) return safeCallback(callback, { error: 'transport not found' });
+      if (!reserveServerResource('producers', MAX_TOTAL_PRODUCERS)) {
+        return safeCallback(callback, { error: 'server producer capacity reached' });
+      }
+      resourceReserved = true;
       const source = sanitizeProducerSource(kind, appData);
       const producerAppData = {
-        ...appData,
         source,
         appType: peer.appType,
         channelId: peer.channelId,
+        label: shortString(appData.label, 160),
+        sourceName: shortString(appData.sourceName, 160),
       };
       const producer = await transport.produce({ kind, rtpParameters, appData: producerAppData });
+      releaseServerResourceReservation('producers');
+      resourceReserved = false;
+
+      if (
+        peers[socket.id] !== peer || !socket.connected ||
+        peer.mediaGeneration !== mediaGeneration ||
+        peer.transports.get(transportId) !== transport || transport.closed || producer.closed ||
+        peer.producers.size + peer.pendingProducers.size > MAX_PRODUCERS_PER_PEER ||
+        serverResourceLoad('producers') >= MAX_TOTAL_PRODUCERS
+      ) {
+        try { producer.close(); } catch (_) {}
+        return safeCallback(callback, { error: 'session changed while creating producer' });
+      }
 
       peer.producers.set(producer.id, {
         producer,
@@ -2800,7 +4010,7 @@ io.on('connection', async socket => {
       });
 
       // 他の全ピアへ通知（拠点名・kind・paused 状態も含む）
-      socket.broadcast.emit('newProducer', {
+      emitProducerEvent(socket.id, 'newProducer', {
         producerId:    producer.id,
         socketId:      socket.id,
         locationName:  peer.locationName,
@@ -2815,46 +4025,96 @@ io.on('connection', async socket => {
     } catch (err) {
       console.error('[produce]', err);
       safeCallback(callback, { error: err.message });
+    } finally {
+      if (resourceReserved) releaseServerResourceReservation('producers');
+      if (peerReservation) peerReservation.peer.pendingProducers.delete(peerReservation.pendingToken);
     }
   });
 
   // ── Consume（他拠点の受信開始）──
   socket.on('consume', async (payload = {}, callback) => {
+    let resourceReserved = false;
+    let pendingConsumeContext = null;
     try {
       const peer = getPeerForRequest(socket, callback);
       if (!peer) return;
-      if (!router) return safeCallback(callback, { error: 'router not ready' });
-      const { transportId, producerId, rtpCapabilities } = asObject(payload);
+      const currentRouter = router;
+      const mediaGeneration = peer.mediaGeneration;
+      if (!currentRouter) return safeCallback(callback, { error: 'router not ready' });
+      if (peer.consumers.size + peer.pendingConsumes.size >= MAX_CONSUMERS_PER_PEER) {
+        return safeCallback(callback, { error: 'consumer limit reached' });
+      }
+      const data = asObject(payload);
+      const transportId = shortString(data.transportId, 128);
+      const producerId = shortString(data.producerId, 128);
+      const rtpCapabilities = data.rtpCapabilities;
+      if (!producerId) return safeCallback(callback, { error: 'producerId is required' });
       const transport = peer.transports.get(transportId);
-      if (!transport) return safeCallback(callback, { error: 'transport not found' });
+      if (!transport || transport.closed) return safeCallback(callback, { error: 'transport not found' });
       const owner = findProducerOwner(producerId);
       if (!owner) return safeCallback(callback, { error: 'producer not found' });
       if (owner.peerId === socket.id) return safeCallback(callback, { error: 'cannot consume own producer' });
-      if (!router.canConsume({ producerId, rtpCapabilities })) {
+      if (!canPeerAccessProducer(socket.id, owner.peerId)) {
+        return safeCallback(callback, { error: 'producer is not available in this private channel' });
+      }
+      const existingConsumer = Array.from(peer.consumers.values())
+        .find(consumer => !consumer.closed && consumer.producerId === producerId);
+      if (existingConsumer) {
+        const createdAt = Number(existingConsumer.appData?.createdAt) || Date.now();
+        if (!existingConsumer.appData?.resumedByClient && Date.now() - createdAt >= CONSUMER_RESUME_TIMEOUT_MS) {
+          closePeerConsumer(peer, existingConsumer);
+        } else {
+          return safeCallback(callback, { error: 'producer is already being consumed' });
+        }
+      }
+      if (peer.pendingConsumes.has(producerId)) {
+        return safeCallback(callback, { error: 'consumer creation already in progress' });
+      }
+      const pendingToken = {};
+      peer.pendingConsumes.set(producerId, pendingToken);
+      pendingConsumeContext = { peer, producerId, pendingToken };
+      if (!currentRouter.canConsume({ producerId, rtpCapabilities })) {
         return safeCallback(callback, { error: 'cannot consume' });
       }
-      const consumer = await transport.consume({ producerId, rtpCapabilities, paused: true });
+      if (!reserveServerResource('consumers', MAX_TOTAL_CONSUMERS)) {
+        return safeCallback(callback, { error: 'server consumer capacity reached' });
+      }
+      resourceReserved = true;
+      const consumer = await transport.consume({
+        producerId,
+        rtpCapabilities,
+        paused: true,
+        appData: { createdAt: Date.now(), resumedByClient: false },
+      });
+      releaseServerResourceReservation('consumers');
+      resourceReserved = false;
 
-      peer.consumers.set(consumer.id, consumer);
-
-      // このピアが受信画質を設定済みなら、新しい consumer にも適用する
-      if (consumer.kind === 'video' && peer.recvQuality && peer.recvQuality !== 'high') {
-        try {
-          await consumer.setPreferredLayers({
-            spatialLayer: recvQualityToSpatialLayer(peer.recvQuality),
-            temporalLayer: 2,
-          });
-        } catch (_) { /* simulcastでない場合は無視 */ }
+      const currentOwner = findProducerOwner(producerId);
+      if (
+        peers[socket.id] !== peer || !socket.connected ||
+        peer.mediaGeneration !== mediaGeneration || router !== currentRouter ||
+        peer.transports.get(transportId) !== transport || transport.closed || consumer.closed ||
+        !currentOwner || currentOwner.peerId !== owner.peerId ||
+        !canPeerAccessProducer(socket.id, owner.peerId) ||
+        Array.from(peer.consumers.values()).some(item => (
+          !item.closed && item.producerId === producerId
+        )) ||
+        peer.consumers.size + peer.pendingConsumes.size > MAX_CONSUMERS_PER_PEER ||
+        serverResourceLoad('consumers') >= MAX_TOTAL_CONSUMERS
+      ) {
+        try { consumer.close(); } catch (_) {}
+        return safeCallback(callback, { error: 'session changed while creating consumer' });
       }
 
+      peer.consumers.set(consumer.id, consumer);
+      armConsumerResumeDeadline(peer, consumer);
+
       consumer.on('transportclose', () => {
-        consumer.close();
-        peers[socket.id]?.consumers.delete(consumer.id);
+        closePeerConsumer(peers[socket.id], consumer);
       });
       consumer.on('producerclose', () => {
         socket.emit('producerClosed', { producerId });
-        consumer.close();
-        peers[socket.id]?.consumers.delete(consumer.id);
+        closePeerConsumer(peers[socket.id], consumer);
       });
 
       safeCallback(callback, {
@@ -2865,9 +4125,26 @@ io.on('connection', async socket => {
           rtpParameters: consumer.rtpParameters,
         },
       });
+
+      // ACKを画質レイヤ設定待ちにしない。ACKがクライアント側でtimeoutすると、
+      // IDを知らないpaused consumerが残り再consume不能になるため、設定は非同期で行う。
+      if (consumer.kind === 'video' && peer.recvQuality && peer.recvQuality !== 'high') {
+        consumer.setPreferredLayers({
+          spatialLayer: recvQualityToSpatialLayer(peer.recvQuality),
+          temporalLayer: 2,
+        }).catch(() => { /* simulcastでない場合は無視 */ });
+      }
     } catch (err) {
       console.error('[consume]', err);
       safeCallback(callback, { error: err.message });
+    } finally {
+      if (resourceReserved) releaseServerResourceReservation('consumers');
+      if (
+        pendingConsumeContext &&
+        pendingConsumeContext.peer.pendingConsumes.get(pendingConsumeContext.producerId) === pendingConsumeContext.pendingToken
+      ) {
+        pendingConsumeContext.peer.pendingConsumes.delete(pendingConsumeContext.producerId);
+      }
     }
   });
 
@@ -2913,17 +4190,36 @@ io.on('connection', async socket => {
     try {
       const peer = getPeerForRequest(socket, callback);
       if (!peer) return;
+      const mediaGeneration = peer.mediaGeneration;
       const { consumerId } = asObject(payload);
       const consumer = peer.consumers.get(consumerId);
       if (!consumer) return safeCallback(callback, { error: 'consumer not found' });
       // クライアントが受信を希望した記録。カメラOFF(配信停止)中はここでは
       // 再開せず、送信側の resumeProducer 時にまとめて再開する。
       consumer.appData.resumedByClient = true;
+      clearConsumerResumeDeadline(consumer);
       const owner = findProducerOwner(consumer.producerId);
       if (owner?.entry && isCameraRelayControlled(owner.entry) && owner.entry.paused) {
         return safeCallback(callback, {});
       }
-      await consumer.resume();
+      try {
+        await consumer.resume();
+      } catch (err) {
+        if (peer.consumers.get(consumerId) === consumer && !consumer.closed) {
+          consumer.appData.resumedByClient = false;
+          consumer.appData.createdAt = Date.now();
+          armConsumerResumeDeadline(peer, consumer);
+        }
+        throw err;
+      }
+      if (
+        peers[socket.id] !== peer || !socket.connected ||
+        peer.mediaGeneration !== mediaGeneration ||
+        peer.consumers.get(consumerId) !== consumer || consumer.closed
+      ) {
+        closePeerConsumer(peer, consumer);
+        return safeCallback(callback, { error: 'session changed while resuming consumer' });
+      }
       safeCallback(callback, {});
     } catch (err) {
       safeCallback(callback, { error: err.message });
@@ -2935,10 +4231,18 @@ io.on('connection', async socket => {
     try {
       const peer = getPeerForRequest(socket, callback);
       if (!peer) return;
+      const mediaGeneration = peer.mediaGeneration;
       const { transportId } = asObject(payload);
       const transport = peer.transports.get(transportId);
       if (!transport) return safeCallback(callback, { error: 'transport not found' });
       const iceParameters = await transport.restartIce();
+      if (
+        peers[socket.id] !== peer || !socket.connected ||
+        peer.mediaGeneration !== mediaGeneration ||
+        peer.transports.get(transportId) !== transport || transport.closed
+      ) {
+        return safeCallback(callback, { error: 'session changed while restarting ICE' });
+      }
       safeCallback(callback, { iceParameters });
     } catch (err) {
       safeCallback(callback, { error: err.message });
@@ -2950,6 +4254,7 @@ io.on('connection', async socket => {
     const list = [];
     for (const [peerId, peerInfo] of Object.entries(peers)) {
       if (peerId === socket.id) continue;
+      if (!canPeerAccessProducer(socket.id, peerId)) continue;
       for (const [producerId, entry] of peerInfo.producers.entries()) {
         list.push({
           ...publicProducer(producerId, entry),
@@ -2969,6 +4274,8 @@ io.on('connection', async socket => {
   socket.on('getPeers', (_, callback) => {
     const list = [];
     for (const [peerId, peerInfo] of Object.entries(peers)) {
+      const privateSession = getPrivateSessionForSocket(peerId);
+      if (privateSession && !privateSession.members.has(socket.id)) continue;
       const producers = Array.from(peerInfo.producers.entries())
         .map(([producerId, entry]) => publicProducer(producerId, entry));
       list.push({
@@ -3005,7 +4312,7 @@ io.on('connection', async socket => {
         await entry.producer.pause();
         entry.paused = true;
       }
-      socket.broadcast.emit('producerPaused', { producerId, socketId: socket.id });
+      emitProducerEvent(socket.id, 'producerPaused', { producerId, socketId: socket.id });
       callback?.({});
     } catch (err) {
       callback?.({ error: err.message });
@@ -3025,7 +4332,7 @@ io.on('connection', async socket => {
         await entry.producer.resume();
         entry.paused = false;
       }
-      socket.broadcast.emit('producerResumed', { producerId, socketId: socket.id });
+      emitProducerEvent(socket.id, 'producerResumed', { producerId, socketId: socket.id });
       callback?.({});
     } catch (err) {
       callback?.({ error: err.message });
@@ -3041,7 +4348,7 @@ io.on('connection', async socket => {
       if (!entry) return callback?.({ error: 'not found' });
       try { entry.producer.close(); } catch (_) {}
       peer.producers.delete(producerId);
-      socket.broadcast.emit('producerClosed', { producerId, socketId: socket.id });
+      emitProducerEvent(socket.id, 'producerClosed', { producerId, socketId: socket.id });
       callback?.({});
     } catch (err) {
       callback?.({ error: err.message });
@@ -3165,16 +4472,9 @@ if (process.send) {
         fromAppType: 'server-gui',
       }, 'server-gui');
     } else if (msg.type === 'set-update-dir') {
-      const dir = shortString(msg.dir, 1024);
-      if (dir && fs.existsSync(dir)) {
-        updateDir = dir;
-        sendAdminLog(`[Updates] 配布フォルダを設定: ${dir} (${listUpdateFiles().length}ファイル)`);
-      } else if (!dir) {
-        updateDir = null;
-        sendAdminLog('[Updates] 配布フォルダを解除しました');
-      } else {
-        sendAdminLog(`[Updates] 配布フォルダが見つかりません: ${dir}`);
-      }
+      void configureUpdateDirectory(msg.dir, 'server-gui').catch(err => {
+        sendAdminLog(`[Updates] 配布フォルダの非同期検証に失敗: ${err.message}`);
+      });
     } else if (msg.type === 'set-system-state') {
       applySystemStatePatch(msg.state || {}, 'server-gui');
     } else if (msg.type === 'set-recording-settings') {
@@ -3227,6 +4527,15 @@ async function run() {
   await createRouter();
   server.listen(config.listenPort, config.listenIp, () => {
     console.log(`[SFU] listening on ${config.listenIp}:${config.listenPort}`);
+  });
+  // 遅い/オフラインの NAS は配布機能だけを待たせ、SFU 起動は妨げない。
+  if (initialUpdateDir) {
+    void configureUpdateDirectory(initialUpdateDir, 'environment').catch(err => {
+      sendAdminLog(`[Updates] 起動時の配布フォルダ検証に失敗: ${err.message}`);
+    });
+  }
+  void ensureRingtonesDirectory().catch(err => {
+    console.warn('[Ringtones] ディレクトリを初期化できません:', err.message);
   });
 }
 

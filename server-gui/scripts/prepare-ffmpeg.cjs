@@ -13,76 +13,94 @@
 
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
+
+const integrityManifest = require('./binary-integrity-manifest.cjs');
+const {
+  downloadVerified,
+  installVerifiedFile,
+  isVerifiedFile,
+} = require('./binary-integrity.cjs');
 
 const rootDir = path.resolve(__dirname, '..');
 const serverModules = path.resolve(rootDir, '..', 'server', 'node_modules');
 const outRoot = path.join(rootDir, 'resources', 'ffmpeg');
 
 const ffmpegStaticPkg = require(path.join(serverModules, 'ffmpeg-static', 'package.json'));
+const ffprobeStaticPkg = require(path.join(serverModules, 'ffprobe-static', 'package.json'));
 const releaseTag = ffmpegStaticPkg['ffmpeg-static']['binary-release-tag']; // 例: b6.1.1
+const allowedHosts = integrityManifest.allowedDownloadHosts;
 
-const targets = [
-  { platform: 'darwin', arch: 'arm64' },
-  { platform: 'win32', arch: 'x64' },
-];
-
-function download(url, dest) {
-  return new Promise((resolve, reject) => {
-    const request = https.get(url, response => {
-      if ([301, 302, 303, 307, 308].includes(response.statusCode)) {
-        response.resume();
-        download(response.headers.location, dest).then(resolve, reject);
-        return;
-      }
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`download failed ${response.statusCode}: ${url}`));
-        return;
-      }
-      const out = fs.createWriteStream(dest);
-      response.pipe(out);
-      out.on('finish', () => out.close(resolve));
-      out.on('error', reject);
-    });
-    request.on('error', reject);
-  });
+if (ffmpegStaticPkg.version !== integrityManifest.ffmpegStatic.packageVersion ||
+    releaseTag !== integrityManifest.ffmpegStatic.releaseTag) {
+  throw new Error(
+    `ffmpeg-static ${ffmpegStaticPkg.version}/${releaseTag} does not match pinned manifest ` +
+    `${integrityManifest.ffmpegStatic.packageVersion}/${integrityManifest.ffmpegStatic.releaseTag}`,
+  );
+}
+if (ffprobeStaticPkg.version !== integrityManifest.ffprobeStatic.packageVersion) {
+  throw new Error(
+    `ffprobe-static ${ffprobeStaticPkg.version} does not match pinned manifest ` +
+    integrityManifest.ffprobeStatic.packageVersion,
+  );
 }
 
+const targets = [
+  { platform: 'darwin', arch: 'arm64', key: 'darwin-arm64' },
+  { platform: 'win32', arch: 'x64', key: 'win32-x64' },
+].map(target => ({
+  ...target,
+  ffmpeg: integrityManifest.ffmpegStatic.targets[target.key],
+  ffprobe: integrityManifest.ffprobeStatic.targets[target.key],
+}));
+
 async function prepareTarget(target) {
-  const dir = path.join(outRoot, `${target.platform}-${target.arch}`);
+  const dir = path.join(outRoot, target.key);
   fs.mkdirSync(dir, { recursive: true });
-  const exeSuffix = target.platform === 'win32' ? '.exe' : '';
 
-  // ffprobe: ffprobe-static は全プラットフォーム同梱
-  const probeSrc = path.join(serverModules, 'ffprobe-static', 'bin', target.platform, target.arch, `ffprobe${exeSuffix}`);
-  const probeDest = path.join(dir, `ffprobe${exeSuffix}`);
-  if (fs.existsSync(probeSrc)) {
-    fs.copyFileSync(probeSrc, probeDest);
-    fs.chmodSync(probeDest, 0o755);
-    console.log(`[prepare-ffmpeg] ffprobe ${target.platform}-${target.arch}: copied from ffprobe-static`);
-  } else {
-    console.warn(`[prepare-ffmpeg] WARN: ffprobe not found for ${target.platform}-${target.arch}: ${probeSrc}`);
-  }
+  // ffprobe-static includes both target binaries in the locked npm package.
+  const probeSrc = path.join(
+    serverModules,
+    'ffprobe-static',
+    'bin',
+    target.platform,
+    target.arch,
+    target.ffprobe.binaryName,
+  );
+  const probeDest = path.join(dir, target.ffprobe.binaryName);
+  if (!fs.existsSync(probeSrc)) throw new Error(`ffprobe not found: ${probeSrc}`);
+  const probeInstall = await installVerifiedFile(
+    probeSrc,
+    probeDest,
+    target.ffprobe.binary,
+    { mode: 0o755 },
+  );
+  console.log(
+    `[prepare-ffmpeg] ffprobe ${target.key}: ` +
+    (probeInstall.reused ? 'existing SHA-256 verified' : 'copied and SHA-256 verified'),
+  );
 
-  // ffmpeg
-  const dest = path.join(dir, `ffmpeg${exeSuffix}`);
-  if (fs.existsSync(dest) && fs.statSync(dest).size > 10_000_000) {
-    console.log(`[prepare-ffmpeg] ffmpeg ${target.platform}-${target.arch}: already prepared`);
+  const dest = path.join(dir, target.ffmpeg.binaryName);
+  if (await isVerifiedFile(dest, target.ffmpeg.binary)) {
+    await fs.promises.chmod(dest, 0o755).catch(() => {});
+    console.log(`[prepare-ffmpeg] ffmpeg ${target.key}: existing SHA-256 verified`);
     return;
+  }
+  if (fs.existsSync(dest)) {
+    console.warn(`[prepare-ffmpeg] existing ffmpeg ${target.key} failed integrity verification; replacing it`);
   }
   if (target.platform === process.platform && target.arch === process.arch) {
     const src = require(path.join(serverModules, 'ffmpeg-static'));
-    fs.copyFileSync(src, dest);
-    fs.chmodSync(dest, 0o755);
-    console.log(`[prepare-ffmpeg] ffmpeg ${target.platform}-${target.arch}: copied from local ffmpeg-static`);
+    await installVerifiedFile(src, dest, target.ffmpeg.binary, { mode: 0o755 });
+    console.log(`[prepare-ffmpeg] ffmpeg ${target.key}: copied and SHA-256 verified`);
     return;
   }
-  const url = `https://github.com/eugeneware/ffmpeg-static/releases/download/${releaseTag}/ffmpeg-${target.platform}-${target.arch}`;
-  console.log(`[prepare-ffmpeg] downloading ${url}`);
-  await download(url, dest);
-  fs.chmodSync(dest, 0o755);
-  console.log(`[prepare-ffmpeg] ffmpeg ${target.platform}-${target.arch}: downloaded (${Math.round(fs.statSync(dest).size / 1024 / 1024)}MB)`);
+  const url = `https://github.com/eugeneware/ffmpeg-static/releases/download/${releaseTag}/ffmpeg-${target.key}`;
+  console.log(`[prepare-ffmpeg] downloading pinned ${url}`);
+  await downloadVerified(url, dest, target.ffmpeg.binary, {
+    allowedHosts,
+    mode: 0o755,
+  });
+  console.log(`[prepare-ffmpeg] ffmpeg ${target.key}: downloaded and SHA-256 verified`);
 }
 
 (async () => {

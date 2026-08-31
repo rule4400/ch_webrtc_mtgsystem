@@ -1,0 +1,201 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+
+jobs:
+  node-syntax:
+    name: Node syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+
+      - name: Check Node and Electron entry points
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=(
+            server/index.js
+            server/config.js
+            server/recording.js
+            server/published-files.js
+            server/scripts/test-recording-stability.cjs
+            server/scripts/test-published-files.cjs
+            server/scripts/smoke-signaling.cjs
+            server-gui/main.cjs
+            server-gui/private-file.cjs
+            server-gui/preload.cjs
+            server-gui/update-folder.cjs
+            server-gui/scripts/binary-integrity-manifest.cjs
+            server-gui/scripts/binary-integrity.cjs
+            server-gui/scripts/prepare-bundled-server.cjs
+            server-gui/scripts/prepare-ffmpeg.cjs
+            server-gui/scripts/test-private-file.cjs
+            server-gui/scripts/test-update-scan.cjs
+            server-gui/scripts/verify-binary-manifest.cjs
+            client/electron/main.cjs
+            client/electron/preload.cjs
+            client/electron/window-state.cjs
+            client/watchdog.js
+            screen-share/electron/main.cjs
+            screen-share/electron/preload.cjs
+            viewer/electron/main.cjs
+            viewer/electron/preload.cjs
+            viewer/electron/window-state.cjs
+            recording-viewer/main.cjs
+            recording-viewer/media-file.cjs
+            recording-viewer/private-file.cjs
+            recording-viewer/preload.cjs
+            recording-viewer/scripts/test-media-file.cjs
+            tools/check-sfu-connectivity.cjs
+            tools/check-inline-scripts.cjs
+            tools/check-version-consistency.cjs
+            tools/check-last-frame-policy.cjs
+          )
+          for file in "${files[@]}"; do
+            echo "Checking ${file}"
+            node --check "${file}"
+          done
+
+      - name: Check inline HTML scripts
+        run: >-
+          node tools/check-inline-scripts.cjs
+          server-gui/index.html
+          recording-viewer/ui/recordings.html
+          server/public/recordings.html
+
+      - name: Check application versions
+        run: node tools/check-version-consistency.cjs
+
+      - name: Verify pinned release-binary manifest
+        run: node server-gui/scripts/verify-binary-manifest.cjs
+
+      - name: Check 20-second last-frame policy
+        run: node tools/check-last-frame-policy.cjs
+
+  renderer:
+    name: Renderer (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - client
+          - screen-share
+          - viewer
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ matrix.package }}/package-lock.json
+
+      - name: Install locked dependencies
+        working-directory: ${{ matrix.package }}
+        run: npm ci
+
+      - name: Lint
+        working-directory: ${{ matrix.package }}
+        run: npm run lint
+
+      - name: Build renderer
+        working-directory: ${{ matrix.package }}
+        run: npm run build
+
+      - name: Audit dependencies
+        working-directory: ${{ matrix.package }}
+        run: npm audit --audit-level=low
+
+  desktop-dependencies:
+    name: Desktop install (${{ matrix.package }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - recording-viewer
+          - server-gui
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ matrix.package }}/package-lock.json
+
+      - name: Install locked dependencies
+        working-directory: ${{ matrix.package }}
+        run: npm ci
+
+      - name: Audit dependencies
+        working-directory: ${{ matrix.package }}
+        run: npm audit --audit-level=low
+
+      - name: Test recording media path safety
+        if: matrix.package == 'recording-viewer'
+        working-directory: recording-viewer
+        run: npm test
+
+      - name: Test private settings persistence
+        if: matrix.package == 'server-gui'
+        working-directory: server-gui
+        run: npm test
+
+  server-smoke:
+    name: Server smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Audit server dependencies
+        working-directory: server
+        run: npm audit --audit-level=low
+
+      - name: Run signaling smoke test
+        working-directory: server
+        run: npm test

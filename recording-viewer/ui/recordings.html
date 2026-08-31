@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' recmedia: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'">
 <title>録画タイムライン - CHECKHOUSE Meeting System</title>
 <!--
   録画タイムライン再生UI
@@ -343,6 +344,7 @@
         サーバーに接続（稼働中の会議サーバーから再生）
       </label>
       <input id="srcServerUrl" placeholder="例: http://192.168.10.5:3000" style="background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px;">
+      <input id="srcAccessToken" type="password" autocomplete="new-password" placeholder="録画閲覧トークン（RECORDING_ACCESS_TOKEN）" style="background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px;">
       <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
         <input type="radio" name="srcMode" value="folder" id="srcModeFolder">
         フォルダを直接読む（NAS・ローカルの録画データ）
@@ -421,6 +423,7 @@
 
   // ── データソース抽象化(サーバーHTTP / Electronビューアブリッジ) ──
   const bridge = window.recviewer || null;
+  let dataSourceGeneration = 0;
   const ds = bridge ? {
     mode: () => bridge.mode(),
     status: () => bridge.status(),
@@ -440,9 +443,19 @@
   };
 
   // ── 状態 ──
+  function loadSelectedKeys() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem('rec-selected') || '[]');
+      return Array.isArray(parsed) ? parsed.map(key => String(key)).slice(0, 64) : [];
+    } catch {
+      localStorage.removeItem('rec-selected');
+      return [];
+    }
+  }
+
   const state = {
     locations: [],          // { key, locKey, source, locationName, recording }
-    selected: new Set(JSON.parse(localStorage.getItem('rec-selected') || '[]')),
+    selected: new Set(loadSelectedKeys()),
     dayStartMs: startOfToday(),
     segmentsByKey: new Map(), // key → その日のセグメント配列(startMs昇順)
     currentMs: startOfToday() + 9 * 3600 * 1000,
@@ -488,9 +501,13 @@
 
   // ── 拠点一覧 ──
   async function loadLocations() {
+    const generation = dataSourceGeneration;
     try {
-      state.locations = await ds.locations();
+      const locations = await ds.locations();
+      if (generation !== dataSourceGeneration) return;
+      state.locations = Array.isArray(locations) ? locations : [];
     } catch (err) {
+      if (generation !== dataSourceGeneration) return;
       $('locList').innerHTML = `<div class="empty-note">拠点一覧を取得できません:<br>${escapeHtml(err.message)}</div>`;
       return;
     }
@@ -765,12 +782,21 @@
   // セグメント切替(既定5分ごと)でストリームが終わると自動で再接続する。
 
   let liveTimer = null;
+  let liveGeneration = 0;
+  let liveRefreshInFlight = false;
 
-  async function refreshLiveSessions() {
+  async function refreshLiveSessions(generation = liveGeneration, sourceGeneration = dataSourceGeneration) {
+    if (liveRefreshInFlight) return;
+    liveRefreshInFlight = true;
     try {
-      state.liveSessions = await ds.live();
+      const sessions = await ds.live();
+      if (generation === liveGeneration && sourceGeneration === dataSourceGeneration) {
+        state.liveSessions = Array.isArray(sessions) ? sessions : [];
+      }
     } catch {
-      state.liveSessions = [];
+      if (generation === liveGeneration && sourceGeneration === dataSourceGeneration) state.liveSessions = [];
+    } finally {
+      liveRefreshInFlight = false;
     }
   }
 
@@ -829,6 +855,9 @@
   }
 
   async function setLive(enabled) {
+    const generation = ++liveGeneration;
+    const sourceGeneration = dataSourceGeneration;
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
     state.live = !!enabled;
     const btn = $('liveBtn');
     btn.classList.toggle('live-on', state.live);
@@ -839,17 +868,19 @@
       if (Date.now() < state.dayStartMs || Date.now() >= state.dayStartMs + DAY_MS) {
         setDay(startOfToday());
       }
-      await refreshLiveSessions();
+      await refreshLiveSessions(generation, sourceGeneration);
+      if (generation !== liveGeneration || sourceGeneration !== dataSourceGeneration || !state.live) return;
       if (!state.liveSessions.length) {
         setLiveUnavailableNote();
       }
       for (const [key, tile] of state.tiles) connectLiveTile(key, tile);
       liveTimer = setInterval(async () => {
-        await refreshLiveSessions();
+        if (generation !== liveGeneration || sourceGeneration !== dataSourceGeneration || !state.live) return;
+        await refreshLiveSessions(generation, sourceGeneration);
+        if (generation !== liveGeneration || sourceGeneration !== dataSourceGeneration || !state.live) return;
         liveMaintain();
       }, 2000);
     } else {
-      if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
       for (const tile of state.tiles.values()) {
         tile.liveUrl = null;
         tile.liveBadge.style.display = 'none';
@@ -866,6 +897,31 @@
       tile.norec.style.display = 'flex';
       tile.norec.querySelector('span:last-child').textContent =
         bridge ? 'ライブ視聴はサーバー接続モードでのみ利用できます' : '現在録画中の拠点がありません';
+    }
+  }
+
+  function resetPlaybackForSourceChange() {
+    dataSourceGeneration += 1;
+    liveGeneration += 1;
+    segmentLoadSeq += 1;
+    if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+    state.live = false;
+    state.liveSessions = [];
+    state.audioKey = null;
+    state.segmentsByKey.clear();
+    setPlaying(false);
+    const btn = $('liveBtn');
+    btn.classList.remove('live-on');
+    btn.textContent = '🔴 ライブ';
+    for (const tile of state.tiles.values()) {
+      tile.video.pause();
+      tile.video.removeAttribute('src');
+      tile.video.load();
+      tile.segId = null;
+      tile.pendingSeekSec = null;
+      tile.liveUrl = null;
+      tile.liveReconnectAt = 0;
+      tile.liveBadge.style.display = 'none';
     }
   }
 
@@ -983,8 +1039,10 @@
 
   // ── ステータス表示 ──
   async function loadStatus() {
+    const generation = dataSourceGeneration;
     let status = null;
     try { status = await ds.status(); } catch { /* サーバー未接続など */ }
+    if (generation !== dataSourceGeneration) return;
     const chips = [];
     if (!status) {
       chips.push('<span class="chip bad">状態を取得できません</span>');
@@ -992,21 +1050,26 @@
       chips.push(`<span class="chip ok">フォルダ直読み: ${escapeHtml(status.folder || '')}</span>`);
     } else {
       const s = status.settings || {};
-      chips.push(s.enabled
+      const enabled = status.enabled ?? s.enabled ?? false;
+      const retentionDays = status.retentionDays ?? s.retentionDays;
+      chips.push(enabled
         ? '<span class="chip ok">● 録画有効</span>'
         : '<span class="chip warn">録画停止中</span>');
-      if (s.enabled) {
+      if (enabled) {
         chips.push(status.storageOk
           ? '<span class="chip ok">保存先OK</span>'
-          : `<span class="chip bad">保存先エラー: ${escapeHtml(status.storageError || '')}</span>`);
+          : '<span class="chip bad">保存先エラー</span>');
         if (!status.ffmpegOk) chips.push('<span class="chip bad">ffmpeg未検出</span>');
-        const active = (status.activeSessions || []).filter(x => x.alive).length;
+        const active = Number.isFinite(Number(status.activeCount))
+          ? Number(status.activeCount)
+          : (status.activeSessions || []).filter(x => x.alive).length;
         chips.push(`<span class="chip">録画中 ${active}拠点</span>`);
         if (status.compressionQueue > 0) chips.push(`<span class="chip">圧縮待ち ${status.compressionQueue}</span>`);
-        chips.push(`<span class="chip">保持 ${escapeHtml(String(s.retentionDays))}日</span>`);
+        if (retentionDays != null) chips.push(`<span class="chip">保持 ${escapeHtml(String(retentionDays))}日</span>`);
       }
-      if (status.disk && Number.isFinite(status.disk.freeBytes)) {
-        const freeGb = (status.disk.freeBytes / 1024 / 1024 / 1024).toFixed(0);
+      const freeBytes = status.freeBytes ?? status.disk?.freeBytes;
+      if (Number.isFinite(freeBytes)) {
+        const freeGb = (freeBytes / 1024 / 1024 / 1024).toFixed(0);
         chips.push(`<span class="chip">空き ${freeGb}GB</span>`);
       }
     }
@@ -1024,6 +1087,7 @@
       $('srcModeServer').checked = cfg.mode !== 'folder';
       $('srcModeFolder').checked = cfg.mode === 'folder';
       $('srcServerUrl').value = cfg.serverUrl || '';
+      $('srcAccessToken').value = cfg.accessToken || '';
       pendingFolder = cfg.folder || '';
       pendingDbFolder = cfg.dbFolder || '';
       $('srcFolderDisplay').textContent = pendingFolder || '未選択';
@@ -1042,15 +1106,26 @@
       if (dir) { pendingDbFolder = dir; $('srcDbFolderDisplay').textContent = `DB: ${dir}`; }
     });
     $('srcApplyBtn').addEventListener('click', async () => {
-      await bridge.setConfig({
-        mode: $('srcModeFolder').checked ? 'folder' : 'server',
-        serverUrl: $('srcServerUrl').value.trim(),
-        folder: pendingFolder,
-        dbFolder: pendingDbFolder,
-      });
+      resetPlaybackForSourceChange();
+      try {
+        await bridge.setConfig({
+          mode: $('srcModeFolder').checked ? 'folder' : 'server',
+          serverUrl: $('srcServerUrl').value.trim(),
+          accessToken: $('srcAccessToken').value,
+          folder: pendingFolder,
+          dbFolder: pendingDbFolder,
+        });
+      } catch (err) {
+        window.alert(`設定を保存できませんでした: ${err.message || err}`);
+        // 秘密値の変更に失敗した場合も旧streamは即停止したままにする。
+        // main processに残る旧設定から一覧とtimelineを再取得し、
+        // 過去日表示でも空画面のまま固定されないようにする。
+        await loadLocations();
+        await loadSegments();
+        await loadStatus();
+        return;
+      }
       panel.style.display = 'none';
-      state.segmentsByKey.clear();
-      for (const tile of state.tiles.values()) tile.segId = null;
       await loadLocations();
       await loadSegments();
       loadStatus();

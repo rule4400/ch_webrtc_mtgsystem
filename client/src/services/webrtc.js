@@ -12,6 +12,7 @@
 
 import { io } from 'socket.io-client';
 import * as mediasoupClient from 'mediasoup-client';
+import packageInfo from '../../package.json';
 
 const SETUP_WATCHDOG_MS = 20000;
 // 送信画質(高/中/低)ごとのビットレート倍率。サーバー配布の上限値に乗算する。
@@ -133,10 +134,13 @@ export class WebRTCManager {
     this._locationName   = '';
     this._instanceId     = getInstanceId();
     this._channelId      = 'general';
-    this._appVersion     = '0.1.0';
+    this._appVersion     = packageInfo.version;
     this._manualDisconnect = false;
     this._setupInFlight = null;
-    this._consumeInFlight = new Set();
+    // producerId → 世代ごとの一意token。メディア再構築時に古い
+    // consume が finally/catch へ到着しても、新世代の進行中consumeや
+    // 完成済みconsumerを削除しないため Set ではなく Map で持つ。
+    this._consumeInFlight = new Map();
     this._syncInFlight = false;
     // 進行中の _request を切断時に即座に失敗させるための reject ハンドル集合。
     // これが無いと、切断で ack が永遠に来ないリクエストが 12 秒タイムアウトまで
@@ -202,13 +206,18 @@ export class WebRTCManager {
   connect(serverUrl, locationName, options = {}) {
     this._locationName = locationName;
     this._channelId = options.channelId || this._channelId || 'general';
-    this._appVersion = options.appVersion || this._appVersion || '0.1.0';
+    this._appVersion = options.appVersion || this._appVersion || packageInfo.version;
     if (QUALITY_LEVELS.includes(options.sendQuality)) this._sendQuality = options.sendQuality;
     if (QUALITY_LEVELS.includes(options.recvQuality)) this._recvQuality = options.recvQuality;
     if (typeof options.forceTcp === 'boolean') this._forceTcp = options.forceTcp;
     this._manualDisconnect = false;
     this._rejectedUntil = 0; // 明示的な接続要求では拒否バックオフを持ち越さない
     this._serverUrl = serverUrl;
+    // Socket.IO handshake で共有トークンを送る。URL/query に入れると
+    // proxy・履歴・アクセスログへ残るため auth ペイロードのみを使う。
+    const authToken = typeof options.authToken === 'string'
+      ? options.authToken.trim().slice(0, 2048)
+      : '';
 
     // 既存ソケットがある状態で connect が呼ばれた場合は必ず破棄してから作り直す。
     // 破棄せず新しいソケットを作ると、古いソケットが裏で自動再接続を続けて
@@ -253,6 +262,7 @@ export class WebRTCManager {
         // 同じ Socket 上に残って再接続時に発火し、一つのセッションに重複した
         // transport/producer を作ってしまう。manager ごとに独立させる。
         forceNew: true,
+        auth: authToken ? { token: authToken } : {},
         transports: ['websocket', 'polling'],
         upgrade: true,
         rememberUpgrade: true,
@@ -339,15 +349,8 @@ export class WebRTCManager {
     this._setupStartedAt = Date.now();
     this._armSetupWatchdog(setupGeneration);
 
-    const assertCurrent = (stage) => {
-      if (
-        this._manualDisconnect ||
-        !this.socket?.connected ||
-        this._setupGeneration !== setupGeneration ||
-        this._connectGeneration !== connectGeneration
-      ) {
-        throw new Error(`setup superseded at ${stage}`);
-      }
+    const assertCurrent = (stage, expected) => {
+      this._assertSessionCurrent(setupGeneration, connectGeneration, stage, expected);
     };
 
     const setupPromise = (async () => {
@@ -359,7 +362,7 @@ export class WebRTCManager {
         appVersion: this._appVersion,
         instanceId: this._instanceId,
       });
-      await this._initMediasoup();
+      await this._initMediasoup(setupGeneration, connectGeneration);
       assertCurrent('init-mediasoup');
       this._initialized = true;
       this._announceRecvQuality();
@@ -390,6 +393,24 @@ export class WebRTCManager {
         this._setupStartedAt = 0;
         this._clearSetupWatchdog();
       }
+    }
+  }
+
+  _isSessionCurrent(setupGeneration, connectGeneration, { transport = null, device = null } = {}) {
+    const transportIsCurrent = !transport || (
+      !transport.closed && (this.sendTransport === transport || this.recvTransport === transport)
+    );
+    return !this._manualDisconnect &&
+      !!this.socket?.connected &&
+      this._setupGeneration === setupGeneration &&
+      this._connectGeneration === connectGeneration &&
+      (!device || this.device === device) &&
+      transportIsCurrent;
+  }
+
+  _assertSessionCurrent(setupGeneration, connectGeneration, stage, expected = {}) {
+    if (!this._isSessionCurrent(setupGeneration, connectGeneration, expected)) {
+      throw new Error(`setup superseded at ${stage}`);
     }
   }
 
@@ -593,7 +614,8 @@ export class WebRTCManager {
       });
   }
 
-  _resetMediaSession({ notifyPeers = false, keepPeers = false } = {}) {
+  _resetMediaSession({ notifyPeers = false, keepPeers = false, failPending = true } = {}) {
+    if (failPending) this._failPendingRequests('media session reset');
     try { this.videoProducer?.close(); } catch { /* ignore close errors */ }
     try { this.audioProducer?.close(); } catch { /* ignore close errors */ }
     try { this.screenProducer?.close(); } catch { /* ignore close errors */ }
@@ -661,6 +683,13 @@ export class WebRTCManager {
 
     this.socket.on('systemStateUpdated', (payload = {}) => {
       this.onSystemStateUpdated?.(payload);
+    });
+
+    // 録画保存先の障害・staging容量不足・圧縮キュー過多では、サーバーが
+    // 会議を優先して録画を縮退する。その変更を再接続待ちにせず反映し、
+    // カメラOFF中の不要なエンコード/RTP送信をその場で停止する。
+    this.socket.on('recordingPolicyChanged', (payload = {}) => {
+      this._applyCameraKeepSendingPolicy(!!payload.cameraKeepSendingWhenOff);
     });
 
     this.socket.on('peerChannelChanged', (payload = {}) => {
@@ -814,7 +843,7 @@ export class WebRTCManager {
     try { this.socket.emit('closeTransport', { transportId: transport.id }); } catch { /* ignore */ }
   }
 
-  async _initMediasoup() {
+  async _initMediasoup(setupGeneration, connectGeneration) {
     // 古い transport/consumer を掃除（再接続時）。
     // ここで close() せずに null 化/clear するだけだと、_scheduleSetupRetry や
     // mediaLayerRestarted など _resetMediaSession を経由しない再構築パスで
@@ -863,17 +892,37 @@ export class WebRTCManager {
     } catch {
       // Older server versions did not expose this optional event.
     }
+    this._assertSessionCurrent(setupGeneration, connectGeneration, 'server-config');
 
     const caps = await this._request('getRouterRtpCapabilities');
-    this.device = new mediasoupClient.Device();
-    await this.device.load({ routerRtpCapabilities: caps });
-    await this._initSendTransport();
-    await this._initRecvTransport();
+    this._assertSessionCurrent(setupGeneration, connectGeneration, 'router-capabilities');
+    const device = new mediasoupClient.Device();
+    await device.load({ routerRtpCapabilities: caps });
+    this._assertSessionCurrent(setupGeneration, connectGeneration, 'device-load');
+    this.device = device;
+    await this._initSendTransport(setupGeneration, connectGeneration, device);
+    this._assertSessionCurrent(setupGeneration, connectGeneration, 'send-transport', {
+      device,
+      transport: this.sendTransport,
+    });
+    await this._initRecvTransport(setupGeneration, connectGeneration, device);
+    this._assertSessionCurrent(setupGeneration, connectGeneration, 'recv-transport', {
+      device,
+      transport: this.recvTransport,
+    });
 
     // 既存 Producer を全て消費
     const existing = await this._request('getProducers');
+    this._assertSessionCurrent(setupGeneration, connectGeneration, 'get-producers', {
+      device,
+      transport: this.recvTransport,
+    });
     for (const p of existing) {
       await this._consumePeer(p.producerId, p.socketId, p.locationName, p.kind, p.paused, p);
+      this._assertSessionCurrent(setupGeneration, connectGeneration, 'existing-consume', {
+        device,
+        transport: this.recvTransport,
+      });
     }
   }
 
@@ -958,37 +1007,90 @@ export class WebRTCManager {
     this._request('setPresenceMode', { mode: this._presenceMode }).catch(() => {});
   }
 
-  async _initSendTransport() {
-    const { params } = await this._request('createWebRtcTransport', { forceTcp: this._forceTcp });
-    this.sendTransport = this.device.createSendTransport(this._transportOptions(params));
-    this.sendTransport.on('connect', async ({ dtlsParameters }, cb, eb) => {
-      try { await this._request('connectTransport', { transportId: this.sendTransport.id, dtlsParameters }); cb(); }
-      catch (e) { eb(e); }
+  async _initSendTransport(setupGeneration, connectGeneration, device) {
+    const transportResponse = await this._request('createWebRtcTransport', {
+      forceTcp: this._forceTcp,
+      supportsTransportLease: true,
     });
-    this.sendTransport.on('produce', async ({ kind, rtpParameters, appData }, cb, eb) => {
-      try { const { id } = await this._request('produce', { transportId: this.sendTransport.id, kind, rtpParameters, appData }); cb({ id }); }
-      catch (e) { eb(e); }
+    const { params } = transportResponse;
+    this._assertSessionCurrent(setupGeneration, connectGeneration, 'create-send-transport', { device });
+    const transport = device.createSendTransport(this._transportOptions(params));
+    this.sendTransport = transport;
+    // createWebRtcTransport のleaseはローカルtransport生成後にだけ受領する。
+    // ACKを待つことで、上り方向の一時断でacceptだけが届かず、
+    // server側lease回収後も死んだlocal transportを使い続ける状態を防ぐ。
+    // transportLeaseRequired を返さない旧serverはacceptTransport未実装なので、
+    // 新serverが明示した場合にだけacceptを必須にする。
+    if (transportResponse?.transportLeaseRequired === true) {
+      try {
+        await this._request('acceptTransport', { transportId: transport.id });
+        this._assertSessionCurrent(setupGeneration, connectGeneration, 'accept-send-transport', { device, transport });
+      } catch (err) {
+        try { transport.close(); } catch { /* ignore close errors */ }
+        this._notifyTransportClosed(transport);
+        if (this.sendTransport === transport) this.sendTransport = null;
+        throw err;
+      }
+    }
+    transport.on('connect', async ({ dtlsParameters }, cb, eb) => {
+      try {
+        this._assertSessionCurrent(setupGeneration, connectGeneration, 'connect-send-transport', { device, transport });
+        await this._request('connectTransport', { transportId: transport.id, dtlsParameters });
+        this._assertSessionCurrent(setupGeneration, connectGeneration, 'connected-send-transport', { device, transport });
+        cb();
+      } catch (e) { eb(e); }
     });
-    this.sendTransport.on('connectionstatechange', (s) => {
+    transport.on('produce', async ({ kind, rtpParameters, appData }, cb, eb) => {
+      try {
+        this._assertSessionCurrent(setupGeneration, connectGeneration, 'produce-send-transport', { device, transport });
+        const { id } = await this._request('produce', { transportId: transport.id, kind, rtpParameters, appData });
+        this._assertSessionCurrent(setupGeneration, connectGeneration, 'produced-send-transport', { device, transport });
+        cb({ id });
+      } catch (e) { eb(e); }
+    });
+    transport.on('connectionstatechange', (s) => {
       console.log('[sendTransport]', s);
-      if (s === 'connected') this._cancelIceRestart(this.sendTransport);
-      if (s === 'failed') this._scheduleIceRestart(this.sendTransport, 'sendTransport', 500);
-      if (s === 'disconnected') this._scheduleIceRestart(this.sendTransport, 'sendTransport', 4500);
+      if (!this._isSessionCurrent(setupGeneration, connectGeneration, { device, transport })) return;
+      if (s === 'connected') this._cancelIceRestart(transport);
+      if (s === 'failed') this._scheduleIceRestart(transport, 'sendTransport', 500);
+      if (s === 'disconnected') this._scheduleIceRestart(transport, 'sendTransport', 4500);
     });
   }
 
-  async _initRecvTransport() {
-    const { params } = await this._request('createWebRtcTransport', { forceTcp: this._forceTcp });
-    this.recvTransport = this.device.createRecvTransport(this._transportOptions(params));
-    this.recvTransport.on('connect', async ({ dtlsParameters }, cb, eb) => {
-      try { await this._request('connectTransport', { transportId: this.recvTransport.id, dtlsParameters }); cb(); }
-      catch (e) { eb(e); }
+  async _initRecvTransport(setupGeneration, connectGeneration, device) {
+    const transportResponse = await this._request('createWebRtcTransport', {
+      forceTcp: this._forceTcp,
+      supportsTransportLease: true,
     });
-    this.recvTransport.on('connectionstatechange', (s) => {
+    const { params } = transportResponse;
+    this._assertSessionCurrent(setupGeneration, connectGeneration, 'create-recv-transport', { device });
+    const transport = device.createRecvTransport(this._transportOptions(params));
+    this.recvTransport = transport;
+    if (transportResponse?.transportLeaseRequired === true) {
+      try {
+        await this._request('acceptTransport', { transportId: transport.id });
+        this._assertSessionCurrent(setupGeneration, connectGeneration, 'accept-recv-transport', { device, transport });
+      } catch (err) {
+        try { transport.close(); } catch { /* ignore close errors */ }
+        this._notifyTransportClosed(transport);
+        if (this.recvTransport === transport) this.recvTransport = null;
+        throw err;
+      }
+    }
+    transport.on('connect', async ({ dtlsParameters }, cb, eb) => {
+      try {
+        this._assertSessionCurrent(setupGeneration, connectGeneration, 'connect-recv-transport', { device, transport });
+        await this._request('connectTransport', { transportId: transport.id, dtlsParameters });
+        this._assertSessionCurrent(setupGeneration, connectGeneration, 'connected-recv-transport', { device, transport });
+        cb();
+      } catch (e) { eb(e); }
+    });
+    transport.on('connectionstatechange', (s) => {
       console.log('[recvTransport]', s);
-      if (s === 'connected') this._cancelIceRestart(this.recvTransport);
-      if (s === 'failed') this._scheduleIceRestart(this.recvTransport, 'recvTransport', 500);
-      if (s === 'disconnected') this._scheduleIceRestart(this.recvTransport, 'recvTransport', 4500);
+      if (!this._isSessionCurrent(setupGeneration, connectGeneration, { device, transport })) return;
+      if (s === 'connected') this._cancelIceRestart(transport);
+      if (s === 'failed') this._scheduleIceRestart(transport, 'recvTransport', 500);
+      if (s === 'disconnected') this._scheduleIceRestart(transport, 'recvTransport', 4500);
     });
   }
 
@@ -1117,6 +1219,25 @@ export class WebRTCManager {
     else         await this._pauseCameraProducer(this.videoProducer);
   }
 
+  _applyCameraKeepSendingPolicy(keepSending) {
+    if (this._cameraKeepSendingWhenOff === keepSending) return;
+    this._cameraKeepSendingWhenOff = keepSending;
+    const producer = this.videoProducer;
+    if (this.camEnabled || !producer || producer.closed) return;
+
+    // producer.pause()/resume() はここではローカル送出だけを切り替える。
+    // カメラは論理的にはOFFのままで、サーバーの配信consumerもpause状態を
+    // 維持するため、他拠点に映像が再表示されることはない。
+    try {
+      if (keepSending && producer.paused) producer.resume();
+      if (!keepSending && !producer.paused) producer.pause();
+    } catch {
+      // transport再構築との競合時は、新producer作成時に最新policyを再適用する。
+    }
+    const pending = this._pendingPauseSync.get(producer.id);
+    if (pending?.paused) pending.keepSending = keepSending;
+  }
+
   async setMicEnabled(enabled) {
     this.micEnabled = enabled;
     if (!this.audioProducer) return;
@@ -1193,7 +1314,17 @@ export class WebRTCManager {
     this.localScreenAudioTrack = audioTrack || null;
     this.screenLabel = label || videoTrack.label || '画面共有';
     this.screenPaused = false;
-    await this._reproduceScreen();
+    try {
+      await this._reproduceScreen();
+      if (!this.screenProducer || this.screenProducer.closed) {
+        throw new Error('画面共有producerを作成できませんでした');
+      }
+    } catch (err) {
+      // video producerだけ成功してaudio producerで失敗した場合も含め、
+      // 部分的に作成されたproducerを必ず閉じる。trackの停止は呼び出し側が行う。
+      await this.stopScreenShare({ stopTracks: false });
+      throw err;
+    }
   }
 
   async _reproduceScreen() {
@@ -1204,7 +1335,7 @@ export class WebRTCManager {
       return;
     }
 
-    this.screenProducer = await this.sendTransport.produce({
+    const videoProducer = await this.sendTransport.produce({
       track: this.localScreenVideoTrack,
       stopTracks: false,
       appData: {
@@ -1215,15 +1346,19 @@ export class WebRTCManager {
       encodings: this._screenEncodings(),
       codecOptions: { videoGoogleStartBitrate: 1200 },
     });
-    this.screenProducer.on('transportclose', () => { this.screenProducer = null; });
-    this.screenProducer.on('trackended', () => {
+    this.screenProducer = videoProducer;
+    videoProducer.on('transportclose', () => {
+      if (this.screenProducer === videoProducer) this.screenProducer = null;
+    });
+    videoProducer.on('trackended', () => {
+      if (this.screenProducer !== videoProducer) return;
       // 共有元のウィンドウが閉じられた等。共有を終了してUIへ通知する。
       this.stopScreenShare().catch(() => {});
       this.onScreenShareEnded?.();
     });
 
     if (this.localScreenAudioTrack && this.localScreenAudioTrack.readyState === 'live') {
-      this.screenAudioProducer = await this.sendTransport.produce({
+      const audioProducer = await this.sendTransport.produce({
         track: this.localScreenAudioTrack,
         stopTracks: false,
         appData: {
@@ -1233,7 +1368,10 @@ export class WebRTCManager {
         },
         codecOptions: { opusStereo: 1, opusDtx: 1 },
       });
-      this.screenAudioProducer.on('transportclose', () => { this.screenAudioProducer = null; });
+      this.screenAudioProducer = audioProducer;
+      audioProducer.on('transportclose', () => {
+        if (this.screenAudioProducer === audioProducer) this.screenAudioProducer = null;
+      });
     }
 
     if (this.screenPaused) {
@@ -1360,26 +1498,38 @@ export class WebRTCManager {
 
   async _consumePeer(producerId, socketId, locationName, kind, paused, metadata = {}) {
     if (this._isSelfSocket(socketId)) return;
-    if (!this.recvTransport || this.recvTransport.closed) { console.warn('[consume] recvTransport not ready'); return; }
+    const transport = this.recvTransport;
+    const device = this.device;
+    const setupGeneration = this._setupGeneration;
+    const connectGeneration = this._connectGeneration;
+    if (!transport || transport.closed || !device) { console.warn('[consume] recvTransport not ready'); return; }
     if (this.consumers.has(producerId)) return; // 重複消費を防ぐ
     if (this._consumeInFlight.has(producerId)) return;
-    this._consumeInFlight.add(producerId);
+    const consumeToken = {};
+    this._consumeInFlight.set(producerId, consumeToken);
 
     let consumer = null;
+    let serverConsumerId = null;
     try {
       const { params } = await this._request('consume', {
-        transportId:     this.recvTransport.id,
+        transportId:     transport.id,
         producerId,
-        rtpCapabilities: this.device.rtpCapabilities,
+        rtpCapabilities: device.rtpCapabilities,
       });
-      consumer = await this.recvTransport.consume({
+      // ローカルconsumeに失敗してもserver側を即座に閉じられるよう、
+      // ACK受信直後にIDを保存する。
+      serverConsumerId = params?.id || null;
+      this._assertSessionCurrent(setupGeneration, connectGeneration, 'consume-response', { device, transport });
+      consumer = await transport.consume({
         id:            params.id,
         producerId:    params.producerId,
         kind:          params.kind,
         rtpParameters: params.rtpParameters,
       });
-      this.consumers.set(producerId, consumer);
+      this._assertSessionCurrent(setupGeneration, connectGeneration, 'local-consume', { device, transport });
       await this._request('resume', { consumerId: consumer.id });
+      this._assertSessionCurrent(setupGeneration, connectGeneration, 'resume-consumer', { device, transport });
+      this.consumers.set(producerId, consumer);
 
       let peer = this.peers.get(socketId);
       if (!peer) {
@@ -1431,29 +1581,35 @@ export class WebRTCManager {
       this.onPeerUpdated?.(socketId, { ...peer, stream: peer.stream });
       console.log(`[consume] ${socketId} ${kind} ok`);
     } catch (err) {
-      console.error('[_consumePeer]', err);
+      if (this._isSessionCurrent(setupGeneration, connectGeneration, { device, transport })) {
+        console.error('[_consumePeer]', err);
+      }
       // consume / resume が途中で失敗した場合、作りかけの consumer を確実に破棄して
       // consumers から取り除く。残したままだと consumers.has(producerId) により
       // syncPeers / newProducer が再消費をスキップし、一過性の失敗でタイルが
       // 恒久的に黒画面・無音のまま固定されてしまう。破棄しておけば 1 秒周期の
       // syncPeers が同じ producer を再消費して自己回復する。
-      if (consumer) {
-        const orphanTrack = consumer.track || null;
-        const orphanConsumerId = consumer.id;
-        try { consumer.close(); } catch { /* ignore close errors */ }
-        // サーバー側に作られた consumer も破棄させる。残すと再consume時に
-        // 二重になり、無駄なRTP送出とネイティブリソースの占有が続く。
-        this._request('closeConsumer', { consumerId: orphanConsumerId }).catch(() => {});
-        const peer = this.peers.get(socketId);
-        if (orphanTrack && peer) {
-          try { peer.stream?.removeTrack(orphanTrack); } catch { /* ignore */ }
-          try { peer.screenStream?.removeTrack(orphanTrack); } catch { /* ignore */ }
-        }
+      if (this.consumers.get(producerId) === consumer) this.consumers.delete(producerId);
+      const orphanTrack = consumer?.track || null;
+      try { consumer?.close(); } catch { /* ignore close errors */ }
+      // local consumer生成前の失敗でも、ACKで受け取ったIDがあれば
+      // server側のpaused consumerを残さない。
+      if (serverConsumerId) this._closeServerConsumer(serverConsumerId);
+      const peer = this.peers.get(socketId);
+      if (orphanTrack && peer) {
+        try { peer.stream?.removeTrack(orphanTrack); } catch { /* ignore */ }
+        try { peer.screenStream?.removeTrack(orphanTrack); } catch { /* ignore */ }
       }
-      this.consumers.delete(producerId);
     } finally {
-      this._consumeInFlight.delete(producerId);
+      if (this._consumeInFlight.get(producerId) === consumeToken) {
+        this._consumeInFlight.delete(producerId);
+      }
     }
+  }
+
+  _closeServerConsumer(consumerId) {
+    if (!consumerId || !this.socket?.connected) return;
+    this.socket.emit('closeConsumer', { consumerId }, () => {});
   }
 
   _handleProducerClosed(producerId) {
@@ -1836,6 +1992,10 @@ export class WebRTCManager {
 
   disconnect() {
     this._manualDisconnect = true;
+    this._connectGeneration += 1;
+    this._setupGeneration += 1;
+    this._setupInFlight = null;
+    this._setupStartedAt = 0;
     this._initialized = false;
     this._clearSetupRetry();
     this._clearSessionRebuild();

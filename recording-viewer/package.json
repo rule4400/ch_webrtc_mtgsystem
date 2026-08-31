@@ -5,6 +5,7 @@
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
+    "test": "node scripts/test-media-file.cjs",
     "package": "electron-builder build --mac --arm64 && electron-builder build --win --x64",
     "package:mac": "electron-builder build --mac --arm64",
     "package:win": "electron-builder build --win --x64"
@@ -27,7 +28,7 @@
     }
   },
   "devDependencies": {
-    "electron": "^42.3.0",
-    "electron-builder": "^26.8.1"
+    "electron": "^42.10.1",
+    "electron-builder": "^26.15.3"
   }
 }

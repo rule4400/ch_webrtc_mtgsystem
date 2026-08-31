@@ -1,5 +1,6 @@
 import { io } from 'socket.io-client';
 import * as mediasoupClient from 'mediasoup-client';
+import packageInfo from '../../package.json';
 
 const SETUP_WATCHDOG_MS = 20000;
 const HARD_RECONNECT_DELAY_MS = 1000;
@@ -42,7 +43,7 @@ export class ScreenShareWebRTCManager {
     this._initialized = false;
     this._manualDisconnect = false;
     this._displayName = '画面共有';
-    this._appVersion = '0.1.0';
+    this._appVersion = packageInfo.version;
     this._channelId = 'general';
     this._instanceId = getInstanceId();
     this._maxBitrate = 2_500_000;
@@ -73,6 +74,9 @@ export class ScreenShareWebRTCManager {
     this._channelId = options.channelId || this._channelId || 'general';
     this._manualDisconnect = false;
     this._rejectedUntil = 0; // 明示的な接続要求では拒否バックオフを持ち越さない
+    const authToken = typeof options.authToken === 'string'
+      ? options.authToken.trim().slice(0, 2048)
+      : '';
 
     // 既存ソケットがある状態で connect が呼ばれた場合は必ず破棄してから作り直す。
     // 破棄しないと古いソケットが裏で自動再接続を続け、同じ端末から二重セッションを
@@ -102,6 +106,7 @@ export class ScreenShareWebRTCManager {
         // 同一URLでの Manager/Socket 共有(multiplex)を防ぐ。共有されると破棄済みの
         // ハンドラが同じソケット上で蘇り、重複 transport/producer の原因になる。
         forceNew: true,
+        auth: authToken ? { token: authToken } : {},
         transports: ['websocket', 'polling'],
         upgrade: true,
         rememberUpgrade: true,
@@ -263,10 +268,23 @@ export class ScreenShareWebRTCManager {
   }
 
   async _initSendTransport() {
-    const { params } = await this._request('createWebRtcTransport', { forceTcp: false });
+    const { params, transportLeaseRequired } = await this._request('createWebRtcTransport', {
+      forceTcp: false,
+      supportsTransportLease: true,
+    });
     const options = this.iceServers.length ? { ...params, iceServers: this.iceServers } : params;
     const transport = this.device.createSendTransport(options);
     this.sendTransport = transport;
+    if (transportLeaseRequired === true) {
+      try {
+        await this._request('acceptTransport', { transportId: transport.id });
+      } catch (err) {
+        try { transport.close(); } catch { /* ignore */ }
+        if (this.sendTransport === transport) this.sendTransport = null;
+        this.socket?.emit('closeTransport', { transportId: transport.id }, () => {});
+        throw err;
+      }
+    }
 
     transport.on('connect', async ({ dtlsParameters }, callback, errback) => {
       try {

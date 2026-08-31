@@ -9,6 +9,7 @@
  */
 
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
+import packageInfo from '../../package.json';
 import {
   Mic, MicOff, Video, VideoOff,
   Volume2, VolumeX, Settings, ChevronDown, X, Download,
@@ -26,7 +27,7 @@ import {
   systemSoundUrl,
 } from '../services/system-sounds';
 
-const APP_VERSION = '0.5.0';
+const APP_VERSION = packageInfo.version;
 // サーバーと確立できない状態がこの時間連続したら、アプリ本体を再起動する
 // （無限リトライの最終手段。Electronメインの app.relaunch で完全再起動）。
 const APP_RELAUNCH_AFTER_MS = 5 * 60 * 1000;
@@ -194,6 +195,348 @@ function ShortcutKeyField({ label, value, onChange }) {
 
 // ─── ビデオセル ───────────────────────────────────────────
 
+const LAST_FRAME_HOLD_MS = 20 * 1000;
+const LAST_FRAME_SAMPLE_MS = 2000;
+const LAST_FRAME_STALL_GRACE_MS = 3000;
+const LAST_FRAME_MAX_WIDTH = 640;
+const LAST_FRAME_MAX_HEIGHT = 360;
+
+/**
+ * 瞬断中だけ直前の受信フレームを canvas 上に保持する。
+ * Data URL / Object URL は作らず、サンプリングも低頻度に抑える。
+ */
+function useLastFrameHold({ videoRef, stream, enabled, outageHint = false }) {
+  const canvasRef = useRef(null);
+  const enabledRef = useRef(enabled);
+  const outageHintRef = useRef(outageHint);
+  const streamRef = useRef(stream);
+  const previousStreamRef = useRef(stream);
+  const hasSnapshotRef = useRef(false);
+  const snapshotCapturedAtRef = useRef(0);
+  const lastProgressAtRef = useRef(0);
+  const progressStreamRef = useRef(stream);
+  const progressMediaTimeRef = useRef(Number.NaN);
+  const progressDecodedFramesRef = useRef(Number.NaN);
+  const outageStartedAtRef = useRef(0);
+  const outageExpiredRef = useRef(false);
+  const holdTimerRef = useRef(null);
+  const statusRef = useRef('healthy');
+  const [status, setStatus] = useState('healthy');
+
+  useEffect(() => {
+    enabledRef.current = enabled;
+    outageHintRef.current = outageHint;
+    streamRef.current = stream;
+    if (progressStreamRef.current !== stream) {
+      progressStreamRef.current = stream;
+      progressMediaTimeRef.current = Number.NaN;
+      progressDecodedFramesRef.current = Number.NaN;
+    }
+  }, [enabled, outageHint, stream]);
+
+  const updateStatus = useCallback((next) => {
+    if (statusRef.current === next) return;
+    statusRef.current = next;
+    setStatus(next);
+  }, []);
+  const clearHoldTimer = useCallback(() => {
+    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+    holdTimerRef.current = null;
+  }, []);
+  const clearSnapshot = useCallback(() => {
+    hasSnapshotRef.current = false;
+    snapshotCapturedAtRef.current = 0;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+    // 意図的な映像OFF中はバッファも最小化する。
+    canvas.width = 1;
+    canvas.height = 1;
+  }, []);
+  const resetOutage = useCallback((discardSnapshot = false) => {
+    clearHoldTimer();
+    outageStartedAtRef.current = 0;
+    outageExpiredRef.current = false;
+    updateStatus('healthy');
+    if (discardSnapshot) {
+      lastProgressAtRef.current = 0;
+      clearSnapshot();
+    }
+  }, [clearHoldTimer, clearSnapshot, updateStatus]);
+  const beginOutage = useCallback((observedAt = Date.now()) => {
+    if (!enabledRef.current) return;
+    const now = Date.now();
+    const capturedAt = snapshotCapturedAtRef.current;
+    const observedCandidate = Number.isFinite(observedAt)
+      ? Math.min(now, Math.max(0, observedAt))
+      : now;
+    // 保持期限は「停止を検出した時刻」ではなく、canvas に保存した最後の正常フレームが基準。
+    // 監視間隔やバックグラウンド化で停止検出が遅れても20秒を超えて表示しない。
+    const candidate = capturedAt > 0
+      ? Math.min(observedCandidate, capturedAt)
+      : observedCandidate;
+    // 最初に確定した期限を固定し、同じ停止中に届く別イベントでは延長も短縮もしない。
+    if (!outageStartedAtRef.current) {
+      outageStartedAtRef.current = candidate;
+    }
+    if (outageExpiredRef.current || !hasSnapshotRef.current || capturedAt <= 0) {
+      updateStatus('fallback');
+      return;
+    }
+    updateStatus('holding');
+    // フレーム停止の検出に遅れた場合も、最後の進行時刻から20秒を超えない。
+    clearHoldTimer();
+    const remaining = Math.max(0, LAST_FRAME_HOLD_MS - (now - outageStartedAtRef.current));
+    if (remaining === 0) {
+      outageExpiredRef.current = true;
+      updateStatus('fallback');
+      return;
+    }
+    holdTimerRef.current = setTimeout(() => {
+      holdTimerRef.current = null;
+      outageExpiredRef.current = true;
+      updateStatus('fallback');
+    }, remaining);
+  }, [clearHoldTimer, updateStatus]);
+  const captureSnapshot = useCallback(({
+    expectedStream = streamRef.current,
+    allowInactiveTrack = false,
+    capturedAt = Date.now(),
+  } = {}) => {
+    if (!enabledRef.current || (!allowInactiveTrack && outageHintRef.current) || document.hidden) return false;
+    const video = videoRef.current;
+    const track = expectedStream?.getVideoTracks?.()[0] || null;
+    // stream 差し替え直後は <video> に旧ストリームの最終画が残り得る。
+    // 明示したストリームと srcObject が一致する時だけ、その表示画を利用する。
+    if (!video || !expectedStream || video.srcObject !== expectedStream ||
+        (!allowInactiveTrack &&
+          (!track || track.readyState !== 'live' || track.muted || !track.enabled || video.ended)) ||
+        video.readyState < 2 || !video.videoWidth || !video.videoHeight) return false;
+    const scale = Math.min(
+      1,
+      LAST_FRAME_MAX_WIDTH / video.videoWidth,
+      LAST_FRAME_MAX_HEIGHT / video.videoHeight,
+    );
+    const width = Math.max(1, Math.round(video.videoWidth * scale));
+    const height = Math.max(1, Math.round(video.videoHeight * scale));
+    const canvas = canvasRef.current;
+    if (!canvas) return false;
+    try {
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const context = canvas.getContext('2d', { alpha: false });
+      if (!context) return false;
+      context.drawImage(video, 0, 0, width, height);
+      hasSnapshotRef.current = true;
+      const now = Date.now();
+      snapshotCapturedAtRef.current = Number.isFinite(capturedAt)
+        ? Math.min(now, Math.max(0, capturedAt))
+        : now;
+      return true;
+    } catch {
+      // デコーダー切替中は drawImage が一時的に失敗し得る。
+      return false;
+    }
+  }, [videoRef]);
+  const captureBeforeOutage = useCallback((expectedStream, capturedAt = Date.now()) => {
+    // 20秒を使い切った同じ停止状態を、別イベントで再び延長しない。
+    if (outageExpiredRef.current || statusRef.current === 'fallback') return false;
+    return captureSnapshot({ expectedStream, allowInactiveTrack: true, capturedAt });
+  }, [captureSnapshot]);
+  const captureAndRecover = useCallback((capturedAt = Date.now()) => {
+    if (!captureSnapshot({ capturedAt })) return false;
+    lastProgressAtRef.current = capturedAt;
+    if (outageStartedAtRef.current || statusRef.current !== 'healthy') resetOutage(false);
+    return true;
+  }, [captureSnapshot, resetOutage]);
+
+  useEffect(() => () => {
+    clearHoldTimer();
+    clearSnapshot();
+  }, [clearHoldTimer, clearSnapshot]);
+
+  // fallback を描画して canvas が非表示になった後、長時間の切断中はバッファを解放する。
+  useEffect(() => {
+    if (status === 'fallback') clearSnapshot();
+  }, [clearSnapshot, status]);
+
+  // ストリーム差し替え中も、新しい有効フレームが来るまで保持する。
+  // outageHint も同時に変わる場合に、旧srcObjectを先に退避できる順序を保つ。
+  useEffect(() => {
+    const previous = previousStreamRef.current;
+    previousStreamRef.current = stream;
+    if (enabled && (!stream || (previous && previous !== stream))) {
+      const observedAt = Date.now();
+      const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || observedAt;
+      // VideoCell 側が srcObject を交換する前に実行されるため、旧streamとの
+      // 同一性を検証した上で、現在表示中の最終画を一度だけ退避できる。
+      if (previous) captureBeforeOutage(previous, lastFrameAt);
+      beginOutage(lastFrameAt);
+    }
+  }, [beginOutage, captureBeforeOutage, enabled, stream]);
+
+  useEffect(() => {
+    if (!enabled) {
+      resetOutage(true);
+      return;
+    }
+    if (outageHint) {
+      const observedAt = Date.now();
+      const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || observedAt;
+      captureBeforeOutage(stream, lastFrameAt);
+      beginOutage(lastFrameAt);
+    }
+  }, [beginOutage, captureBeforeOutage, enabled, outageHint, resetOutage, stream]);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const video = videoRef.current;
+    if (!video) return undefined;
+    let lastProgressCheckAt = 0;
+    const fail = () => {
+      const observedAt = Date.now();
+      const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || observedAt;
+      captureBeforeOutage(stream, lastFrameAt);
+      beginOutage(lastFrameAt);
+    };
+    // loadeddata は実際の最初のフレームが得られた時だけ。
+    // canplay/playing の通知だけでタイマーを延長しない。
+    const recover = () => captureAndRecover(Date.now());
+    // canvas readbackは行わず、停止イベント時の期限基準だけを軽量に更新する。
+    const noteProgress = () => {
+      const now = Date.now();
+      if (now - lastProgressCheckAt < 200) return;
+      lastProgressCheckAt = now;
+      const currentStream = streamRef.current;
+      const currentTrack = currentStream?.getVideoTracks?.()[0] || null;
+      if (video.srcObject === currentStream && currentTrack?.readyState === 'live' &&
+          !currentTrack.muted && currentTrack.enabled && video.readyState >= 2 &&
+          !video.paused && !video.ended) {
+        const mediaTime = Number(video.currentTime);
+        let decodedFrames = Number.NaN;
+        try {
+          decodedFrames = Number(video.getVideoPlaybackQuality?.().totalVideoFrames);
+        } catch { /* currentTime fallback below */ }
+        if (!Number.isFinite(decodedFrames)) decodedFrames = Number(video.webkitDecodedFrameCount);
+        if (progressStreamRef.current !== currentStream) {
+          progressStreamRef.current = currentStream;
+          progressMediaTimeRef.current = Number.NaN;
+          progressDecodedFramesRef.current = Number.NaN;
+        }
+        const hasFrameCounter = Number.isFinite(decodedFrames);
+        const progressed = hasFrameCounter
+          ? (Number.isFinite(progressDecodedFramesRef.current) &&
+            decodedFrames > progressDecodedFramesRef.current)
+          : (Number.isFinite(progressMediaTimeRef.current) && Number.isFinite(mediaTime) &&
+            mediaTime > progressMediaTimeRef.current + 0.01);
+        progressMediaTimeRef.current = mediaTime;
+        progressDecodedFramesRef.current = decodedFrames;
+        if (progressed) lastProgressAtRef.current = now;
+      }
+    };
+    const failureEvents = ['waiting', 'stalled', 'emptied', 'abort', 'error', 'ended', 'pause'];
+    const recoveryEvents = ['loadeddata'];
+    failureEvents.forEach(name => video.addEventListener(name, fail));
+    recoveryEvents.forEach(name => video.addEventListener(name, recover));
+    video.addEventListener('timeupdate', noteProgress);
+
+    const track = stream?.getVideoTracks?.()[0] || null;
+    const unmute = () => { video.play().catch(() => {}); };
+    track?.addEventListener('mute', fail);
+    track?.addEventListener('ended', fail);
+    track?.addEventListener('unmute', unmute);
+    stream?.addEventListener?.('addtrack', fail);
+    stream?.addEventListener?.('removetrack', fail);
+    return () => {
+      failureEvents.forEach(name => video.removeEventListener(name, fail));
+      recoveryEvents.forEach(name => video.removeEventListener(name, recover));
+      video.removeEventListener('timeupdate', noteProgress);
+      track?.removeEventListener('mute', fail);
+      track?.removeEventListener('ended', fail);
+      track?.removeEventListener('unmute', unmute);
+      stream?.removeEventListener?.('addtrack', fail);
+      stream?.removeEventListener?.('removetrack', fail);
+    };
+  }, [beginOutage, captureAndRecover, captureBeforeOutage, enabled, stream, videoRef]);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let lastMediaTime = Number.NaN;
+    let lastDecodedFrames = Number.NaN;
+    if (!lastProgressAtRef.current) lastProgressAtRef.current = Date.now();
+    const inspect = () => {
+      // 非表示中のタブ/ウィンドウでGPU readbackを発生させない。
+      if (!enabledRef.current || document.hidden) return;
+      if (outageHintRef.current) {
+        beginOutage(outageStartedAtRef.current || lastProgressAtRef.current);
+        return;
+      }
+      const now = Date.now();
+      const video = videoRef.current;
+      const currentStream = streamRef.current;
+      const track = currentStream?.getVideoTracks?.()[0] || null;
+      if (!video || !currentStream || video.srcObject !== currentStream ||
+          !track || track.readyState !== 'live' || track.muted || !track.enabled ||
+          video.readyState < 2 || video.ended) {
+        const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || now;
+        captureBeforeOutage(currentStream, lastFrameAt);
+        beginOutage(lastFrameAt);
+        return;
+      }
+      const mediaTime = Number(video.currentTime);
+      let decodedFrames = Number.NaN;
+      try {
+        decodedFrames = Number(video.getVideoPlaybackQuality?.().totalVideoFrames);
+      } catch { /* Chromiumの実装差で取得できない場合はcurrentTimeへフォールバック */ }
+      if (!Number.isFinite(decodedFrames)) decodedFrames = Number(video.webkitDecodedFrameCount);
+      const hasFrameCounter = Number.isFinite(decodedFrames);
+      const hasBaseline = hasFrameCounter
+        ? Number.isFinite(lastDecodedFrames)
+        : Number.isFinite(lastMediaTime);
+      const progressed = hasFrameCounter
+        ? (hasBaseline && decodedFrames > lastDecodedFrames)
+        : (hasBaseline && Number.isFinite(mediaTime) && mediaTime > lastMediaTime + 0.01);
+      lastMediaTime = mediaTime;
+      lastDecodedFrames = decodedFrames;
+      if (!hasBaseline) {
+        // 初回値は比較基準としてのみ保存する。次の実フレーム進行か
+        // loadeddata を確認するまで、保存・復旧扱いにはしない。
+        lastProgressAtRef.current = now;
+        return;
+      }
+      if (progressed) {
+        captureAndRecover(now);
+      } else if (video.paused || now - lastProgressAtRef.current >= LAST_FRAME_STALL_GRACE_MS) {
+        const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || now;
+        captureBeforeOutage(currentStream, lastFrameAt);
+        beginOutage(lastFrameAt);
+      }
+    };
+    inspect();
+    const id = setInterval(inspect, LAST_FRAME_SAMPLE_MS);
+    return () => clearInterval(id);
+  }, [beginOutage, captureAndRecover, captureBeforeOutage, enabled, stream, videoRef]);
+
+  // バックグラウンド中にタイマーが抑制されても、再表示時に期限超過を持ち越さない。
+  useEffect(() => {
+    const checkDeadline = () => {
+      if (!document.hidden && statusRef.current === 'holding') {
+        beginOutage(outageStartedAtRef.current || Date.now());
+      }
+    };
+    document.addEventListener('visibilitychange', checkDeadline);
+    return () => document.removeEventListener('visibilitychange', checkDeadline);
+  }, [beginOutage]);
+
+  return {
+    canvasRef,
+    holdingLastFrame: status === 'holding',
+    lastFrameFallback: status === 'fallback',
+  };
+}
+
 const VideoCell = React.memo(function VideoCell({
   label,
   stream,
@@ -223,6 +566,16 @@ const VideoCell = React.memo(function VideoCell({
   const videoRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef(null);
+  const {
+    canvasRef: lastFrameCanvasRef,
+    holdingLastFrame,
+    lastFrameFallback,
+  } = useLastFrameHold({
+    videoRef,
+    stream,
+    enabled: !isSelf && !videoPaused,
+    outageHint: reconnecting,
+  });
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -244,6 +597,8 @@ const VideoCell = React.memo(function VideoCell({
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    let disposed = false;
+    let removeRetryListeners = () => {};
     // 自拠点プレビューは常にミュート（ハウリング防止）。他拠点は speakerMuted に従う。
     video.muted = isSelf ? true : !!(speakerMuted || audioPaused);
     video.volume = isSelf || speakerMuted || audioPaused ? 0 : clampNumber(volume, 0, 1);
@@ -257,9 +612,10 @@ const VideoCell = React.memo(function VideoCell({
       if (p && p.catch) {
         p.catch((err) => {
           console.warn('play():', err.message);
+          if (disposed) return;
           // autoplay がブロックされた場合は次のユーザー操作で再試行
-          const resume = () => { video.play().catch(() => {}); cleanup(); };
-          const cleanup = () => {
+          const resume = () => { video.play().catch(() => {}); removeRetryListeners(); };
+          removeRetryListeners = () => {
             document.removeEventListener('click', resume);
             document.removeEventListener('keydown', resume);
           };
@@ -269,6 +625,10 @@ const VideoCell = React.memo(function VideoCell({
       }
     };
     tryPlay();
+    return () => {
+      disposed = true;
+      removeRetryListeners();
+    };
   }, [stream, isSelf, speakerMuted, audioPaused, volume]);
 
   // 黒画面自己復旧: ストリームは生きているのに <video> の再生が止まっている
@@ -298,7 +658,8 @@ const VideoCell = React.memo(function VideoCell({
   const cameraOff = !!videoPaused;
   // カメラONのはずなのに映像トラックが届いていない（consume未完了・経路劣化など）
   const noVideoSignal = !cameraOff && !isSelf && !isScreen &&
-    (!stream || stream.getVideoTracks().length === 0);
+    (!stream || stream.getVideoTracks().length === 0 || lastFrameFallback);
+  const noScreenSignal = !cameraOff && !isSelf && isScreen && lastFrameFallback;
   const selfMutedHighlight = isSelf && !!audioPaused && highlightMuted;
 
   return (
@@ -328,19 +689,46 @@ const VideoCell = React.memo(function VideoCell({
         }}
       />
 
+      {/* 瞬断から20秒間だけ、最後に描画できた受信フレームを表示する。 */}
+      <canvas
+        ref={lastFrameCanvasRef}
+        aria-hidden="true"
+        style={{
+          position: 'absolute',
+          inset: 0,
+          zIndex: 5,
+          width: '100%',
+          height: '100%',
+          objectFit: 'contain',
+          background: '#000',
+          display: holdingLastFrame ? 'block' : 'none',
+          pointerEvents: 'none',
+        }}
+      />
+      {holdingLastFrame && (
+        <div style={{
+          position: 'absolute', top: 8, right: 8, zIndex: 6,
+          padding: '3px 7px', borderRadius: 4,
+          color: 'rgba(255,255,255,0.78)', background: 'rgba(0,0,0,0.55)',
+          fontSize: '0.65rem', pointerEvents: 'none',
+        }}>
+          映像復旧待機中（最終映像）
+        </div>
+      )}
+
       {/* カメラOFF / 映像未達 オーバーレイ: 拠点名を中央に大きく表示する */}
-      {(cameraOff || noVideoSignal) && !reconnecting && (
+      {(cameraOff || noVideoSignal || noScreenSignal) && !reconnecting && !holdingLastFrame && (
         <div className="cam-off-overlay">
           <div className="camoff-name">{label}</div>
           <span className="camoff-caption">
             <VideoOff size={13} />
-            {cameraOff ? 'カメラ OFF' : '映像を受信していません'}
+            {cameraOff ? (isScreen ? '共有一時停止中' : 'カメラ OFF') : '映像を受信していません'}
           </span>
         </div>
       )}
 
       {/* この拠点がサーバーと再接続中（復旧中）: スピナーを中央に表示する */}
-      {reconnecting && (
+      {reconnecting && !holdingLastFrame && (
         <div className="tile-reconnect-overlay" role="status" aria-label={`${label} はサーバー接続中`}>
           <div className="camoff-name">{label}</div>
           <div className="tile-reconnect-row">
@@ -713,6 +1101,7 @@ function sanitizeVolumePercent(value, fallback = 100) {
 const defaultClientConfig = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
+  authToken: '',           // SFU_AUTH_TOKEN と同じ値（URLには埋め込まない）
   // 保険用サブサーバー（クラウド等）。メインに接続できない状態が続くと自動切替する。
   subServerIp: '',
   subServerPort: '3000',
@@ -820,6 +1209,7 @@ function sanitizeClientConfig(config) {
   const activeServer = raw.activeServer === 'sub' && subServerIp ? 'sub' : 'main';
   const locationName = String(raw.locationName || defaultClientConfig.locationName).trim() || defaultClientConfig.locationName;
   const channelId = String(raw.channelId || defaultClientConfig.channelId).trim() || defaultClientConfig.channelId;
+  const authToken = typeof raw.authToken === 'string' ? raw.authToken.trim().slice(0, 2048) : '';
   const shortcuts = sanitizeShortcuts(raw.shortcuts);
   // 明示的に false が保存されていない限り既定オン（後から追加した設定のため）。
   const autoUnmuteOnCallAnswer = raw.autoUnmuteOnCallAnswer !== false;
@@ -841,6 +1231,7 @@ function sanitizeClientConfig(config) {
     activeServer,
     locationName,
     channelId,
+    authToken,
     shortcuts,
     autoUnmuteOnCallAnswer,
     highlightSelfMuted,
@@ -879,6 +1270,18 @@ function serverUrlFromConfig(config) {
     return `http://${conf.subServerIp}:${conf.subServerPort || 3000}`;
   }
   return `http://${conf.serverIp}:${conf.serverPort || 3000}`;
+}
+
+function sfuRequestOptions(config, options = {}) {
+  const conf = sanitizeClientConfig(config);
+  if (!conf.authToken) return options;
+  return {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      Authorization: `Bearer ${conf.authToken}`,
+    },
+  };
 }
 
 // メイン到達不能がこの時間続き、かつもう一方のサーバーが応答するなら自動切替する
@@ -1132,6 +1535,8 @@ export default function MainView() {
   const privateCallRef = useRef(null);
   const callNoticeTimerRef = useRef(null);
   const screenShareRef = useRef(null);
+  const screenShareStartGenerationRef = useRef(0);
+  const screenShareStartPromiseRef = useRef(null);
 
   useEffect(() => { outgoingCallRef.current = outgoingCall; }, [outgoingCall]);
   useEffect(() => { privateCallRef.current = privateCall; }, [privateCall]);
@@ -1648,6 +2053,7 @@ export default function MainView() {
   }, [installLocalStream, selectedVideoId, selectedAudioInId]);
 
   const releaseClientRuntime = useCallback(({ status = 'connecting', updateState = true, keepLocalMedia = false, keepPeers = false } = {}) => {
+    screenShareStartGenerationRef.current += 1;
     // 進行中の startClientSessionInner を無効化する（孤児セッション防止）
     sessionGenerationRef.current += 1;
     const manager = webrtcRef.current;
@@ -1945,6 +2351,7 @@ export default function MainView() {
     const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName, {
       channelId: conf.channelId,
       appVersion: APP_VERSION,
+      authToken: conf.authToken,
       forceTcp: conf.forceTcp === true,
       sendQuality: conf.sendQuality,
       recvQuality: conf.recvQuality,
@@ -2721,7 +3128,7 @@ export default function MainView() {
     setServerRingtones(null);
     try {
       const conf = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
-      const res = await fetch(`${serverUrlFromConfig(conf)}/ringtones`);
+      const res = await fetch(`${serverUrlFromConfig(conf)}/ringtones`, sfuRequestOptions(conf));
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       setServerRingtones(Array.isArray(data.files) ? data.files : []);
@@ -2735,7 +3142,10 @@ export default function MainView() {
   const importServerRingtone = useCallback(async (name) => {
     try {
       const conf = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
-      const res = await fetch(`${serverUrlFromConfig(conf)}/ringtones/${encodeURIComponent(name)}`);
+      const res = await fetch(
+        `${serverUrlFromConfig(conf)}/ringtones/${encodeURIComponent(name)}`,
+        sfuRequestOptions(conf),
+      );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
       if (blob.size > RINGTONE_MAX_BYTES) throw new Error('ファイルが大きすぎます（3MB以下）');
@@ -2765,6 +3175,7 @@ export default function MainView() {
       // 使用サーバー(メイン/サブ)の切替やIP/ポート変更で接続先URLが変わる場合
       serverUrlFromConfig(previous) !== serverUrlFromConfig(next) ||
       previous.locationName !== next.locationName ||
+      previous.authToken !== next.authToken ||
       // TCP切替と送信画質は transport/producer の再作成が必要
       previous.forceTcp !== next.forceTcp ||
       previous.sendQuality !== next.sendQuality;
@@ -3133,6 +3544,9 @@ export default function MainView() {
 
   // ─── 画面共有（Client内蔵）──────────────────────────────
   const stopScreenShare = useCallback(async () => {
+    screenShareStartGenerationRef.current += 1;
+    const pendingStart = screenShareStartPromiseRef.current;
+    if (pendingStart) await pendingStart.catch(() => {});
     const share = screenShareRef.current;
     screenShareRef.current = null;
     setScreenShare(null);
@@ -3150,52 +3564,95 @@ export default function MainView() {
     setShareModalMode(null);
     if (!source?.id) return;
 
-    try {
-      // Electron では chromeMediaSourceId 指定の getUserMedia で画面をキャプチャする。
-      // 音声ループバックは Windows のみ対応（macはOS制約）。
-      const constraints = {
-        audio: withAudio && window.electronAPI?.platform === 'win32'
-          ? { mandatory: { chromeMediaSource: 'desktop' } }
-          : false,
-        video: {
-          mandatory: {
-            chromeMediaSource: 'desktop',
-            chromeMediaSourceId: source.id,
-            maxWidth: 1920,
-            maxHeight: 1080,
-            maxFrameRate: 15,
+    if (screenShareStartPromiseRef.current) {
+      setCamError('別の画面共有開始処理が進行中です');
+      return;
+    }
+    const generation = ++screenShareStartGenerationRef.current;
+    const manager = webrtcRef.current;
+    const previous = screenShareRef.current;
+    const operation = (async () => {
+      let stream = null;
+      try {
+        if (!manager || manager !== webrtcRef.current || !manager.isInitialized?.()) {
+          throw new Error('サーバー接続の復旧後にもう一度お試しください');
+        }
+        // Electron では chromeMediaSourceId 指定の getUserMedia で画面をキャプチャする。
+        // 音声ループバックは Windows のみ対応（macはOS制約）。
+        const constraints = {
+          audio: withAudio && window.electronAPI?.platform === 'win32'
+            ? { mandatory: { chromeMediaSource: 'desktop' } }
+            : false,
+          video: {
+            mandatory: {
+              chromeMediaSource: 'desktop',
+              chromeMediaSourceId: source.id,
+              maxWidth: 1920,
+              maxHeight: 1080,
+              maxFrameRate: 15,
+            },
           },
-        },
-      };
-      const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      const videoTrack = stream.getVideoTracks()[0] || null;
-      const audioTrack = stream.getAudioTracks()[0] || null;
-      if (!videoTrack) {
-        stream.getTracks().forEach(track => track.stop());
-        throw new Error('共有映像を取得できませんでした');
+        };
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        if (
+          generation !== screenShareStartGenerationRef.current ||
+          manager !== webrtcRef.current || !manager.isInitialized?.()
+        ) {
+          throw new Error('画面共有開始中に接続セッションが変更されました');
+        }
+        const videoTrack = stream.getVideoTracks()[0] || null;
+        const audioTrack = stream.getAudioTracks()[0] || null;
+        if (!videoTrack) {
+          stream.getTracks().forEach(track => track.stop());
+          throw new Error('共有映像を取得できませんでした');
+        }
+
+        await manager.startScreenShare(videoTrack, source.name, audioTrack);
+        if (
+          generation !== screenShareStartGenerationRef.current ||
+          manager !== webrtcRef.current || !manager.isInitialized?.()
+        ) {
+          throw new Error('画面共有開始中に接続セッションが変更されました');
+        }
+
+        // 共有元変更時は旧ストリームを止める（manager は producer のみ閉じる）
+        previous?.stream?.getTracks().forEach(track => { try { track.stop(); } catch { /* ignore */ } });
+
+        const next = {
+          sourceId: source.id,
+          sourceName: source.name || '画面共有',
+          hasAudio: !!audioTrack,
+          audioEnabled: !!audioTrack,
+          paused: false,
+          stream,
+        };
+        screenShareRef.current = next;
+        setScreenShare(next);
+        setCamError(null);
+        playEffectSound('screenShareStart');
+      } catch (err) {
+        // producerの部分成功、共有元置換失敗、session世代交代の全経路で
+        // 新旧captureとmanager側producerを同じ停止状態へ収束させる。
+        try { await manager?.stopScreenShare({ stopTracks: false }); } catch { /* ignore */ }
+        stream?.getTracks().forEach(track => { try { track.stop(); } catch { /* ignore */ } });
+        previous?.stream?.getTracks().forEach(track => { try { track.stop(); } catch { /* ignore */ } });
+        if (
+          generation === screenShareStartGenerationRef.current &&
+          screenShareRef.current === previous
+        ) {
+          screenShareRef.current = null;
+          setScreenShare(null);
+          if (previous) playEffectSound('screenShareStop');
+          console.error('[ScreenShare]', err);
+          setCamError(`画面共有を開始できませんでした: ${err.message}`);
+        }
       }
-
-      const previous = screenShareRef.current;
-      await webrtcRef.current?.startScreenShare(videoTrack, source.name, audioTrack);
-
-      // 共有元変更時は旧ストリームを止める（manager は producer のみ閉じる）
-      previous?.stream?.getTracks().forEach(track => { try { track.stop(); } catch { /* ignore */ } });
-
-      const next = {
-        sourceId: source.id,
-        sourceName: source.name || '画面共有',
-        hasAudio: !!audioTrack,
-        audioEnabled: !!audioTrack,
-        paused: false,
-        stream,
-      };
-      screenShareRef.current = next;
-      setScreenShare(next);
-      setCamError(null);
-      playEffectSound('screenShareStart');
-    } catch (err) {
-      console.error('[ScreenShare]', err);
-      setCamError(`画面共有を開始できませんでした: ${err.message}`);
+    })();
+    screenShareStartPromiseRef.current = operation;
+    try {
+      await operation;
+    } finally {
+      if (screenShareStartPromiseRef.current === operation) screenShareStartPromiseRef.current = null;
     }
   }, [playEffectSound]);
 
@@ -4148,6 +4605,17 @@ export default function MainView() {
                       サブ（保険）サーバー
                     </option>
                   </select>
+                </div>
+                <div className="field">
+                  <label>接続トークン</label>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={settingsDraft.authToken || ''}
+                    onChange={e => updateSettingsDraft('authToken', e.target.value)}
+                    placeholder="サーバーの SFU_AUTH_TOKEN"
+                  />
+                  <p className="field-hint">サーバーで認証を有効にした場合のみ入力し、全拠点で同じ値を設定します。</p>
                 </div>
                 <p className="field-hint">
                   現在のサーバーに約{Math.round(FAILOVER_AFTER_MS / 1000)}秒間接続できず、もう一方のサーバーが応答する場合は自動的に切り替えて再接続します。
