@@ -1,0 +1,1080 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>録画タイムライン - CHECKHOUSE Meeting System</title>
+<!--
+  録画タイムライン再生UI
+
+  サーバー(/recordings)と専用ビューアアプリ(recording-viewer)の両方で使われる。
+  データソースは自動判定:
+    - window.recviewer (Electronビューアの preload ブリッジ) があればそれを使う
+      (サーバー接続モード / NAS・ローカルフォルダ直読みモードの両方をブリッジが吸収)
+    - 無ければ同一オリジンの /recordings/api/* を使う(サーバー配信時)
+
+  ※このファイルの原本は server/public/recordings.html。
+    recording-viewer/ui/recordings.html は同一内容のコピー(ビルド同梱用)。
+-->
+<style>
+  :root {
+    --bg: #10141c;
+    --panel: #1a2029;
+    --panel2: #222a36;
+    --border: #2e3947;
+    --text: #e8edf4;
+    --muted: #8b98a9;
+    --accent: #4da3ff;
+    --accent2: #37c978;
+    --danger: #ff6b6b;
+    --warn: #f0b429;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic UI", "Meiryo", sans-serif;
+    font-size: 14px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── ヘッダー ── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; font-weight: 600; white-space: nowrap; }
+  .date-controls { display: flex; align-items: center; gap: 6px; }
+  .btn {
+    background: var(--panel2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #08121f; font-weight: 600; }
+  .btn.small { padding: 4px 8px; font-size: 12px; }
+  input[type="date"] {
+    background: var(--panel2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 13px;
+    color-scheme: dark;
+  }
+  .status-chips { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+  .chip {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: var(--panel2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .chip.ok { color: var(--accent2); border-color: rgba(55,201,120,.4); }
+  .chip.bad { color: var(--danger); border-color: rgba(255,107,107,.4); }
+  .chip.warn { color: var(--warn); border-color: rgba(240,180,41,.4); }
+
+  /* ── 本体レイアウト ── */
+  main { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 230px;
+    min-width: 180px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  .aside-head {
+    padding: 10px 12px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .aside-head .title { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  .aside-head .row { display: flex; gap: 6px; }
+  .loc-list { flex: 1; overflow-y: auto; padding: 6px; }
+  .loc-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    user-select: none;
+  }
+  .loc-item:hover { background: var(--panel2); }
+  .loc-item.checked { background: var(--panel2); border-color: var(--border); }
+  .loc-item input { accent-color: var(--accent); width: 15px; height: 15px; flex: none; }
+  .loc-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .loc-sub { font-size: 11px; color: var(--muted); }
+  .rec-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--danger);
+    flex: none;
+    animation: blink 1.6s infinite;
+  }
+  @keyframes blink { 50% { opacity: .25; } }
+  .empty-note { color: var(--muted); padding: 16px 12px; font-size: 13px; line-height: 1.7; }
+
+  /* ── 映像グリッド ── */
+  .stage { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  #videoGrid {
+    flex: 1;
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    min-height: 0;
+    grid-auto-rows: 1fr;
+    align-items: stretch;
+  }
+  .tile {
+    position: relative;
+    background: #000;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    min-height: 120px;
+  }
+  .tile video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .tile .label {
+    position: absolute;
+    left: 8px; top: 8px;
+    background: rgba(0,0,0,.6);
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    z-index: 2;
+  }
+  .tile .norec {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    color: var(--muted);
+    background: repeating-linear-gradient(45deg, #151a22, #151a22 12px, #181e27 12px, #181e27 24px);
+    font-size: 13px;
+    z-index: 1;
+  }
+  .tile .norec .big { font-size: 22px; opacity: .7; }
+  .tile .audio-btn {
+    position: absolute;
+    right: 8px; bottom: 8px;
+    z-index: 3;
+    background: rgba(0,0,0,.6);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 9px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .tile .audio-btn.on { border-color: var(--accent2); color: var(--accent2); }
+  .tile .live-badge {
+    position: absolute;
+    right: 8px; top: 8px;
+    z-index: 2;
+    background: rgba(200,40,40,.85);
+    color: #fff;
+    padding: 2px 9px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    display: none;
+  }
+  .btn.live-on { background: #c22; border-color: #c22; color: #fff; font-weight: 700; }
+  .grid-empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--muted);
+    font-size: 14px;
+    height: 100%;
+    grid-column: 1 / -1;
+    text-align: center;
+    line-height: 2;
+  }
+
+  /* ── コントロール ── */
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .play-btn {
+    width: 42px; height: 42px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #08121f;
+    border: none;
+    font-size: 17px;
+    cursor: pointer;
+    flex: none;
+  }
+  .time-display { font-variant-numeric: tabular-nums; font-size: 17px; font-weight: 600; min-width: 90px; }
+  .date-display { color: var(--muted); font-size: 12px; }
+  select {
+    background: var(--panel2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 13px;
+  }
+  .ctrl-label { color: var(--muted); font-size: 12px; }
+
+  /* ── タイムライン ── */
+  .timeline-wrap {
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 4px 0 8px;
+  }
+  .timeline-scroll { overflow-x: auto; overflow-y: hidden; }
+  .timeline-inner { position: relative; min-width: 100%; }
+  .time-axis {
+    position: relative;
+    height: 20px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .time-axis .tick {
+    position: absolute;
+    top: 2px;
+    font-size: 10px;
+    color: var(--muted);
+    transform: translateX(-50%);
+    user-select: none;
+  }
+  .tl-rows { position: relative; cursor: pointer; }
+  .tl-row {
+    position: relative;
+    height: 26px;
+    border-bottom: 1px solid rgba(46,57,71,.5);
+  }
+  .tl-row .row-label {
+    position: sticky;
+    left: 4px;
+    top: 4px;
+    z-index: 3;
+    display: inline-block;
+    font-size: 11px;
+    color: var(--muted);
+    background: rgba(26,32,41,.85);
+    padding: 1px 8px;
+    border-radius: 4px;
+    pointer-events: none;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .seg {
+    position: absolute;
+    top: 5px;
+    height: 16px;
+    background: linear-gradient(180deg, #3f8fe0, #2d6db3);
+    border-radius: 3px;
+    min-width: 2px;
+    opacity: .92;
+  }
+  .seg.screen { background: linear-gradient(180deg, #37c978, #23935a); }
+  .playhead {
+    position: absolute;
+    top: 0; bottom: 0;
+    width: 2px;
+    background: var(--danger);
+    z-index: 4;
+    pointer-events: none;
+  }
+  .playhead::before {
+    content: '';
+    position: absolute;
+    top: 0; left: -4px;
+    border: 5px solid transparent;
+    border-top-color: var(--danger);
+  }
+  .now-line { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(240,180,41,.6); z-index: 3; pointer-events: none; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>📹 録画タイムライン</h1>
+    <div class="date-controls">
+      <button class="btn small" id="prevDayBtn" title="前日">◀</button>
+      <input type="date" id="datePicker">
+      <button class="btn small" id="nextDayBtn" title="翌日">▶</button>
+      <button class="btn small" id="todayBtn">今日</button>
+      <button class="btn small" id="refreshBtn" title="再読み込み">🔄</button>
+    </div>
+    <button class="btn small" id="sourceBtn" style="display:none">⚙ データソース</button>
+    <div class="status-chips" id="statusChips"></div>
+  </header>
+
+  <!-- 専用ビューアアプリのみ: データソース設定(サーバー接続 / NAS・フォルダ直読み) -->
+  <div id="sourcePanel" style="display:none; position:absolute; top:52px; left:16px; z-index:50;
+       background:var(--panel2); border:1px solid var(--border); border-radius:10px;
+       padding:16px; width:480px; max-width:92vw; box-shadow:0 8px 30px rgba(0,0,0,.5);">
+    <div style="font-weight:600; margin-bottom:10px;">データソース設定</div>
+    <div style="display:flex; flex-direction:column; gap:10px;">
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+        <input type="radio" name="srcMode" value="server" id="srcModeServer">
+        サーバーに接続（稼働中の会議サーバーから再生）
+      </label>
+      <input id="srcServerUrl" placeholder="例: http://192.168.10.5:3000" style="background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:7px 10px;">
+      <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+        <input type="radio" name="srcMode" value="folder" id="srcModeFolder">
+        フォルダを直接読む（NAS・ローカルの録画データ）
+      </label>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <div id="srcFolderDisplay" style="flex:1; font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">未選択</div>
+        <button class="btn small" id="srcFolderBtn">録画フォルダを選択</button>
+      </div>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <div id="srcDbFolderDisplay" style="flex:1; font-size:12px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">DB: 自動(録画フォルダ内 recording-db)</div>
+        <button class="btn small" id="srcDbFolderBtn">DBフォルダを選択(任意)</button>
+      </div>
+      <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:4px;">
+        <button class="btn small" id="srcCancelBtn">閉じる</button>
+        <button class="btn primary small" id="srcApplyBtn">適用</button>
+      </div>
+    </div>
+  </div>
+
+  <main>
+    <aside>
+      <div class="aside-head">
+        <div class="title">拠点を選択（複数可）</div>
+        <div class="row">
+          <button class="btn small" id="selectAllBtn" style="flex:1">全拠点選択</button>
+          <button class="btn small" id="clearAllBtn" style="flex:1">解除</button>
+        </div>
+      </div>
+      <div class="loc-list" id="locList">
+        <div class="empty-note">読み込み中...</div>
+      </div>
+    </aside>
+
+    <section class="stage">
+      <div id="videoGrid"><div class="grid-empty">左の一覧から拠点を選択してください</div></div>
+
+      <div class="controls">
+        <button class="play-btn" id="playBtn" title="再生/一時停止">▶</button>
+        <div>
+          <div class="time-display" id="timeDisplay">--:--:--</div>
+          <div class="date-display" id="dateDisplay"></div>
+        </div>
+        <span class="ctrl-label">速度</span>
+        <select id="speedSelect">
+          <option value="0.5">0.5倍</option>
+          <option value="1" selected>1倍</option>
+          <option value="2">2倍</option>
+          <option value="4">4倍</option>
+          <option value="8">8倍</option>
+        </select>
+        <span class="ctrl-label">表示幅</span>
+        <select id="zoomSelect">
+          <option value="1" selected>24時間</option>
+          <option value="4">6時間</option>
+          <option value="24">1時間</option>
+        </select>
+        <button class="btn small" id="latestBtn">最新の録画へ</button>
+        <button class="btn small" id="liveBtn" title="録画中の映像をリアルタイムで見る">🔴 ライブ</button>
+      </div>
+
+      <div class="timeline-wrap">
+        <div class="timeline-scroll" id="timelineScroll">
+          <div class="timeline-inner" id="timelineInner">
+            <div class="time-axis" id="timeAxis"></div>
+            <div class="tl-rows" id="tlRows"></div>
+            <div class="playhead" id="playhead" style="left:0"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+<script>
+(() => {
+  'use strict';
+
+  // ── データソース抽象化(サーバーHTTP / Electronビューアブリッジ) ──
+  const bridge = window.recviewer || null;
+  const ds = bridge ? {
+    mode: () => bridge.mode(),
+    status: () => bridge.status(),
+    locations: () => bridge.locations(),
+    segments: (query) => bridge.segments(query),
+    live: () => (bridge.live ? bridge.live() : Promise.resolve([])),
+  } : {
+    mode: () => Promise.resolve({ mode: 'server' }),
+    status: () => fetch('/recordings/api/status').then(r => r.json()),
+    locations: () => fetch('/recordings/api/locations').then(r => r.json()).then(d => d.locations || []),
+    segments: ({ keys, from, to }) => {
+      const params = new URLSearchParams({ from: String(from), to: String(to) });
+      if (keys && keys.length) params.set('keys', keys.join(','));
+      return fetch(`/recordings/api/segments?${params}`).then(r => r.json()).then(d => d.segments || []);
+    },
+    live: () => fetch('/recordings/api/live').then(r => r.json()).then(d => d.sessions || []),
+  };
+
+  // ── 状態 ──
+  const state = {
+    locations: [],          // { key, locKey, source, locationName, recording }
+    selected: new Set(JSON.parse(localStorage.getItem('rec-selected') || '[]')),
+    dayStartMs: startOfToday(),
+    segmentsByKey: new Map(), // key → その日のセグメント配列(startMs昇順)
+    currentMs: startOfToday() + 9 * 3600 * 1000,
+    playing: false,
+    speed: 1,
+    zoom: 1,
+    lastTick: 0,
+    tiles: new Map(),        // key → { el, video, norec, label, segId, pendingSeekSec }
+    live: false,             // ライブモード(録画中データのリアルタイム視聴)
+    liveSessions: [],        // /recordings/api/live の結果
+    audioKey: null,          // 音声ONのタイル(同時に1拠点のみ)
+  };
+
+  const $ = id => document.getElementById(id);
+  const DAY_MS = 24 * 3600 * 1000;
+
+  function startOfToday() {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  }
+  function fmtClock(ms) {
+    const d = new Date(ms);
+    const p = n => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  }
+  function fmtDateJp(ms) {
+    const d = new Date(ms);
+    const w = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+    return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日(${w})`;
+  }
+  function dateInputValue(ms) {
+    const d = new Date(ms);
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+  function escapeHtml(text) {
+    return String(text ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+  function sourceLabel(source) {
+    return source === 'screen' ? '画面' : 'カメラ';
+  }
+
+  // ── 拠点一覧 ──
+  async function loadLocations() {
+    try {
+      state.locations = await ds.locations();
+    } catch (err) {
+      $('locList').innerHTML = `<div class="empty-note">拠点一覧を取得できません:<br>${escapeHtml(err.message)}</div>`;
+      return;
+    }
+    // 消えた拠点の選択は外す
+    const validKeys = new Set(state.locations.map(l => l.key));
+    for (const key of [...state.selected]) if (!validKeys.has(key)) state.selected.delete(key);
+    renderLocList();
+    renderTiles();
+    renderTimeline();
+  }
+
+  function renderLocList() {
+    const list = $('locList');
+    if (!state.locations.length) {
+      list.innerHTML = '<div class="empty-note">録画データがまだありません。<br>録画を有効にすると、接続中の拠点の映像が自動で記録されます。</div>';
+      return;
+    }
+    list.innerHTML = state.locations.map(loc => `
+      <label class="loc-item ${state.selected.has(loc.key) ? 'checked' : ''}" data-key="${escapeHtml(loc.key)}">
+        <input type="checkbox" ${state.selected.has(loc.key) ? 'checked' : ''}>
+        <span class="loc-name">${escapeHtml(loc.locationName)}
+          <span class="loc-sub">(${sourceLabel(loc.source)})</span></span>
+        ${loc.recording ? '<span class="rec-dot" title="録画中"></span>' : ''}
+      </label>
+    `).join('');
+    list.querySelectorAll('.loc-item').forEach(item => {
+      item.addEventListener('change', () => {
+        const key = item.dataset.key;
+        if (item.querySelector('input').checked) state.selected.add(key);
+        else state.selected.delete(key);
+        persistSelection();
+        renderLocList();
+        renderTiles();
+        loadSegments();
+      });
+    });
+  }
+
+  function persistSelection() {
+    localStorage.setItem('rec-selected', JSON.stringify([...state.selected]));
+  }
+
+  $('selectAllBtn').addEventListener('click', () => {
+    for (const loc of state.locations) state.selected.add(loc.key);
+    persistSelection();
+    renderLocList(); renderTiles(); loadSegments();
+  });
+  $('clearAllBtn').addEventListener('click', () => {
+    state.selected.clear();
+    persistSelection();
+    renderLocList(); renderTiles(); loadSegments();
+  });
+
+  // ── セグメント読み込み ──
+  let segmentLoadSeq = 0;
+  async function loadSegments() {
+    const seq = ++segmentLoadSeq;
+    const keys = [...state.selected];
+    const from = state.dayStartMs;
+    const to = state.dayStartMs + DAY_MS;
+    if (!keys.length) {
+      state.segmentsByKey.clear();
+      renderTimeline();
+      return;
+    }
+    try {
+      const segments = await ds.segments({ keys, from, to });
+      if (seq !== segmentLoadSeq) return; // 古い応答は破棄
+      state.segmentsByKey.clear();
+      for (const seg of segments) {
+        if (!state.segmentsByKey.has(seg.key)) state.segmentsByKey.set(seg.key, []);
+        state.segmentsByKey.get(seg.key).push(seg);
+      }
+      for (const list of state.segmentsByKey.values()) list.sort((a, b) => a.startMs - b.startMs);
+    } catch (err) {
+      console.warn('segments load failed:', err);
+    }
+    renderTimeline();
+  }
+
+  function findSegmentAt(key, t) {
+    const list = state.segmentsByKey.get(key);
+    if (!list) return null;
+    for (const seg of list) {
+      if (t >= seg.startMs && t < seg.startMs + (seg.durationMs || 0)) return seg;
+    }
+    return null;
+  }
+
+  function latestSegment() {
+    let latest = null;
+    for (const list of state.segmentsByKey.values()) {
+      for (const seg of list) {
+        const end = seg.startMs + (seg.durationMs || 0);
+        if (!latest || end > latest.startMs + (latest.durationMs || 0)) latest = seg;
+      }
+    }
+    return latest;
+  }
+
+  // ── 映像タイル ──
+  function renderTiles() {
+    const grid = $('videoGrid');
+    const keys = [...state.selected];
+    // 既存タイルの再利用(再生位置を保つ)
+    for (const [key, tile] of [...state.tiles]) {
+      if (!keys.includes(key)) {
+        tile.el.remove();
+        state.tiles.delete(key);
+      }
+    }
+    grid.querySelector('.grid-empty')?.remove();
+
+    for (const key of keys) {
+      if (state.tiles.has(key)) continue;
+      const loc = state.locations.find(l => l.key === key);
+      const el = document.createElement('div');
+      el.className = 'tile';
+      el.innerHTML = `
+        <span class="label"></span>
+        <span class="live-badge">● LIVE</span>
+        <video muted playsinline preload="auto"></video>
+        <div class="norec"><span class="big">🎬</span><span>この時刻の録画はありません</span></div>
+        <button class="audio-btn" title="この拠点の音声を聞く">🔇</button>
+      `;
+      const video = el.querySelector('video');
+      const tile = {
+        el, video,
+        norec: el.querySelector('.norec'),
+        label: el.querySelector('.label'),
+        liveBadge: el.querySelector('.live-badge'),
+        audioBtn: el.querySelector('.audio-btn'),
+        segId: null,
+        pendingSeekSec: null,
+        liveUrl: null,
+        liveReconnectAt: 0,
+      };
+      tile.label.textContent = `${loc?.locationName || key} (${sourceLabel(loc?.source)})`;
+      video.addEventListener('loadedmetadata', () => {
+        if (state.live) return;
+        if (tile.pendingSeekSec != null) {
+          try { video.currentTime = tile.pendingSeekSec; } catch (_) {}
+          tile.pendingSeekSec = null;
+        }
+        if (state.playing) safePlay(tile);
+      });
+      video.addEventListener('error', () => { tile.segId = null; });
+      // 音声は同時に1拠点のみON(全拠点同時再生時の混線を防ぐ)
+      tile.audioBtn.addEventListener('click', () => {
+        state.audioKey = state.audioKey === key ? null : key;
+        applyAudioSelection();
+      });
+      state.tiles.set(key, tile);
+      grid.appendChild(el);
+    }
+    applyAudioSelection();
+
+    if (!keys.length) {
+      grid.innerHTML = '<div class="grid-empty">左の一覧から拠点を選択してください<br><span style="font-size:12px">「全拠点選択」で全拠点を同時に再生できます</span></div>';
+      state.tiles.clear();
+    }
+
+    // グリッド列数(枚数に応じて自動)
+    const n = Math.max(keys.length, 1);
+    const cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : 4;
+    grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    syncTiles(true);
+  }
+
+  /** 音声ON拠点(1つ)以外をミュートする */
+  function applyAudioSelection() {
+    for (const [key, tile] of state.tiles) {
+      const on = state.audioKey === key;
+      tile.video.muted = !on;
+      tile.audioBtn.textContent = on ? '🔊' : '🔇';
+      tile.audioBtn.classList.toggle('on', on);
+    }
+  }
+
+  /**
+   * 再生開始。音声付き再生が自動再生ポリシーで拒否された場合は
+   * ミュートへフォールバックして映像だけでも止めない。
+   */
+  function safePlay(tile) {
+    tile.video.play().catch(() => {
+      if (!tile.video.muted) {
+        state.audioKey = null;
+        applyAudioSelection();
+        tile.video.play().catch(() => {});
+      }
+    });
+  }
+
+  /** 現在時刻に合わせて各タイルの映像・シーク位置を同期する */
+  function syncTiles(force = false) {
+    if (state.live) return; // ライブモード中はライブエンジンが管理する
+    const t = state.currentMs;
+    for (const [key, tile] of state.tiles) {
+      const seg = findSegmentAt(key, t);
+      if (!seg) {
+        tile.norec.style.display = 'flex';
+        if (tile.segId) { tile.video.pause(); tile.segId = null; tile.video.removeAttribute('src'); tile.video.load(); }
+        continue;
+      }
+      tile.norec.style.display = 'none';
+      const offsetSec = (t - seg.startMs) / 1000;
+      if (tile.segId !== seg.id) {
+        tile.segId = seg.id;
+        tile.pendingSeekSec = offsetSec;
+        tile.video.src = seg.mediaUrl;
+        tile.video.load();
+      } else if (force || Math.abs((tile.video.currentTime || 0) - offsetSec) > 2.5) {
+        // 2.5秒以上ズレたら補正(セグメント内シーク・複数拠点間の同期維持)
+        try { tile.video.currentTime = offsetSec; } catch (_) {}
+      }
+      tile.video.playbackRate = state.speed;
+      if (state.playing && tile.video.paused) safePlay(tile);
+      if (!state.playing && !tile.video.paused) tile.video.pause();
+    }
+  }
+
+  // ── 再生エンジン(マスタークロック) ──
+  function tick(now) {
+    if (state.live) {
+      // ライブ中は再生ヘッドを現在時刻に固定表示
+      state.currentMs = Math.min(Date.now(), state.dayStartMs + DAY_MS - 1);
+      updatePlayhead();
+    } else if (state.playing) {
+      const elapsed = state.lastTick ? now - state.lastTick : 0;
+      state.currentMs += elapsed * state.speed;
+      if (state.currentMs >= state.dayStartMs + DAY_MS) {
+        state.currentMs = state.dayStartMs + DAY_MS - 1000;
+        setPlaying(false);
+      }
+      syncTiles();
+      updatePlayhead();
+    }
+    state.lastTick = now;
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  function setPlaying(playing) {
+    state.playing = playing;
+    $('playBtn').textContent = playing ? '⏸' : '▶';
+    syncTiles();
+  }
+
+  function seekTo(ms) {
+    state.currentMs = Math.min(Math.max(ms, state.dayStartMs), state.dayStartMs + DAY_MS - 1);
+    syncTiles(true);
+    updatePlayhead();
+  }
+
+  $('playBtn').addEventListener('click', () => setPlaying(!state.playing));
+  $('speedSelect').addEventListener('change', e => {
+    state.speed = Number(e.target.value) || 1;
+    syncTiles();
+  });
+  $('latestBtn').addEventListener('click', () => {
+    if (state.live) setLive(false);
+    const seg = latestSegment();
+    if (!seg) return;
+    // 最新セグメントの終端30秒前へ。ただしセグメント開始より手前には行かない
+    const end = seg.startMs + (seg.durationMs || 0);
+    seekTo(Math.max(seg.startMs, end - 30_000));
+  });
+
+  // ── ライブモード(録画中データのリアルタイム視聴) ──
+  // サーバーが書き込み中の生セグメント(webm)を追記追従ストリーミングで受信し、
+  // バッファ末尾に張り付くことで数秒遅れのライブ視聴を実現する。
+  // セグメント切替(既定5分ごと)でストリームが終わると自動で再接続する。
+
+  let liveTimer = null;
+
+  async function refreshLiveSessions() {
+    try {
+      state.liveSessions = await ds.live();
+    } catch {
+      state.liveSessions = [];
+    }
+  }
+
+  function liveSessionFor(key) {
+    return state.liveSessions.find(s => s.key === key) || null;
+  }
+
+  function connectLiveTile(key, tile) {
+    const session = liveSessionFor(key);
+    if (!session || !session.liveUrl) {
+      tile.norec.style.display = 'flex';
+      tile.norec.querySelector('span:last-child').textContent = 'この拠点は現在録画されていません';
+      tile.liveBadge.style.display = 'none';
+      tile.liveUrl = null;
+      if (tile.video.src) { tile.video.pause(); tile.video.removeAttribute('src'); tile.video.load(); }
+      return;
+    }
+    tile.norec.style.display = 'none';
+    tile.liveBadge.style.display = 'block';
+    tile.liveUrl = session.liveUrl;
+    tile.segId = null;
+    // キャッシュバスターを付けて追従ストリームへ接続
+    tile.video.src = `${session.liveUrl}${session.liveUrl.includes('?') ? '&' : '?'}t=${Date.now()}`;
+    tile.video.load();
+    safePlay(tile);
+  }
+
+  function liveMaintain() {
+    if (!state.live) return;
+    const now = Date.now();
+    for (const [key, tile] of state.tiles) {
+      const video = tile.video;
+      if (!tile.liveUrl) {
+        // 未接続タイル: セッションが現れたら接続する
+        if (liveSessionFor(key) && now > tile.liveReconnectAt) connectLiveTile(key, tile);
+        continue;
+      }
+      // ストリーム終了(セグメント切替)や停止 → 再接続
+      if (video.ended || video.error) {
+        if (now > tile.liveReconnectAt) {
+          tile.liveReconnectAt = now + 2000;
+          connectLiveTile(key, tile);
+        }
+        continue;
+      }
+      // ライブ端(バッファ末尾)への追従。遅れが4秒を超えたらジャンプする
+      try {
+        const buffered = video.buffered;
+        if (buffered.length) {
+          const liveEdge = buffered.end(buffered.length - 1);
+          if (liveEdge - video.currentTime > 4) video.currentTime = Math.max(0, liveEdge - 1);
+          if (video.paused) safePlay(tile);
+        }
+      } catch (_) { /* 一時的なバッファ状態は無視 */ }
+    }
+  }
+
+  async function setLive(enabled) {
+    state.live = !!enabled;
+    const btn = $('liveBtn');
+    btn.classList.toggle('live-on', state.live);
+    btn.textContent = state.live ? '🔴 ライブ中(戻る)' : '🔴 ライブ';
+    if (state.live) {
+      setPlaying(false);
+      // 今日以外を表示中なら今日に切り替える
+      if (Date.now() < state.dayStartMs || Date.now() >= state.dayStartMs + DAY_MS) {
+        setDay(startOfToday());
+      }
+      await refreshLiveSessions();
+      if (!state.liveSessions.length) {
+        setLiveUnavailableNote();
+      }
+      for (const [key, tile] of state.tiles) connectLiveTile(key, tile);
+      liveTimer = setInterval(async () => {
+        await refreshLiveSessions();
+        liveMaintain();
+      }, 2000);
+    } else {
+      if (liveTimer) { clearInterval(liveTimer); liveTimer = null; }
+      for (const tile of state.tiles.values()) {
+        tile.liveUrl = null;
+        tile.liveBadge.style.display = 'none';
+        tile.segId = null;
+        tile.norec.querySelector('span:last-child').textContent = 'この時刻の録画はありません';
+        if (tile.video.src) { tile.video.pause(); tile.video.removeAttribute('src'); tile.video.load(); }
+      }
+      loadSegments().then(() => syncTiles(true));
+    }
+  }
+
+  function setLiveUnavailableNote() {
+    for (const tile of state.tiles.values()) {
+      tile.norec.style.display = 'flex';
+      tile.norec.querySelector('span:last-child').textContent =
+        bridge ? 'ライブ視聴はサーバー接続モードでのみ利用できます' : '現在録画中の拠点がありません';
+    }
+  }
+
+  $('liveBtn').addEventListener('click', () => setLive(!state.live));
+
+  // ── 日付操作 ──
+  function setDay(dayStartMs, { keepTimeOfDay = true } = {}) {
+    const timeOfDay = keepTimeOfDay ? state.currentMs - state.dayStartMs : 9 * 3600 * 1000;
+    state.dayStartMs = dayStartMs;
+    state.currentMs = dayStartMs + Math.min(Math.max(timeOfDay, 0), DAY_MS - 1000);
+    $('datePicker').value = dateInputValue(dayStartMs);
+    setPlaying(false);
+    for (const tile of state.tiles.values()) tile.segId = null;
+    loadSegments();
+    updatePlayhead();
+  }
+  $('datePicker').addEventListener('change', e => {
+    if (state.live) setLive(false);
+    const parts = String(e.target.value || '').split('-').map(Number);
+    if (parts.length === 3 && parts.every(Number.isFinite)) {
+      setDay(new Date(parts[0], parts[1] - 1, parts[2]).getTime());
+    }
+  });
+  $('prevDayBtn').addEventListener('click', () => { if (state.live) setLive(false); setDay(state.dayStartMs - DAY_MS); });
+  $('nextDayBtn').addEventListener('click', () => { if (state.live) setLive(false); setDay(state.dayStartMs + DAY_MS); });
+  $('todayBtn').addEventListener('click', () => { if (state.live) setLive(false); setDay(startOfToday()); });
+  $('refreshBtn').addEventListener('click', () => { loadLocations(); loadSegments(); loadStatus(); });
+  $('zoomSelect').addEventListener('change', e => {
+    state.zoom = Number(e.target.value) || 1;
+    renderTimeline();
+    centerPlayhead();
+  });
+
+  // ── タイムライン描画 ──
+  function timelineWidthPct() { return state.zoom * 100; }
+
+  function renderTimeline() {
+    const inner = $('timelineInner');
+    inner.style.width = `${timelineWidthPct()}%`;
+
+    // 時刻軸(1時間ごと。ズーム時は30分/10分刻み)
+    const axis = $('timeAxis');
+    const stepMin = state.zoom >= 24 ? 10 : state.zoom >= 4 ? 30 : 60;
+    let html = '';
+    for (let min = 0; min <= 24 * 60; min += stepMin) {
+      const pct = (min / (24 * 60)) * 100;
+      const hh = String(Math.floor(min / 60)).padStart(2, '0');
+      const mm = String(min % 60).padStart(2, '0');
+      html += `<span class="tick" style="left:${pct}%">${mm === '00' ? `${hh}時` : `${hh}:${mm}`}</span>`;
+    }
+    axis.innerHTML = html;
+
+    // 拠点ごとのセグメント行
+    const rows = $('tlRows');
+    const keys = [...state.selected];
+    rows.innerHTML = keys.map(key => {
+      const loc = state.locations.find(l => l.key === key);
+      const segs = state.segmentsByKey.get(key) || [];
+      const bars = segs.map(seg => {
+        const startPct = ((seg.startMs - state.dayStartMs) / DAY_MS) * 100;
+        const widthPct = ((seg.durationMs || 0) / DAY_MS) * 100;
+        if (startPct + widthPct < 0 || startPct > 100) return '';
+        return `<span class="seg ${seg.source === 'screen' ? 'screen' : ''}"
+          style="left:${Math.max(0, startPct)}%;width:${Math.max(0.05, Math.min(widthPct, 100 - startPct))}%"
+          title="${escapeHtml(loc?.locationName || '')} ${fmtClock(seg.startMs)}〜"></span>`;
+      }).join('');
+      return `<div class="tl-row" data-key="${escapeHtml(key)}">
+        <span class="row-label">${escapeHtml(loc?.locationName || key)} (${sourceLabel(loc?.source)})</span>${bars}
+      </div>`;
+    }).join('') || '<div class="tl-row"><span class="row-label">拠点未選択</span></div>';
+
+    // 現在時刻ライン(今日を表示中のみ)
+    inner.querySelector('.now-line')?.remove();
+    const now = Date.now();
+    if (now >= state.dayStartMs && now < state.dayStartMs + DAY_MS) {
+      const line = document.createElement('div');
+      line.className = 'now-line';
+      line.style.left = `${((now - state.dayStartMs) / DAY_MS) * 100}%`;
+      inner.appendChild(line);
+    }
+    updatePlayhead();
+  }
+
+  function updatePlayhead() {
+    const pct = ((state.currentMs - state.dayStartMs) / DAY_MS) * 100;
+    $('playhead').style.left = `${Math.min(Math.max(pct, 0), 100)}%`;
+    $('timeDisplay').textContent = fmtClock(state.currentMs);
+    $('dateDisplay').textContent = fmtDateJp(state.currentMs);
+  }
+
+  function centerPlayhead() {
+    const scroll = $('timelineScroll');
+    const inner = $('timelineInner');
+    const pct = (state.currentMs - state.dayStartMs) / DAY_MS;
+    scroll.scrollLeft = inner.offsetWidth * pct - scroll.clientWidth / 2;
+  }
+
+  // タイムラインクリック/ドラッグでシーク
+  function timelineSeekFromEvent(event) {
+    if (state.live) setLive(false); // タイムライン操作でライブを抜けて過去再生へ
+    const inner = $('timelineInner');
+    const rect = inner.getBoundingClientRect();
+    const ratio = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1);
+    seekTo(state.dayStartMs + ratio * DAY_MS);
+  }
+  let dragging = false;
+  for (const el of [$('timeAxis'), $('tlRows')]) {
+    el.addEventListener('mousedown', event => {
+      dragging = true;
+      timelineSeekFromEvent(event);
+    });
+  }
+  window.addEventListener('mousemove', event => { if (dragging) timelineSeekFromEvent(event); });
+  window.addEventListener('mouseup', () => { dragging = false; });
+
+  // ── ステータス表示 ──
+  async function loadStatus() {
+    let status = null;
+    try { status = await ds.status(); } catch { /* サーバー未接続など */ }
+    const chips = [];
+    if (!status) {
+      chips.push('<span class="chip bad">状態を取得できません</span>');
+    } else if (status.folderMode) {
+      chips.push(`<span class="chip ok">フォルダ直読み: ${escapeHtml(status.folder || '')}</span>`);
+    } else {
+      const s = status.settings || {};
+      chips.push(s.enabled
+        ? '<span class="chip ok">● 録画有効</span>'
+        : '<span class="chip warn">録画停止中</span>');
+      if (s.enabled) {
+        chips.push(status.storageOk
+          ? '<span class="chip ok">保存先OK</span>'
+          : `<span class="chip bad">保存先エラー: ${escapeHtml(status.storageError || '')}</span>`);
+        if (!status.ffmpegOk) chips.push('<span class="chip bad">ffmpeg未検出</span>');
+        const active = (status.activeSessions || []).filter(x => x.alive).length;
+        chips.push(`<span class="chip">録画中 ${active}拠点</span>`);
+        if (status.compressionQueue > 0) chips.push(`<span class="chip">圧縮待ち ${status.compressionQueue}</span>`);
+        chips.push(`<span class="chip">保持 ${escapeHtml(String(s.retentionDays))}日</span>`);
+      }
+      if (status.disk && Number.isFinite(status.disk.freeBytes)) {
+        const freeGb = (status.disk.freeBytes / 1024 / 1024 / 1024).toFixed(0);
+        chips.push(`<span class="chip">空き ${freeGb}GB</span>`);
+      }
+    }
+    $('statusChips').innerHTML = chips.join('');
+  }
+
+  // ── データソース設定(専用ビューアアプリのみ) ──
+  if (bridge) {
+    const panel = $('sourcePanel');
+    let pendingFolder = '';
+    let pendingDbFolder = '';
+
+    async function openSourcePanel() {
+      const cfg = await bridge.getConfig();
+      $('srcModeServer').checked = cfg.mode !== 'folder';
+      $('srcModeFolder').checked = cfg.mode === 'folder';
+      $('srcServerUrl').value = cfg.serverUrl || '';
+      pendingFolder = cfg.folder || '';
+      pendingDbFolder = cfg.dbFolder || '';
+      $('srcFolderDisplay').textContent = pendingFolder || '未選択';
+      $('srcDbFolderDisplay').textContent = pendingDbFolder ? `DB: ${pendingDbFolder}` : 'DB: 自動(録画フォルダ内 recording-db)';
+      panel.style.display = 'block';
+    }
+    $('sourceBtn').style.display = '';
+    $('sourceBtn').addEventListener('click', openSourcePanel);
+    $('srcCancelBtn').addEventListener('click', () => { panel.style.display = 'none'; });
+    $('srcFolderBtn').addEventListener('click', async () => {
+      const dir = await bridge.chooseFolder('録画データのフォルダを選択(NASのマウント先も可)');
+      if (dir) { pendingFolder = dir; $('srcFolderDisplay').textContent = dir; $('srcModeFolder').checked = true; $('srcModeServer').checked = false; }
+    });
+    $('srcDbFolderBtn').addEventListener('click', async () => {
+      const dir = await bridge.chooseFolder('録画データベース(recording-db)のフォルダを選択');
+      if (dir) { pendingDbFolder = dir; $('srcDbFolderDisplay').textContent = `DB: ${dir}`; }
+    });
+    $('srcApplyBtn').addEventListener('click', async () => {
+      await bridge.setConfig({
+        mode: $('srcModeFolder').checked ? 'folder' : 'server',
+        serverUrl: $('srcServerUrl').value.trim(),
+        folder: pendingFolder,
+        dbFolder: pendingDbFolder,
+      });
+      panel.style.display = 'none';
+      state.segmentsByKey.clear();
+      for (const tile of state.tiles.values()) tile.segId = null;
+      await loadLocations();
+      await loadSegments();
+      loadStatus();
+    });
+    // 初回起動で未設定なら設定パネルを開く
+    bridge.getConfig().then(cfg => {
+      if (!cfg.configured) openSourcePanel();
+    });
+  }
+
+  // ── 起動 ──
+  $('datePicker').value = dateInputValue(state.dayStartMs);
+  updatePlayhead();
+  loadLocations().then(() => loadSegments());
+  loadStatus();
+  // 今日を表示中は新しいセグメントを定期的に取り込む
+  setInterval(() => {
+    loadStatus();
+    if (Date.now() >= state.dayStartMs && Date.now() < state.dayStartMs + DAY_MS) {
+      loadLocations();
+      loadSegments();
+    }
+  }, 30_000);
+})();
+</script>
+</body>
+</html>

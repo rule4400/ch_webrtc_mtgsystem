@@ -14,13 +14,42 @@ import {
   Volume2, VolumeX, Settings, ChevronDown, X, Download,
   Plus, Pencil, PanelLeftClose, PanelLeftOpen, Maximize2, Minimize2,
   Volume1, Bell, BellRing, Trash2, Check, MonitorUp, Pause, Play, SwitchCamera, Square,
-  Briefcase, Clock, Moon, Music,
+  Briefcase, Clock, Moon, Music, PhoneOff,
 } from 'lucide-react';
 import { WebRTCManager } from '../services/webrtc';
 import ScreenShareModal from '../components/ScreenShareModal';
+import {
+  playSystemSound,
+  startLoopingSystemSound,
+  stopAllSystemSounds,
+  stopLoopingSystemSound,
+  systemSoundUrl,
+} from '../services/system-sounds';
 
-const APP_VERSION = '0.4.0';
+const APP_VERSION = '0.5.0';
+// サーバーと確立できない状態がこの時間連続したら、アプリ本体を再起動する
+// （無限リトライの最終手段。Electronメインの app.relaunch で完全再起動）。
+const APP_RELAUNCH_AFTER_MS = 5 * 60 * 1000;
 const APP_TYPE = 'client';
+
+/**
+ * latest が current より新しいときだけ true。
+ * 単純な !== 比較だとサーバー登録が古い場合にダウングレード案内になるため数値比較する。
+ * 数値として解釈できない形式は従来どおり不一致で更新扱い（運用でのフェイルセーフ）。
+ */
+function isNewerVersion(latest, current) {
+  if (!latest || latest === current) return false;
+  const parse = value => String(value).trim().replace(/^v/i, '').split('.').map(part => parseInt(part, 10));
+  const a = parse(latest);
+  const b = parse(current);
+  if (a.some(Number.isNaN) || b.some(Number.isNaN)) return latest !== current;
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
 const CALL_RING_TIMEOUT_MS = 30000;
 const CALL_RING_INTERVAL_MS = 1500;
 const DEFAULT_SYSTEM_STATE = {
@@ -28,11 +57,31 @@ const DEFAULT_SYSTEM_STATE = {
   channels: [{ id: 'general', name: '一般' }],
   latestVersions: { [APP_TYPE]: APP_VERSION },
   updatePackages: {},
+  maintenance: { serverRestartTimes: [], clientRestartTimes: [] },
 };
+
+// ── ルーティン再起動（サーバーから同期された時刻にアプリ本体を再起動）──────
+// 長時間稼働によるレンダラー/GPUプロセスのリソース肥大を、営業時間外の
+// 計画再起動で予防する。時刻(HH:MM、複数可)は server-gui で設定され、
+// systemState.maintenance.clientRestartTimes として全拠点へ同期される。
+const ROUTINE_RESTART_WINDOW_MS = 10 * 60 * 1000; // 通話中などの延期を許す猶予
+const ROUTINE_RESTART_KEY = 'sfu_last_routine_restart';
+const APP_STARTED_AT = Date.now();
+
+// 全拠点が同一時刻に一斉再起動してサーバーへ集中しないよう、端末ごとに
+// 0〜20秒の固定オフセットをずらす（instanceId から決定的に算出）
+function routineRestartJitterMs() {
+  let seed = '';
+  try { seed = localStorage.getItem('sfu_instance_id') || ''; } catch { /* ignore */ }
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  return hash % 20000;
+}
+const ROUTINE_RESTART_JITTER_MS = routineRestartJitterMs();
 
 // ─── デバイス選択ドロップダウンボタン ────────────────────
 
-function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, onDeviceChange, title, label }) {
+function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, onDeviceChange, title, label, shortcutKey }) {
   const [open, setOpen] = useState(false);
   const wrapRef = useRef(null);
 
@@ -50,6 +99,7 @@ function DeviceButton({ active, onToggle, Icon, IconOff, devices, selectedId, on
       <button className={`ctrl-btn ${!active ? 'danger' : ''}`} onClick={onToggle}>
         {active ? <Icon size={20} /> : <IconOff size={20} />}
         {label && <span className="ctrl-btn-label">{label}</span>}
+        {shortcutKey && <kbd className="ctrl-btn-kbd" aria-hidden="true">{shortcutKey}</kbd>}
       </button>
       {/* デバイス選択トリガー */}
       {devices.length > 0 && (
@@ -153,6 +203,7 @@ const VideoCell = React.memo(function VideoCell({
   audioPaused,
   presenceMode = 'none',
   signalLevel = null,
+  reconnecting = false,
   highlightMuted = false,
   speakerDeviceId,
   speakerMuted,
@@ -278,13 +329,24 @@ const VideoCell = React.memo(function VideoCell({
       />
 
       {/* カメラOFF / 映像未達 オーバーレイ: 拠点名を中央に大きく表示する */}
-      {(cameraOff || noVideoSignal) && (
+      {(cameraOff || noVideoSignal) && !reconnecting && (
         <div className="cam-off-overlay">
           <div className="camoff-name">{label}</div>
           <span className="camoff-caption">
             <VideoOff size={13} />
             {cameraOff ? 'カメラ OFF' : '映像を受信していません'}
           </span>
+        </div>
+      )}
+
+      {/* この拠点がサーバーと再接続中（復旧中）: スピナーを中央に表示する */}
+      {reconnecting && (
+        <div className="tile-reconnect-overlay" role="status" aria-label={`${label} はサーバー接続中`}>
+          <div className="camoff-name">{label}</div>
+          <div className="tile-reconnect-row">
+            <span className="reconnect-spinner small" aria-hidden="true" />
+            <span>サーバー接続中...</span>
+          </div>
         </div>
       )}
 
@@ -306,19 +368,20 @@ const VideoCell = React.memo(function VideoCell({
         {isSelf && <span style={{ opacity: 0.5, marginLeft: 3, flexShrink: 0 }}>（自拠点）</span>}
       </div>
 
-      {/* ── ホバー操作バー ──
-          普段は映像を邪魔せず、マウスオーバー時のみ半透明バーを表示する。
-          フォーカス・個別ミュート・個別音量・呼び出しをここから操作できる。 */}
+      {/* ── ホバー操作オーバーレイ ──
+          普段は映像を邪魔せず、マウスオーバー時のみタイル中央に大きめの
+          半透明パネル（不透明度60%）を表示する。各ボタンはホバーで
+          一言の補助説明（data-tip）を吹き出し表示する。 */}
       <div className="tile-actions" onDoubleClick={event => event.stopPropagation()}>
         {canFocus && (
           <button
             type="button"
             className={`tile-btn ${focused ? 'active' : ''}`}
             onClick={() => onFocus?.(tileId)}
-            title={focused ? 'フォーカス解除' : '大きく表示'}
-            aria-label={focused ? 'フォーカス解除' : '大きく表示'}
+            data-tip={focused ? '元のサイズに戻す' : 'この拠点を大きく表示'}
+            aria-label={focused ? '元のサイズに戻す' : 'この拠点を大きく表示'}
           >
-            {focused ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+            {focused ? <Minimize2 size={20} /> : <Maximize2 size={20} />}
           </button>
         )}
 
@@ -327,9 +390,10 @@ const VideoCell = React.memo(function VideoCell({
             type="button"
             className={`tile-btn ${volumeValue <= 0 ? 'danger-active' : ''}`}
             onClick={() => onVolumeChange?.(tileId, volumeValue > 0 ? 0 : 1)}
-            title={volumeValue > 0 ? 'この拠点をスピーカーミュート' : 'スピーカーミュート解除'}
+            data-tip={volumeValue > 0 ? 'この拠点の音声を消す' : 'この拠点の音声を出す'}
+            aria-label={volumeValue > 0 ? 'この拠点の音声を消す' : 'この拠点の音声を出す'}
           >
-            {volumeValue > 0 ? <Volume2 size={15} /> : <VolumeX size={15} />}
+            {volumeValue > 0 ? <Volume2 size={20} /> : <VolumeX size={20} />}
           </button>
         )}
 
@@ -339,7 +403,8 @@ const VideoCell = React.memo(function VideoCell({
             className={`tile-btn ${menuOpen ? 'active' : ''}`}
             onClick={(event) => { event.stopPropagation(); setMenuOpen(open => !open); }}
             onMouseDown={(event) => event.stopPropagation()}
-            title="個別音量調整"
+            data-tip="音量を細かく調整"
+            aria-label="音量を細かく調整"
           >
             <span className="tile-vol-text">{Math.round(volumeValue * 100)}%</span>
           </button>
@@ -350,9 +415,10 @@ const VideoCell = React.memo(function VideoCell({
             type="button"
             className="tile-btn call"
             onClick={onCall}
-            title="この拠点を呼び出す"
+            data-tip="この拠点を呼び出す"
+            aria-label="この拠点を呼び出す"
           >
-            <BellRing size={15} />
+            <BellRing size={20} />
           </button>
         )}
       </div>
@@ -540,21 +606,30 @@ function calculateGridLayout(cellCount, width, height) {
 }
 
 function useFittedVideoGrid(cellCount) {
-  const gridRef = useRef(null);
+  // コールバックref + state でグリッドDOMノードを追跡する。
+  // useRef だと、フォーカス表示⇄グリッド表示の切替でグリッドが再マウントされた
+  // ときに effect が再実行されず（依存が cellCount だけのため）、ResizeObserver が
+  // 取り外された旧ノードを監視し続けて幅0を記録 → フォーカス解除後に全タイルが
+  // 幅1pxで描画され「他拠点が表示されない」不具合になっていた。
+  const [element, setElement] = useState(null);
+  const gridRef = useCallback(node => setElement(node), []);
   const [layout, setLayout] = useState(() => {
     const cols = getGridCols(cellCount);
     return { cols, rows: Math.ceil(Math.max(1, cellCount) / cols), cellWidth: 0, cellHeight: 0 };
   });
 
   useLayoutEffect(() => {
-    const element = gridRef.current;
     if (!element) return undefined;
 
     let frame = 0;
     const update = () => {
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
+        // 取り外された/非表示のノードの計測（幅0）は捨てる。採用すると
+        // セル幅0が残り、再マウント時にタイル数が同じだと再計測されない。
+        if (!element.isConnected) return;
         const rect = element.getBoundingClientRect();
+        if (rect.width < 1 || rect.height < 1) return;
         const next = calculateGridLayout(cellCount, rect.width, rect.height);
         setLayout(prev => (
           prev.cols === next.cols &&
@@ -583,7 +658,7 @@ function useFittedVideoGrid(cellCount) {
       cancelAnimationFrame(frame);
       window.removeEventListener('resize', update);
     };
-  }, [cellCount]);
+  }, [element, cellCount]);
 
   return { gridRef, layout };
 }
@@ -628,6 +703,13 @@ const PRESENCE_LABELS = {
 };
 const QUALITY_OPTIONS = ['high', 'medium', 'low'];
 const QUALITY_LABELS = { high: '高', medium: '中', low: '低' };
+
+function sanitizeVolumePercent(value, fallback = 100) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(100, Math.max(0, Math.round(numeric)));
+}
+
 const defaultClientConfig = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
@@ -644,7 +726,9 @@ const defaultClientConfig = {
   forceTcp: false,          // メディアをTCPで送受信（UDPが不安定な場合のみ）
   sendQuality: 'high',      // 送信画質（ビットレート倍率）
   recvQuality: 'high',      // 受信画質（simulcastレイヤ選択）
-  callVolume: 100,          // 呼び出し音の音量（0-100）
+  voiceVolume: 100,         // 通話音声の音量（0-100）
+  ringtoneVolume: 100,      // 着信音/呼び出し音の音量（0-100）
+  effectsVolume: 100,       // 効果音の音量（0-100）
 };
 
 // ── カスタム着信音（mp3/wav等）の永続化 ─────────────────────
@@ -744,9 +828,9 @@ function sanitizeClientConfig(config) {
   const forceTcp = raw.forceTcp === true;
   const sendQuality = QUALITY_OPTIONS.includes(raw.sendQuality) ? raw.sendQuality : defaultClientConfig.sendQuality;
   const recvQuality = QUALITY_OPTIONS.includes(raw.recvQuality) ? raw.recvQuality : defaultClientConfig.recvQuality;
-  const callVolume = Number.isFinite(Number(raw.callVolume))
-    ? Math.min(100, Math.max(0, Math.round(Number(raw.callVolume))))
-    : defaultClientConfig.callVolume;
+  const voiceVolume = sanitizeVolumePercent(raw.voiceVolume, defaultClientConfig.voiceVolume);
+  const ringtoneVolume = sanitizeVolumePercent(raw.ringtoneVolume ?? raw.callVolume, defaultClientConfig.ringtoneVolume);
+  const effectsVolume = sanitizeVolumePercent(raw.effectsVolume, defaultClientConfig.effectsVolume);
 
   return {
     ...raw,
@@ -764,8 +848,15 @@ function sanitizeClientConfig(config) {
     forceTcp,
     sendQuality,
     recvQuality,
-    callVolume,
+    voiceVolume,
+    ringtoneVolume,
+    effectsVolume,
+    callVolume: ringtoneVolume,
   };
+}
+
+function isPrivateChannel(channel) {
+  return !!channel && (channel.private === true || String(channel.id || '').startsWith('private-'));
 }
 
 function loadClientConfig() {
@@ -793,6 +884,9 @@ function serverUrlFromConfig(config) {
 // メイン到達不能がこの時間続き、かつもう一方のサーバーが応答するなら自動切替する
 const FAILOVER_AFTER_MS = 12000;
 const FAILOVER_COOLDOWN_MS = 30000;
+// 手動でサーバーを切り替えた後、この時間は占有数ベースの自動選択で上書きしない
+// （到達不能による自動フェイルオーバーは常に有効）
+const MANUAL_SERVER_STICKY_MS = 10 * 60 * 1000;
 
 function clampNumber(value, min, max) {
   const numeric = Number(value);
@@ -846,6 +940,85 @@ async function probeServerReady(config, timeoutMs = 800) {
   } finally {
     clearTimeout(fallbackTimer);
   }
+}
+
+/**
+ * サーバーの接続拠点数を問い合わせる（サーバー選択用）。
+ * 新サーバーは軽量な /presence、旧サーバーは /health から数える。
+ */
+async function probeServerPresence(config, timeoutMs = 1200) {
+  const baseUrl = serverUrlFromConfig(config);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${baseUrl}/presence`, { signal: controller.signal, cache: 'no-store' });
+    if (res.ok) {
+      const data = await res.json();
+      const clientCount = Number(data.clientCount) || 0;
+      // clientAppCount: 会議アプリ(client)のみの数。screen-share を「拠点がいる」と
+      // 数えると、クライアント不在のサーバーへ寄ってしまうため、判定はこちらを優先する。
+      // 旧サーバー(フィールド無し)は合算値へフォールバック。
+      const clientAppCount = Number.isFinite(Number(data.clientAppCount))
+        ? Number(data.clientAppCount)
+        : clientCount;
+      return { reachable: true, clientCount, clientAppCount };
+    }
+  } catch {
+    // 旧サーバー(未実装)や到達不能。/health のフォールバックへ。
+  } finally {
+    clearTimeout(timer);
+  }
+
+  const fallbackController = new AbortController();
+  const fallbackTimer = setTimeout(() => fallbackController.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${baseUrl}/health`, { signal: fallbackController.signal, cache: 'no-store' });
+    if (!res.ok) return { reachable: false, clientCount: 0, clientAppCount: 0 };
+    const data = await res.json();
+    const clients = Array.isArray(data.clients) ? data.clients : [];
+    const active = clients.filter(client => (
+      (client.appType === 'client' || client.appType === 'screen-share') && client.connected !== false
+    ));
+    const clientAppCount = active.filter(client => client.appType === 'client').length;
+    return { reachable: true, clientCount: active.length, clientAppCount };
+  } catch {
+    return { reachable: false, clientCount: 0, clientAppCount: 0 };
+  } finally {
+    clearTimeout(fallbackTimer);
+  }
+}
+
+/**
+ * メイン/サブ両サーバーの接続拠点数を確認し、接続すべきサーバーを返す（null=変更不要/判定不能）。
+ * 到達性だけで選ぶと、復旧タイミングの差で拠点ごとに別サーバーへ散らばり
+ * 「お互いの映像が見えない」スプリットブレインになるため、
+ * 他拠点が接続しているサーバーへ寄せる。どちらも空なら メイン へ収束させる。
+ */
+async function chooseServerByOccupancy(config, { manualSelectionAt = 0 } = {}) {
+  const conf = sanitizeClientConfig(config);
+  if (!conf.subServerIp) return null;
+  if (Date.now() - manualSelectionAt < MANUAL_SERVER_STICKY_MS) return null; // 手動選択を尊重
+
+  const [main, sub] = await Promise.all([
+    probeServerPresence({ ...conf, activeServer: 'main' }),
+    probeServerPresence({ ...conf, activeServer: 'sub' }),
+  ]);
+  const current = conf.activeServer === 'sub' ? 'sub' : 'main';
+  const other = current === 'main' ? 'sub' : 'main';
+  const info = { main, sub };
+
+  if (!info.main.reachable && !info.sub.reachable) return null;
+  // 現サーバーが単発プローブで不達でも、もう一方が「空」なら移らない。
+  // ルーティン再起動などの数秒のダウンで空のサブへ散らばり、復帰したメインと
+  // 分裂したまま固定されるのを防ぐ。本当の障害は自動フェイルオーバー
+  // (FAILOVER_AFTER_MS の継続監視)が拾うので、ここで急いで移る必要はない。
+  if (!info[current].reachable) {
+    return info[other].reachable && info[other].clientAppCount > 0 ? other : null;
+  }
+  if (!info[other].reachable) return current;
+  // 両方到達可能: 会議アプリ(client)が多い方へ（同数・両方空はメインへ収束）
+  return info.main.clientAppCount >= info.sub.clientAppCount ? 'main' : 'sub';
 }
 
 // ─── メインビュー ─────────────────────────────────────────
@@ -903,6 +1076,7 @@ export default function MainView() {
   const [memberMenu, setMemberMenu] = useState(null);
   const [incomingCall, setIncomingCall] = useState(null);
   const [outgoingCall, setOutgoingCall] = useState(null);   // { callId, targetSocketId, targetName }
+  const [privateCall, setPrivateCall] = useState(null);     // { channelId, previousChannelId, channelName }
   const [callNotice, setCallNotice] = useState(null);       // 呼び出し結果の一時表示
   const [screenShare, setScreenShare] = useState(null);     // { sourceId, sourceName, hasAudio, audioEnabled, paused, stream }
   const [shareModalMode, setShareModalMode] = useState(null); // null | 'start' | 'change'
@@ -924,11 +1098,29 @@ export default function MainView() {
   // サーバー到達確認ポーリングが「managerがまだ無い」と判断してもう一度
   // セッションを開始すると、同じ拠点からサーバーへ二重セッションが張られる。
   const sessionStartInFlightRef = useRef(false);
+  // 進行中のセッション開始 Promise。performQuickRestart が完了を待って直列化する。
+  const sessionStartPromiseRef = useRef(null);
+  // セッション世代。releaseClientRuntime のたびに進み、進行中の startClientSessionInner が
+  // 「自分は破棄済み」と気付いて中断するために使う。これが無いと、初期化中に再起動が
+  // 走った場合に破棄済みの manager が connect() で蘇り、誰からも参照されない
+  // 孤児セッション(旧サーバーへ接続し続けるゴースト拠点)になる。
+  const sessionGenerationRef = useRef(0);
+  // 設定上の接続先と実際の接続先の不一致検出(連続カウント)
+  const serverUrlMismatchRef = useRef(0);
+  // 占有数の再収束チェック(自分だけ別サーバーに取り残された状態の自己修復)
+  const reconvergeStrikesRef = useRef(0);
   const softRestartHandlerRef = useRef(null);
   const serverProbeInFlightRef = useRef(false);
   // 自動フェイルオーバーの状態（現サーバーの到達不能開始時刻と直近切替時刻）
   const serverFailoverRef = useRef({ downSince: null, lastSwitchAt: 0 });
+  // 手動でサーバーを切り替えた時刻（この後しばらく占有数ベースの自動選択を抑制）
+  const manualServerSelectAtRef = useRef(0);
+  const micEnabledRef = useRef(micEnabled);
   const speakerMutedRef = useRef(false);
+  const sfuStatusRef = useRef(sfuStatus);
+  const peersRef = useRef(peers);
+  const channelIdRef = useRef(channelId);
+  const observedRemoteScreenSharesRef = useRef(new Set());
   const sendTelemetryRef = useRef(null);
   const joinAudioRef = useRef(null);
   const callAudioRef = useRef(null);
@@ -937,11 +1129,14 @@ export default function MainView() {
   const activeIncomingCallIdRef = useRef('');
   const outgoingCallRef = useRef(null);
   const outgoingCallTimerRef = useRef(null);
+  const privateCallRef = useRef(null);
   const callNoticeTimerRef = useRef(null);
   const screenShareRef = useRef(null);
 
   useEffect(() => { outgoingCallRef.current = outgoingCall; }, [outgoingCall]);
+  useEffect(() => { privateCallRef.current = privateCall; }, [privateCall]);
   useEffect(() => { screenShareRef.current = screenShare; }, [screenShare]);
+  useEffect(() => { channelIdRef.current = channelId; }, [channelId]);
 
   const channels = useMemo(() => {
     const items = Array.isArray(systemState.channels) && systemState.channels.length
@@ -949,6 +1144,7 @@ export default function MainView() {
       : DEFAULT_SYSTEM_STATE.channels;
     return items;
   }, [systemState]);
+  const registeredChannels = useMemo(() => channels.filter(channel => !isPrivateChannel(channel)), [channels]);
 
   const activeChannel = useMemo(() => (
     channels.find(channel => channel.id === channelId) || channels[0] || DEFAULT_SYSTEM_STATE.channels[0]
@@ -957,7 +1153,7 @@ export default function MainView() {
 
   const updatePackage = systemState.updatePackages?.[APP_TYPE] || null;
   const latestVersion = systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
-  const updateAvailable = latestVersion && latestVersion !== APP_VERSION;
+  const updateAvailable = isNewerVersion(latestVersion, APP_VERSION);
   const peerEntries = useMemo(() => Array.from(peers.entries()), [peers]);
 
   const audiblePeerCount = useMemo(() => (
@@ -972,11 +1168,40 @@ export default function MainView() {
     audiblePeerCount,
     localSpeaking,
     speakerMuted,
-  }), [audiblePeerCount, localSpeaking, speakerMuted]);
+  }) * (sanitizeVolumePercent(settingsDraft.voiceVolume ?? 100) / 100), [
+    audiblePeerCount,
+    localSpeaking,
+    settingsDraft.voiceVolume,
+    speakerMuted,
+  ]);
+
+  useEffect(() => {
+    micEnabledRef.current = micEnabled;
+  }, [micEnabled]);
 
   useEffect(() => {
     speakerMutedRef.current = speakerMuted;
   }, [speakerMuted]);
+
+  useEffect(() => {
+    sfuStatusRef.current = sfuStatus;
+  }, [sfuStatus]);
+
+  useEffect(() => {
+    peersRef.current = peers;
+  }, [peers]);
+
+  const effectsVolumeScale = useCallback(() => {
+    const conf = configRef.current?.serverIp ? configRef.current : loadClientConfig();
+    return sanitizeVolumePercent(conf.effectsVolume ?? 100) / 100;
+  }, []);
+
+  const playEffectSound = useCallback((key, options = {}) => (
+    playSystemSound(key, {
+      ...options,
+      volume: options.volume ?? effectsVolumeScale(),
+    })
+  ), [effectsVolumeScale]);
 
   const channelMembers = useMemo(() => {
     const knownChannels = new Set(channels.map(channel => channel.id));
@@ -1017,33 +1242,8 @@ export default function MainView() {
 
   const playJoinTone = useCallback(() => {
     if (speakerMutedRef.current) return;
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) return;
-
-    try {
-      const context = joinAudioRef.current && joinAudioRef.current.state !== 'closed'
-        ? joinAudioRef.current
-        : new AudioContextClass();
-      joinAudioRef.current = context;
-      context.resume?.().catch(() => {});
-
-      const now = context.currentTime;
-      const gain = context.createGain();
-      const oscillator = context.createOscillator();
-      oscillator.type = 'sine';
-      oscillator.frequency.setValueAtTime(660, now);
-      oscillator.frequency.exponentialRampToValueAtTime(880, now + 0.12);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.11, now + 0.025);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
-      oscillator.connect(gain);
-      gain.connect(context.destination);
-      oscillator.start(now);
-      oscillator.stop(now + 0.28);
-    } catch (err) {
-      console.warn('[joinTone]', err.message);
-    }
-  }, []);
+    playEffectSound('channelJoin');
+  }, [playEffectSound]);
 
   // customRingtone(state) をコールバックから参照するための ref 同期
   useEffect(() => {
@@ -1056,7 +1256,7 @@ export default function MainView() {
    */
   const ringVolumeScale = useCallback(() => {
     const conf = configRef.current?.serverIp ? configRef.current : loadClientConfig();
-    const base = Math.min(100, Math.max(0, Number(conf.callVolume ?? 100))) / 100;
+    const base = sanitizeVolumePercent(conf.ringtoneVolume ?? conf.callVolume ?? 100) / 100;
     const busyFactor = presenceModeRef.current === 'busy' ? 0.5 : 1;
     return base * busyFactor;
   }, []);
@@ -1107,16 +1307,21 @@ export default function MainView() {
     if (volume <= 0) return;
 
     const ringtone = customRingtoneRef.current;
-    if (ringtone?.dataUrl) {
+    const bundledRingtoneUrl = systemSoundUrl('incomingCall');
+    const ringtoneSource = ringtone?.dataUrl || bundledRingtoneUrl;
+    if (ringtoneSource) {
       const playing = ringtoneAudioRef.current;
-      if (playing && !playing.paused && !playing.ended) {
+      if (playing && playing._systemSoundSource === ringtoneSource && !playing.paused && !playing.ended) {
         playing.volume = volume; // モード切替を鳴動中にも反映
         return;
       }
       try {
-        const audio = playing || new Audio(ringtone.dataUrl);
+        const audio = playing && playing._systemSoundSource === ringtoneSource
+          ? playing
+          : new Audio(ringtoneSource);
         audio.loop = true;
         audio.volume = volume;
+        audio._systemSoundSource = ringtoneSource;
         ringtoneAudioRef.current = audio;
         audio.play().catch(err => {
           // 自動再生ブロック等。既定のベル音にフォールバックする。
@@ -1135,11 +1340,12 @@ export default function MainView() {
 
   /** 設定画面の試聴用。ドラフト中の音量・選択中の音源で一度だけ鳴らす */
   const previewCallTone = useCallback((volumePercent) => {
-    const volume = Math.min(100, Math.max(0, Number(volumePercent ?? 100))) / 100;
+    const volume = sanitizeVolumePercent(volumePercent ?? 100) / 100;
     const ringtone = customRingtoneRef.current;
-    if (ringtone?.dataUrl) {
+    const ringtoneSource = ringtone?.dataUrl || systemSoundUrl('incomingCall');
+    if (ringtoneSource) {
       try {
-        const audio = new Audio(ringtone.dataUrl);
+        const audio = new Audio(ringtoneSource);
         audio.volume = volume;
         audio.play().catch(() => {});
         // 試聴は数秒で止める（長い曲をフルで流さない）
@@ -1153,9 +1359,10 @@ export default function MainView() {
   // ── 呼び出し結果の一時通知（画面下部に数秒表示）──
   const showCallNotice = useCallback((text, tone = 'info') => {
     if (callNoticeTimerRef.current) clearTimeout(callNoticeTimerRef.current);
+    playEffectSound('notification');
     setCallNotice({ text, tone });
     callNoticeTimerRef.current = setTimeout(() => setCallNotice(null), 4500);
-  }, []);
+  }, [playEffectSound]);
 
   // ── 発信中状態の終了（応答/拒否/タイムアウト/キャンセル/切断）──
   const stopOutgoingCall = useCallback((expectedCallId = '') => {
@@ -1165,6 +1372,7 @@ export default function MainView() {
       clearTimeout(outgoingCallTimerRef.current);
       outgoingCallTimerRef.current = null;
     }
+    stopLoopingSystemSound('outgoingCall');
     outgoingCallRef.current = null;
     setOutgoingCall(null);
   }, []);
@@ -1204,6 +1412,8 @@ export default function MainView() {
       fromSocketId: payload.fromSocketId || '',
       fromChannelId: payload.fromChannelId || '',
       fromChannelName: payload.fromChannelName || '',
+      callMode: payload.callMode || '',
+      privateChannelId: payload.privateChannelId || '',
       receivedAt: Date.now(),
       expiresAt,
     });
@@ -1226,6 +1436,7 @@ export default function MainView() {
     if (incomingCallRingIntervalRef.current) clearInterval(incomingCallRingIntervalRef.current);
     if (outgoingCallTimerRef.current) clearTimeout(outgoingCallTimerRef.current);
     if (callNoticeTimerRef.current) clearTimeout(callNoticeTimerRef.current);
+    stopAllSystemSounds();
     try { joinAudioRef.current?.close?.(); } catch { /* ignore */ }
     try { callAudioRef.current?.close?.(); } catch { /* ignore */ }
   }, []);
@@ -1436,7 +1647,9 @@ export default function MainView() {
     }
   }, [installLocalStream, selectedVideoId, selectedAudioInId]);
 
-  const releaseClientRuntime = useCallback(({ status = 'connecting', updateState = true, keepLocalMedia = false } = {}) => {
+  const releaseClientRuntime = useCallback(({ status = 'connecting', updateState = true, keepLocalMedia = false, keepPeers = false } = {}) => {
+    // 進行中の startClientSessionInner を無効化する（孤児セッション防止）
+    sessionGenerationRef.current += 1;
     const manager = webrtcRef.current;
     webrtcRef.current = null;
     if (manager) {
@@ -1453,9 +1666,12 @@ export default function MainView() {
       manager.onUpdateCommand = null;
       manager.onPeerJoined = null;
       manager.onIncomingCall = null;
+      manager.onPrivateCallStarted = null;
+      manager.onPrivateCallEnded = null;
       manager.onCallResult = null;
       manager.onCallCancelled = null;
       manager.onScreenShareEnded = null;
+      manager.onSessionRejected = null;
       manager.disconnect();
     }
 
@@ -1482,10 +1698,13 @@ export default function MainView() {
 
     if (updateState) {
       if (!keepLocalMedia) setLocalStream(null);
-      setPeers(new Map());
+      // keepPeers: サーバー都合の再構築中はグリッドを消さず、画面はそのままに
+      // 中央のスピナーだけを重ねる。再接続後の同期が古いタイルを回収する。
+      if (!keepPeers) setPeers(new Map());
       setViewerPresenceActive(false);
       setScreenShare(null);
       setOutgoingCall(null);
+      setPrivateCall(null);
       setSfuStatus(status);
     }
   }, [stopLocalAudioMonitor]);
@@ -1497,6 +1716,10 @@ export default function MainView() {
     if (webrtcRef.current) {
       releaseClientRuntime({ updateState: false, keepLocalMedia: true });
     }
+    // このセッション開始の世代。途中で releaseClientRuntime が走った（＝別の
+    // 再起動/切替がセッションを破棄した）ら、以降の処理を中断して孤児化を防ぐ。
+    const generation = sessionGenerationRef.current;
+    const superseded = () => sessionGenerationRef.current !== generation;
     const conf = sanitizeClientConfig(loadClientConfig());
     configRef.current = conf;
     setSettingsDraft(conf);
@@ -1521,6 +1744,8 @@ export default function MainView() {
       await installLocalStream(stream, error, { stopPrevious: stopPreviousStream });
     }
 
+    if (superseded()) return { manager: null, connectionState: 'superseded' };
+
     const rtcManager = new WebRTCManager();
     webrtcRef.current = rtcManager;
 
@@ -1528,9 +1753,13 @@ export default function MainView() {
       setPeers(prev => { const m = new Map(prev); m.set(socketId, peer); return m; });
     };
     rtcManager.onPeerRemoved = (socketId) => {
+      const removedPeer = peersRef.current.get(socketId);
+      if (removedPeer && removedPeer.appType !== 'viewer') playEffectSound('channelLeave');
       setPeers(prev => { const m = new Map(prev); m.delete(socketId); return m; });
     };
     rtcManager.onConnectionChange = (ok) => {
+      if (!ok && sfuStatusRef.current === 'connected') playEffectSound('audioDisconnect');
+      sfuStatusRef.current = ok ? 'connected' : 'error';
       setSfuStatus(ok ? 'connected' : 'error');
       if (!ok) setViewerPresenceActive(false);
     };
@@ -1540,18 +1769,41 @@ export default function MainView() {
       const remoteChannels = Array.isArray(state.channels) && state.channels.length ? state.channels : DEFAULT_SYSTEM_STATE.channels;
       const current = configRef.current.channelId || conf.channelId || 'general';
       const selfChannelId = state.self?.channelId || '';
-      if (selfChannelId && remoteChannels.some(channel => channel.id === selfChannelId) && selfChannelId !== current) {
-        const nextConfig = { ...sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig()), channelId: selfChannelId };
-        configRef.current = nextConfig;
-        localStorage.setItem('sfu_config', JSON.stringify(nextConfig));
-        setSettingsDraft(nextConfig);
+      const selfChannel = remoteChannels.find(channel => channel.id === selfChannelId);
+      const selfPrivateCall = state.self?.privateCall || null;
+
+      if (selfChannelId && selfChannel) {
+        rtcManager.adoptChannel(selfChannelId);
         setChannelId(selfChannelId);
+        if (isPrivateChannel(selfChannel)) {
+          setPrivateCall({
+            channelId: selfChannelId,
+            privateChannelId: selfPrivateCall?.privateChannelId || selfChannelId,
+            channelName: selfPrivateCall?.channelName || selfChannel.name || '個別',
+            previousChannelId: selfPrivateCall?.previousChannelId || current,
+            memberSocketIds: selfPrivateCall?.memberSocketIds || [],
+          });
+          return;
+        }
+
+        const hadPrivateCall = !!privateCallRef.current;
+        setPrivateCall(null);
+        if (selfChannelId !== current || hadPrivateCall) {
+          const nextConfig = { ...sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig()), channelId: selfChannelId };
+          configRef.current = nextConfig;
+          localStorage.setItem('sfu_config', JSON.stringify(nextConfig));
+          setSettingsDraft(nextConfig);
+        }
+        if (selfChannelId !== channelIdRef.current || hadPrivateCall) playEffectSound('channelMove');
       } else if (!remoteChannels.some(channel => channel.id === current)) {
         const fallback = remoteChannels[0]?.id || 'general';
         configRef.current = { ...configRef.current, channelId: fallback };
         localStorage.setItem('sfu_config', JSON.stringify(configRef.current));
         setSettingsDraft(configRef.current);
         setChannelId(fallback);
+        rtcManager.adoptChannel(fallback);
+        setPrivateCall(null);
+        playEffectSound('channelMove');
       }
     };
     rtcManager.onUpdateCommand = (payload) => {
@@ -1563,7 +1815,39 @@ export default function MainView() {
       if (payload.appType === 'viewer') return;
       playJoinTone();
     };
+    rtcManager.onPeerChannelChanged = (payload = {}) => {
+      if (!payload.socketId || payload.socketId === rtcManager.socket?.id) return;
+      playEffectSound('channelMove');
+    };
     rtcManager.onIncomingCall = showIncomingCall;
+    rtcManager.onPrivateCallStarted = (payload = {}) => {
+      const nextChannelId = payload.channelId || payload.privateChannelId || '';
+      if (!nextChannelId) return;
+      rtcManager.adoptChannel(nextChannelId);
+      setChannelId(nextChannelId);
+      setPrivateCall({
+        channelId: nextChannelId,
+        privateChannelId: payload.privateChannelId || nextChannelId,
+        channelName: payload.channelName || '個別',
+        previousChannelId: payload.previousChannelId || configRef.current.channelId || 'general',
+        memberSocketIds: payload.memberSocketIds || [],
+      });
+      playEffectSound('channelMove');
+    };
+    rtcManager.onPrivateCallEnded = (payload = {}) => {
+      const returnChannelId = payload.channelId || privateCallRef.current?.previousChannelId || configRef.current.channelId || 'general';
+      rtcManager.adoptChannel(returnChannelId);
+      const nextConfig = { ...sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig()), channelId: returnChannelId };
+      configRef.current = nextConfig;
+      localStorage.setItem('sfu_config', JSON.stringify(nextConfig));
+      setSettingsDraft(nextConfig);
+      setChannelId(returnChannelId);
+      setPrivateCall(null);
+      playEffectSound('channelMove');
+      if (payload.shouldMuteMic !== false) {
+        mediaControlsRef.current.setMicrophoneEnabled?.(false)?.catch?.(() => {});
+      }
+    };
 
     // 発信した呼び出しの結果（応答/拒否/タイムアウト/切断）→ 鳴動表示を止めて結果を通知
     rtcManager.onCallResult = (payload = {}) => {
@@ -1588,12 +1872,20 @@ export default function MainView() {
       stopIncomingCall(payload.callId || '');
     };
 
+    // 同じ拠点の別端末（二重起動・撤去し忘れ等）が接続中のため、この接続は
+    // 受け入れられなかった。manager側が再試行を抑制するので、UIで原因を知らせる。
+    rtcManager.onSessionRejected = (payload = {}) => {
+      setSfuStatus('error');
+      setCamError(`「${payload.locationName || configRef.current.locationName || '同名拠点'}」の別の端末が接続中のため待機しています。別端末のアプリを終了してください。`);
+    };
+
     // 共有元ウィンドウが閉じられた等でトラックが終了した → UIを共有停止状態へ
     rtcManager.onScreenShareEnded = () => {
       const share = screenShareRef.current;
       if (share) {
         share.stream?.getTracks().forEach(track => track.stop());
         screenShareRef.current = null;
+        playEffectSound('screenShareStop');
       }
       setScreenShare(null);
       setShareModalMode(null);
@@ -1623,7 +1915,33 @@ export default function MainView() {
       currentStream?.getAudioTracks()[0] || null,
     );
 
-    const serverUrl = serverUrlFromConfig(conf);
+    // 接続前に他拠点がどちらのサーバーに集まっているかを確認して寄せる。
+    // 再接続のタイミング差で自分だけ別サーバーへ繋がり「他拠点が見えない」
+    // 状態になるのを防ぐ（サブ未設定・手動切替直後・判定不能時は現設定のまま）。
+    try {
+      const occupancyChoice = await chooseServerByOccupancy(configRef.current, {
+        manualSelectionAt: manualServerSelectAtRef.current,
+      });
+      const currentServer = configRef.current.activeServer === 'sub' ? 'sub' : 'main';
+      if (occupancyChoice && occupancyChoice !== currentServer) {
+        const switched = sanitizeClientConfig({ ...configRef.current, activeServer: occupancyChoice });
+        configRef.current = switched;
+        localStorage.setItem('sfu_config', JSON.stringify(switched));
+        setSettingsDraft(switched);
+        console.warn(`[ServerSelect] 他拠点が接続している${occupancyChoice === 'sub' ? 'サブ' : 'メイン'}サーバーへ接続します`);
+      }
+    } catch (err) {
+      console.warn('[ServerSelect]', err.message);
+    }
+
+    // 破棄済みなら接続しない。releaseClientRuntime → disconnect 済みの manager で
+    // connect() すると _manualDisconnect が解除されて蘇り、孤児セッションになる。
+    if (superseded() || webrtcRef.current !== rtcManager) {
+      rtcManager.disconnect();
+      return { manager: null, connectionState: 'superseded' };
+    }
+
+    const serverUrl = serverUrlFromConfig(configRef.current);
     const connectionState = await connectWithinStartupWindow(rtcManager, serverUrl, conf.locationName, {
       channelId: conf.channelId,
       appVersion: APP_VERSION,
@@ -1631,9 +1949,13 @@ export default function MainView() {
       sendQuality: conf.sendQuality,
       recvQuality: conf.recvQuality,
     });
+    if (superseded() || webrtcRef.current !== rtcManager) {
+      rtcManager.disconnect();
+      return { manager: null, connectionState: 'superseded' };
+    }
     setSfuStatus(connectionState === 'connected' ? 'connected' : 'connecting');
     return { manager: rtcManager, connectionState };
-  }, [camEnabled, micEnabled, installLocalStream, playJoinTone, refreshDevices, releaseClientRuntime, showIncomingCall, showCallNotice, stopIncomingCall, stopOutgoingCall]);
+  }, [camEnabled, micEnabled, installLocalStream, playEffectSound, playJoinTone, refreshDevices, releaseClientRuntime, showIncomingCall, showCallNotice, stopIncomingCall, stopOutgoingCall]);
 
   // startClientSessionInner の多重実行ガード。初期化(メディア取得)には数秒かかり、
   // その間にサーバー到達確認ポーリング等が重ねてセッション開始を呼ぶと、
@@ -1643,25 +1965,62 @@ export default function MainView() {
       return { manager: webrtcRef.current, connectionState: 'starting' };
     }
     sessionStartInFlightRef.current = true;
-    try {
-      return await startClientSessionInner(options);
-    } finally {
-      sessionStartInFlightRef.current = false;
-    }
+    const run = (async () => {
+      try {
+        return await startClientSessionInner(options);
+      } finally {
+        sessionStartInFlightRef.current = false;
+        sessionStartPromiseRef.current = null;
+      }
+    })();
+    sessionStartPromiseRef.current = run;
+    return run;
   }, [startClientSessionInner]);
 
   const performQuickRestart = useCallback(async (payload = {}) => {
-    if (softRestartInFlightRef.current) return;
+    // サーバーが「アプリ本体の再起動」を指示してきた場合（5分以上復旧しない拠点への
+    // 最終手段）は、アプリ内再構築ではなく Electron の完全再起動を行う。
+    if (payload?.mode === 'relaunch' && window.electronAPI?.restartApp) {
+      console.warn('[QuickRestart] server requested full app relaunch:', payload?.reason || '');
+      window.electronAPI.restartApp();
+      return;
+    }
     const reason = payload?.reason || payload?.source || 'server-command';
+    const forced = payload?.forced || /manual|remote-config|update/.test(reason);
+
+    // 進行中の再起動/セッション確立と重なった場合:
+    //  - 通常要求: 進行中の再起動が同じ目的(接続の回復)を果たすので捨てる。
+    //  - 強制要求(手動切替・フェイルオーバー・設定変更): 完了を待ってから実行する。
+    //    以前はここで無言スキップしており、「トグルはサブ表示なのに実接続はメインのまま」
+    //    という設定と実態の不一致が恒久化する取りこぼしの原因だった。
+    if (softRestartInFlightRef.current || sessionStartInFlightRef.current) {
+      if (!forced) return;
+      const waitUntil = Date.now() + 20000;
+      while ((softRestartInFlightRef.current || sessionStartInFlightRef.current) && Date.now() < waitUntil) {
+        const pending = sessionStartPromiseRef.current;
+        if (pending) await pending.catch(() => {});
+        else await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
 
     // 不安定なVPN経路ではサーバーの restartCommand やクライアント自身の復旧が
     // 短時間に重なりやすい。直前に再起動して既にセッションが健全なら、重複した
     // 再起動要求は無視して常時接続を揺らさない（手動/明示要求は除く）。
     const sinceLast = Date.now() - lastQuickRestartAtRef.current;
     const manager = webrtcRef.current;
-    const forced = payload?.forced || /manual|remote-config|update/.test(reason);
     if (!forced && sinceLast < QUICK_RESTART_COOLDOWN_MS && manager?.isSocketConnected() && manager?.isInitialized()) {
       console.log(`[QuickRestart] skipped (healthy, ${sinceLast}ms since last) reason=${reason}`);
+      return;
+    }
+    // サーバー切替系の要求は、待っている間に先行の再起動が目的を果たしている
+    // ことがある。既に設定どおりのサーバーへ健全に接続済みなら再実行しない
+    // （トグル連打などで同じ再起動を二重に走らせない）。
+    if (
+      /server-switch|server-failover|server-occupancy|server-config-mismatch/.test(reason) &&
+      manager?.isSocketConnected() && manager?.isInitialized() &&
+      manager.getServerUrl?.() === serverUrlFromConfig(configRef.current.serverIp ? configRef.current : loadClientConfig())
+    ) {
+      console.log(`[QuickRestart] skipped (already on desired server) reason=${reason}`);
       return;
     }
 
@@ -1672,9 +2031,14 @@ export default function MainView() {
 
     try {
       // サーバー都合の再起動でも自拠点カメラは保持し続ける（要件: 常時自拠点表示）。
-      releaseClientRuntime({ status: 'restarting', keepLocalMedia: true });
+      // タイルも消さず、画面はそのままに中央スピナーだけで再構築を伝える。
+      releaseClientRuntime({ status: 'restarting', keepLocalMedia: true, keepPeers: true });
       setCamError(null); // 取り直しに失敗すれば installLocalStream が再設定する
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      // スピナー描画を待つ小休止。requestAnimationFrame はウィンドウが最小化・
+      // 非表示だと発火せず、再構築が「再構築中...」のまま永久に止まる
+      // （最小化中の拠点がフェイルオーバー/再起動指示から復帰できない実障害）
+      // ため、必ず進む setTimeout を使う。
+      await new Promise(resolve => setTimeout(resolve, 50));
       const { connectionState } = await startClientSession({ stopPreviousStream: false, reuseLocalMedia: true });
       window.electronAPI?.quickRestartResult?.({
         ok: true,
@@ -1700,6 +2064,28 @@ export default function MainView() {
   useEffect(() => {
     softRestartHandlerRef.current = performQuickRestart;
   }, [performQuickRestart]);
+
+  // ─── サーバー切り替え（サイドバー左下のトグル・設定画面から共用）─────────
+  // 手動切替は占有数ベースの自動選択より優先される（MANUAL_SERVER_STICKY_MS の間）。
+  // 到達不能時の自動フェイルオーバーは従来どおり常に有効。
+  const switchActiveServer = useCallback(async (target) => {
+    const conf = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+    const next = target === 'sub' ? 'sub' : 'main';
+    const current = conf.activeServer === 'sub' ? 'sub' : 'main';
+    if (next === current) return;
+    if (next === 'sub' && !conf.subServerIp) return;
+
+    manualServerSelectAtRef.current = Date.now();
+    serverFailoverRef.current.lastSwitchAt = Date.now();
+    serverFailoverRef.current.downSince = null;
+
+    const nextConf = { ...conf, activeServer: next };
+    configRef.current = nextConf;
+    localStorage.setItem('sfu_config', JSON.stringify(nextConf));
+    setSettingsDraft(nextConf);
+    showCallNotice(next === 'sub' ? 'サブサーバーへ切り替えています…' : 'メインサーバーへ切り替えています…');
+    await performQuickRestart({ reason: 'manual-server-switch', forced: true });
+  }, [performQuickRestart, showCallNotice]);
 
   useEffect(() => {
     const unsubscribe = window.electronAPI?.onQuickRestartRequest?.((payload) => {
@@ -1763,10 +2149,110 @@ export default function MainView() {
   // ─── 1秒ポーリング ──────────────────────────────────────
   useEffect(() => {
     const id = setInterval(() => {
-      webrtcRef.current?.syncPeers();
+      const manager = webrtcRef.current;
+      manager?.syncPeers();
+
+      // 右上ステータスとマネージャ実態のずれを常時補正する。
+      // イベント(onConnectionChange)の取りこぼしや再構築の競合で
+      // 「未接続表示なのに他拠点が見える」「接続表示なのに映像が来ない」
+      // という不一致が固定化するのを防ぐ。
+      const state = manager?.getConnectionState?.();
+      if (state === 'connected') {
+        if (sfuStatusRef.current !== 'connected') {
+          sfuStatusRef.current = 'connected';
+          setSfuStatus('connected');
+        }
+        // 再構築をまたいで残った旧セッションのタイルを回収する
+        setPeers(prev => {
+          let changed = false;
+          const next = new Map();
+          for (const [socketId, peer] of prev) {
+            if (manager.peers.has(socketId)) next.set(socketId, peer);
+            else changed = true;
+          }
+          return changed ? next : prev;
+        });
+      } else if (state === 'reconnecting' && sfuStatusRef.current === 'connected') {
+        sfuStatusRef.current = 'restarting';
+        setSfuStatus('restarting');
+      } else if (state === 'disconnected' && sfuStatusRef.current === 'connected') {
+        sfuStatusRef.current = 'error';
+        setSfuStatus('error');
+      }
     }, 1000);
     return () => clearInterval(id);
   }, []);
+
+  // ─── 最終手段: 5分間サーバーと確立できなければアプリ本体を再起動 ─────
+  // セッション貼り直し/再接続は無限に繰り返すが、レンダラー内の復旧だけでは
+  // 直らない状態（ネットワークスタック異常・リソース枯渇など）に備え、
+  // APP_RELAUNCH_AFTER_MS 連続で未確立なら Electron ごと再起動して復帰させる。
+  useEffect(() => {
+    let downSince = null;
+    let relaunchRequested = false;
+    const id = setInterval(() => {
+      const manager = webrtcRef.current;
+      const healthy = !!manager?.isSocketConnected() && !!manager?.isInitialized();
+      if (healthy) {
+        downSince = null;
+        return;
+      }
+      // 重複セッションとして拒否され待機中はネットワーク障害ではないので、
+      // アプリ再起動しても解決しない（再起動→再拒否のループになるだけ）
+      if (manager?.isSessionRejected?.()) {
+        downSince = null;
+        return;
+      }
+      if (downSince == null) {
+        downSince = Date.now();
+        return;
+      }
+      if (relaunchRequested || Date.now() - downSince < APP_RELAUNCH_AFTER_MS) return;
+      relaunchRequested = true;
+      console.error(`[Relaunch] ${Math.round(APP_RELAUNCH_AFTER_MS / 60000)}分間サーバーと確立できないため、アプリを再起動します`);
+      if (window.electronAPI?.restartApp) window.electronAPI.restartApp();
+      else window.location.reload();
+    }, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  // ─── ルーティン再起動: サーバー同期の指定時刻(HH:MM、複数可)にアプリを再起動 ───
+  // 長時間稼働の予防保守。通話・呼び出し・画面共有中は延期し、猶予(10分)内に
+  // 終われば実行する。実行済み時刻は localStorage に記録し、再起動後の再発動を防ぐ。
+  useEffect(() => {
+    const times = Array.isArray(systemState.maintenance?.clientRestartTimes)
+      ? systemState.maintenance.clientRestartTimes
+      : [];
+    if (!times.length || !window.electronAPI?.restartApp) return undefined;
+
+    const check = () => {
+      const now = Date.now();
+      for (const time of times) {
+        const match = /^([0-2]?\d):([0-5]\d)$/.exec(String(time || ''));
+        if (!match) continue;
+        const scheduled = new Date();
+        scheduled.setHours(Number(match[1]), Number(match[2]), 0, 0);
+        const scheduledAt = scheduled.getTime();
+        const elapsed = now - scheduledAt;
+        if (elapsed < ROUTINE_RESTART_JITTER_MS || elapsed > ROUTINE_RESTART_WINDOW_MS) continue;
+        // この時刻より後に起動したアプリは対象外（起動直後の再起動ループ防止）
+        if (APP_STARTED_AT >= scheduledAt) continue;
+        let last = 0;
+        try { last = Number(localStorage.getItem(ROUTINE_RESTART_KEY)) || 0; } catch { /* ignore */ }
+        if (last >= scheduledAt) continue; // この回は実行済み
+        // 使用中（通話/発着信/画面共有）は延期。猶予内の次のチェックで再評価する
+        if (privateCallRef.current || outgoingCallRef.current || activeIncomingCallIdRef.current || screenShareRef.current) return;
+        try { localStorage.setItem(ROUTINE_RESTART_KEY, String(scheduledAt)); } catch { /* ignore */ }
+        console.warn(`[Maintenance] ルーティン再起動を実行します (${time})`);
+        window.electronAPI.restartApp();
+        return;
+      }
+    };
+
+    check();
+    const id = setInterval(check, 15000);
+    return () => clearInterval(id);
+  }, [systemState]);
 
   // ─── サーバー到達確認: オフライン復帰を1秒周期で拾う ─────────────
   // あわせて自動フェイルオーバーを行う: 現在のサーバーに一定時間到達できず、
@@ -1776,6 +2262,27 @@ export default function MainView() {
       if (softRestartInFlightRef.current || serverProbeInFlightRef.current) return;
       const manager = webrtcRef.current;
       if (manager?.isSocketConnected() && manager?.isInitialized()) {
+        serverFailoverRef.current.downSince = null;
+        // 設定上の接続先と実接続先の不一致を自己修復する。手動切替・フェイルオーバーが
+        // 進行中の再起動と競合して取りこぼされた場合の最終防衛線（5秒連続で不一致なら再接続）。
+        const desiredUrl = serverUrlFromConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+        const actualUrl = manager.getServerUrl?.() || '';
+        if (actualUrl && desiredUrl && actualUrl !== desiredUrl) {
+          serverUrlMismatchRef.current += 1;
+          if (serverUrlMismatchRef.current >= 5) {
+            serverUrlMismatchRef.current = 0;
+            console.warn(`[ServerSelect] 設定(${desiredUrl})と実接続(${actualUrl})の不一致を検出。接続し直します`);
+            await softRestartHandlerRef.current?.({ reason: 'server-config-mismatch', forced: true });
+          }
+        } else {
+          serverUrlMismatchRef.current = 0;
+        }
+        return;
+      }
+      serverUrlMismatchRef.current = 0;
+      // 重複セッション拒否の待機中: サーバーは正常なので到達確認・フェイルオーバー・
+      // 再接続促進はすべて不要（managerが待機明けに自動で再試行する）
+      if (manager?.isSessionRejected?.()) {
         serverFailoverRef.current.downSince = null;
         return;
       }
@@ -1819,8 +2326,37 @@ export default function MainView() {
           return;
         }
 
+        const wasDownFor = serverFailoverRef.current.downSince == null
+          ? 0
+          : Date.now() - serverFailoverRef.current.downSince;
         serverFailoverRef.current.downSince = null;
         setSfuStatus(prev => (prev === 'connected' ? prev : 'connecting'));
+
+        // 長い断のあとの復帰: その間に他拠点が別サーバーへフェイルオーバーして
+        // いる可能性があるため、繋ぎ直す前に占有数を確認して同じサーバーへ寄せる
+        if (manager && wasDownFor >= FAILOVER_AFTER_MS) {
+          const occupancyChoice = await chooseServerByOccupancy(conf, {
+            manualSelectionAt: manualServerSelectAtRef.current,
+          });
+          const currentServer = conf.activeServer === 'sub' ? 'sub' : 'main';
+          if (occupancyChoice && occupancyChoice !== currentServer) {
+            serverFailoverRef.current.lastSwitchAt = Date.now();
+            const switched = sanitizeClientConfig({ ...conf, activeServer: occupancyChoice });
+            configRef.current = switched;
+            localStorage.setItem('sfu_config', JSON.stringify(switched));
+            setSettingsDraft(switched);
+            showCallNotice(
+              occupancyChoice === 'sub'
+                ? '他拠点が接続しているサブサーバーへ切り替えます'
+                : '他拠点が接続しているメインサーバーへ切り替えます',
+              'warn',
+            );
+            console.warn(`[Failover] occupancy-based switch to ${occupancyChoice}`);
+            await softRestartHandlerRef.current?.({ reason: 'server-occupancy-switch', forced: true });
+            return;
+          }
+        }
+
         if (manager) {
           manager.requestReconnect();
         } else {
@@ -1835,6 +2371,68 @@ export default function MainView() {
 
     return () => clearInterval(id);
   }, [startClientSession, showCallNotice]);
+
+  // ─── 占有数の再収束: 「自分だけ別サーバー」の分裂を自己修復 ──────────
+  // occupancy 判定は接続時にしか走らないため、再起動タイミングの差で一度分裂すると
+  // 次の接続イベントまで（最悪、翌日のルーティン再起動まで）残ってしまう。
+  // 健全稼働中も低頻度で確認し、「現サーバーに他の会議アプリが0・もう一方には居る」
+  // 状態が3回(約3分)続いた時だけ寄せる。サブ→メインは1拠点でも寄り、
+  // メイン→サブは2拠点以上で寄る片方向ルールにして、1対1で互いに
+  // 移動し合う発振（スワップ）を構造的に起こさない。
+  useEffect(() => {
+    const id = setInterval(async () => {
+      if (softRestartInFlightRef.current || sessionStartInFlightRef.current || serverProbeInFlightRef.current) return;
+      const manager = webrtcRef.current;
+      if (!manager?.isSocketConnected() || !manager?.isInitialized()) {
+        reconvergeStrikesRef.current = 0;
+        return;
+      }
+      const conf = sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig());
+      if (!conf.subServerIp) return;
+      if (Date.now() - manualServerSelectAtRef.current < MANUAL_SERVER_STICKY_MS) {
+        reconvergeStrikesRef.current = 0;
+        return;
+      }
+      // 通話・呼び出し・画面共有中はサーバーを移動しない
+      if (privateCallRef.current || outgoingCallRef.current || activeIncomingCallIdRef.current || screenShareRef.current) {
+        reconvergeStrikesRef.current = 0;
+        return;
+      }
+
+      const current = conf.activeServer === 'sub' ? 'sub' : 'main';
+      const other = current === 'main' ? 'sub' : 'main';
+      const [cur, oth] = await Promise.all([
+        probeServerPresence(conf),
+        probeServerPresence({ ...conf, activeServer: other }),
+      ]);
+      if (!cur.reachable || !oth.reachable) {
+        reconvergeStrikesRef.current = 0;
+        return;
+      }
+      const othersHere = Math.max(0, cur.clientAppCount - 1); // 自分を除いた会議アプリ数
+      const there = oth.clientAppCount;
+      const shouldMove = othersHere === 0 && (other === 'main' ? there >= 1 : there >= 2);
+      if (!shouldMove) {
+        reconvergeStrikesRef.current = 0;
+        return;
+      }
+      reconvergeStrikesRef.current += 1;
+      if (reconvergeStrikesRef.current < 3) return;
+      reconvergeStrikesRef.current = 0;
+
+      serverFailoverRef.current.lastSwitchAt = Date.now();
+      const switched = sanitizeClientConfig({ ...conf, activeServer: other });
+      configRef.current = switched;
+      localStorage.setItem('sfu_config', JSON.stringify(switched));
+      setSettingsDraft(switched);
+      showCallNotice(other === 'sub'
+        ? '他拠点が接続しているサブサーバーへ移動します'
+        : '他拠点が接続しているメインサーバーへ移動します');
+      console.warn(`[ServerSelect] occupancy reconverge to ${other} (here=${othersHere}, there=${there})`);
+      await softRestartHandlerRef.current?.({ reason: 'server-occupancy-reconverge', forced: true });
+    }, 60000);
+    return () => clearInterval(id);
+  }, [showCallNotice]);
 
   // ─── ローカルカメラ/マイク自己復旧 ───────────────────────
   useEffect(() => {
@@ -1867,19 +2465,21 @@ export default function MainView() {
 
       if (type === 'video')   setSelectedVideoId(deviceId);
       if (type === 'audioIn') setSelectedAudioInId(deviceId);
+      if (type === 'audioIn') playEffectSound('audioDeviceChange');
       flushTelemetrySoon();
     } catch (err) {
       console.error('[changeDevice]', err);
     }
-  }, [installLocalStream, selectedVideoId, selectedAudioInId, flushTelemetrySoon]);
+  }, [installLocalStream, selectedVideoId, selectedAudioInId, flushTelemetrySoon, playEffectSound]);
 
   const changeSpeaker = useCallback((deviceId) => {
     setSelectedAudioOutId(deviceId);
     const conf = { ...configRef.current, selectedAudioOutId: deviceId };
     configRef.current = conf;
     localStorage.setItem('sfu_config', JSON.stringify(conf));
+    playEffectSound('audioDeviceChange');
     flushTelemetrySoon();
-  }, [flushTelemetrySoon]);
+  }, [flushTelemetrySoon, playEffectSound]);
 
   const setCameraEnabled = useCallback(async (enabled) => {
     const next = !!enabled;
@@ -1891,21 +2491,48 @@ export default function MainView() {
 
   const setMicrophoneEnabled = useCallback(async (enabled) => {
     const next = !!enabled;
+    const previous = micEnabledRef.current;
     streamRef.current?.getAudioTracks().forEach(t => (t.enabled = next));
+    micEnabledRef.current = next;
     setMicEnabled(next);
     await webrtcRef.current?.setMicEnabled(next);
+    if (previous !== next) playEffectSound(next ? 'micUnmute' : 'micMute');
     flushTelemetrySoon();
-  }, [flushTelemetrySoon]);
+  }, [flushTelemetrySoon, playEffectSound]);
 
   const setSpeakerOutputEnabled = useCallback((enabled) => {
-    setSpeakerMuted(!enabled);
+    const nextMuted = !enabled;
+    const previousMuted = speakerMutedRef.current;
+    speakerMutedRef.current = nextMuted;
+    setSpeakerMuted(nextMuted);
+    if (previousMuted !== nextMuted) playEffectSound(nextMuted ? 'speakerMute' : 'speakerUnmute');
     flushTelemetrySoon();
-  }, [flushTelemetrySoon]);
+  }, [flushTelemetrySoon, playEffectSound]);
 
   useEffect(() => {
     mediaControlsRef.current.setMicrophoneEnabled = setMicrophoneEnabled;
     mediaControlsRef.current.setSpeakerOutputEnabled = setSpeakerOutputEnabled;
   }, [setMicrophoneEnabled, setSpeakerOutputEnabled]);
+
+  const endPrivateCall = useCallback(async () => {
+    try {
+      const result = await webrtcRef.current?.endPrivateCall();
+      const returnChannelId = result?.channelId || privateCallRef.current?.previousChannelId || configRef.current.channelId || 'general';
+      if (returnChannelId) {
+        const nextConfig = { ...sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig()), channelId: returnChannelId };
+        configRef.current = nextConfig;
+        localStorage.setItem('sfu_config', JSON.stringify(nextConfig));
+        setSettingsDraft(nextConfig);
+        setChannelId(returnChannelId);
+        webrtcRef.current?.adoptChannel(returnChannelId);
+      }
+      setPrivateCall(null);
+      await setMicrophoneEnabled(false);
+    } catch (err) {
+      console.warn('[endPrivateCall]', err.message);
+      setCamError(`通話終了に失敗しました: ${err.message}`);
+    }
+  }, [setMicrophoneEnabled]);
 
   useEffect(() => {
     adminHandlersRef.current = {
@@ -2144,6 +2771,13 @@ export default function MainView() {
     const channelChanged = previous.channelId !== next.channelId;
     const recvQualityChanged = previous.recvQuality !== next.recvQuality;
 
+    // 設定画面からのサーバー切替も手動選択として扱い、占有数ベースの
+    // 自動選択でしばらく上書きされないようにする
+    if (previous.activeServer !== next.activeServer) {
+      manualServerSelectAtRef.current = Date.now();
+      serverFailoverRef.current.lastSwitchAt = Date.now();
+    }
+
     configRef.current = next;
     localStorage.setItem('sfu_config', JSON.stringify(next));
     setSelfName(next.locationName || '自拠点');
@@ -2155,14 +2789,20 @@ export default function MainView() {
     if (requiresReconnect) {
       await performQuickRestart({ reason: 'settings-updated' });
     } else {
-      if (channelChanged) await webrtcRef.current?.setChannel(next.channelId);
+      if (channelChanged) {
+        await webrtcRef.current?.setChannel(next.channelId);
+        playEffectSound('channelMove');
+      }
       // 受信画質は再接続不要（サーバー側のレイヤ選択で即時反映）
       if (recvQualityChanged) await webrtcRef.current?.setRecvQuality(next.recvQuality);
     }
-  }, [performQuickRestart, settingsDraft]);
+  }, [performQuickRestart, settingsDraft, playEffectSound]);
 
   const changeChannel = useCallback(async (nextChannelId) => {
     const nextId = nextChannelId || channels[0]?.id || 'general';
+    const targetChannel = channels.find(channel => channel.id === nextId);
+    if (isPrivateChannel(targetChannel)) return;
+    const previousId = configRef.current.channelId || channelId || 'general';
     const nextConfig = { ...sanitizeClientConfig(configRef.current.serverIp ? configRef.current : loadClientConfig()), channelId: nextId };
     configRef.current = nextConfig;
     localStorage.setItem('sfu_config', JSON.stringify(nextConfig));
@@ -2173,18 +2813,20 @@ export default function MainView() {
     } catch (err) {
       console.warn('[setChannel]', err.message);
     }
-  }, [channels]);
+    if (previousId !== nextId) playEffectSound('channelMove');
+  }, [channelId, channels, playEffectSound]);
 
   const answerIncomingCall = useCallback(async (call) => {
     const targetChannelId = call?.fromChannelId || '';
     stopIncomingCall(call?.callId || '');
     // 発信側の鳴動表示を止める（失敗しても応答処理は続行）
-    webrtcRef.current?.ackCall(call?.callId, 'answered').catch(() => {});
+    const ackResult = await webrtcRef.current?.ackCall(call?.callId, 'answered').catch(() => null);
     // 着信側も応答した時点でミュートを解除する（設定でオフ可・既定オン）。
     if (configRef.current?.autoUnmuteOnCallAnswer !== false) {
       mediaControlsRef.current.setMicrophoneEnabled?.(true)?.catch?.(() => {});
       mediaControlsRef.current.setSpeakerOutputEnabled?.(true);
     }
+    if (call?.callMode === 'private' || call?.privateChannelId || ackResult?.privateChannelId) return;
     if (!targetChannelId || targetChannelId === activeChannelId) return;
     if (!channels.some(channel => channel.id === targetChannelId)) return;
     await changeChannel(targetChannelId);
@@ -2335,8 +2977,12 @@ export default function MainView() {
 
   const handleTileVolumeChange = useCallback((tileId, value) => {
     const nextValue = clampNumber(value, 0, 1.5);
+    const currentValue = getTileVolume(tileId);
+    if ((currentValue > 0) !== (nextValue > 0)) {
+      playEffectSound(nextValue > 0 ? 'speakerUnmute' : 'speakerMute');
+    }
     setPeerVolumes(prev => ({ ...prev, [tileId]: nextValue }));
-  }, []);
+  }, [getTileVolume, playEffectSound]);
 
   const openMemberMenu = useCallback((event, member, channel) => {
     if (member.isSelf || !member.socketId) return;
@@ -2391,6 +3037,7 @@ export default function MainView() {
         const call = { callId, targetSocketId: socketId, targetName, startedAt: Date.now() };
         outgoingCallRef.current = call;
         setOutgoingCall(call);
+        startLoopingSystemSound('outgoingCall', { volume: ringVolumeScale() });
 
         // サーバー通知が届かない場合のフォールバック（サーバー側タイムアウトと同じ30秒）
         if (outgoingCallTimerRef.current) clearTimeout(outgoingCallTimerRef.current);
@@ -2417,13 +3064,14 @@ export default function MainView() {
     }
 
     await startCall();
-  }, [peers, showCallNotice, stopOutgoingCall]);
+  }, [peers, ringVolumeScale, showCallNotice, stopOutgoingCall]);
 
   const moveMemberToChannel = useCallback(async (socketId, nextChannelId) => {
     if (!socketId || !nextChannelId) return;
     try {
       const result = await webrtcRef.current?.movePeerToChannel(socketId, nextChannelId);
       if (result?.systemState) setSystemState({ ...DEFAULT_SYSTEM_STATE, ...result.systemState });
+      playEffectSound('channelMove');
       setPeers(prev => {
         const next = new Map(prev);
         const peer = next.get(socketId);
@@ -2435,7 +3083,7 @@ export default function MainView() {
       console.warn('[movePeerToChannel]', err.message);
       setCamError(`チャンネル移動に失敗しました: ${err.message}`);
     }
-  }, []);
+  }, [playEffectSound]);
 
   const toggleMemberSpeakerMute = useCallback((socketId) => {
     if (!socketId) return;
@@ -2495,7 +3143,8 @@ export default function MainView() {
     }
     // manager 側でも止めるが、開始直後の失敗などに備えてUI側でも確実に止める
     share?.stream?.getTracks().forEach(track => { try { track.stop(); } catch { /* ignore */ } });
-  }, []);
+    if (share) playEffectSound('screenShareStop');
+  }, [playEffectSound]);
 
   const startScreenShareFromSource = useCallback(async (source, withAudio) => {
     setShareModalMode(null);
@@ -2543,11 +3192,12 @@ export default function MainView() {
       screenShareRef.current = next;
       setScreenShare(next);
       setCamError(null);
+      playEffectSound('screenShareStart');
     } catch (err) {
       console.error('[ScreenShare]', err);
       setCamError(`画面共有を開始できませんでした: ${err.message}`);
     }
-  }, []);
+  }, [playEffectSound]);
 
   const toggleSharePause = useCallback(async () => {
     const share = screenShareRef.current;
@@ -2643,6 +3293,7 @@ export default function MainView() {
           channelId: peerChannelId,
           presenceMode: peer.presenceMode || 'none',
           signalLevel: Number.isFinite(peer.signalLevel) ? peer.signalLevel : null,
+          recovering: !!peer.recovering,
           canControlVolume: true,
           baseVolume: remoteAudioVolume,
           sortRank: sameChannel ? 1 : 3,
@@ -2689,6 +3340,28 @@ export default function MainView() {
     selfName,
     speakerMuted,
   ]);
+
+  useEffect(() => {
+    if (sfuStatus !== 'connected') {
+      observedRemoteScreenSharesRef.current = new Set();
+      return;
+    }
+
+    const current = new Set();
+    for (const [socketId, peer] of peerEntries) {
+      const hasLiveScreen = !!peer.screenProducerId &&
+        peer.screenStream?.getVideoTracks().some(track => track.readyState === 'live');
+      if (hasLiveScreen) current.add(`${socketId}:${peer.screenProducerId}`);
+    }
+
+    const previous = observedRemoteScreenSharesRef.current;
+    const started = Array.from(current).some(id => !previous.has(id));
+    const stopped = Array.from(previous).some(id => !current.has(id));
+    observedRemoteScreenSharesRef.current = current;
+
+    if (started) playEffectSound('screenViewStart');
+    if (stopped) playEffectSound('screenViewStop');
+  }, [peerEntries, playEffectSound, sfuStatus]);
 
   // ── チャンネル別グルーピング ──
   //   メイン: 自チャンネルのカメラON・画面共有タイル（大きく表示）
@@ -2741,6 +3414,7 @@ export default function MainView() {
         audioPaused={tile.audioPaused}
         presenceMode={tile.presenceMode || 'none'}
         signalLevel={tile.signalLevel ?? null}
+        reconnecting={!!tile.recovering}
         highlightMuted={highlightSelfMuted}
         speakerDeviceId={tile.speakerDeviceId}
         speakerMuted={tile.speakerMuted}
@@ -2830,7 +3504,7 @@ export default function MainView() {
                   </button>
                 </form>
                 <div className="channel-edit-list">
-                  {channels.map(channel => {
+                  {registeredChannels.map(channel => {
                     const draft = channelDrafts[channel.id] ?? channel.name;
                     return (
                       <div className="channel-edit-row" key={channel.id}>
@@ -2853,7 +3527,7 @@ export default function MainView() {
                           type="button"
                           title="削除"
                           aria-label="削除"
-                          disabled={channels.length <= 1}
+                          disabled={registeredChannels.length <= 1}
                           onClick={() => deleteChannel(channel.id)}
                         >
                           <Trash2 size={14} />
@@ -2948,9 +3622,30 @@ export default function MainView() {
             </button>
           )}
           <div className="version-line">{sidebarCollapsed ? `v${APP_VERSION}` : `Client v${APP_VERSION}`}</div>
-          {settingsDraft.activeServer === 'sub' && (
-            <div className="version-line sub-server-line" title="保険用サブサーバーに接続しています">
-              {sidebarCollapsed ? 'SUB' : 'サブサーバー接続中'}
+          {/* サーバー切り替えトグル（メイン⇄サブ）。到達不能時の自動切替も併用される */}
+          {!!String(settingsDraft.subServerIp || '').trim() && (
+            <div
+              className={`server-switch ${sidebarCollapsed ? 'collapsed' : ''}`}
+              title={settingsDraft.activeServer === 'sub'
+                ? 'サブサーバー使用中（クリックでメインへ切り替え）。手動選択は10分間、自動選択より優先されます。アプリ再起動後は自動選択に戻ります'
+                : 'メインサーバー使用中（クリックでサブへ切り替え）。手動選択は10分間、自動選択より優先されます。アプリ再起動後は自動選択に戻ります'}
+            >
+              {!sidebarCollapsed && (
+                <span className={`server-switch-label ${settingsDraft.activeServer !== 'sub' ? 'on' : ''}`}>メイン</span>
+              )}
+              <button
+                type="button"
+                role="switch"
+                aria-checked={settingsDraft.activeServer === 'sub'}
+                aria-label={settingsDraft.activeServer === 'sub' ? 'メインサーバーへ切り替え' : 'サブサーバーへ切り替え'}
+                className={`server-switch-track ${settingsDraft.activeServer === 'sub' ? 'sub' : ''}`}
+                onClick={() => switchActiveServer(settingsDraft.activeServer === 'sub' ? 'main' : 'sub')}
+              >
+                <span className="server-switch-knob" />
+              </button>
+              {!sidebarCollapsed && (
+                <span className={`server-switch-label ${settingsDraft.activeServer === 'sub' ? 'on sub' : ''}`}>サブ</span>
+              )}
             </div>
           )}
         </div>
@@ -3004,7 +3699,7 @@ export default function MainView() {
               value={memberMenu.channelId}
               onChange={event => moveMemberToChannel(memberMenu.socketId, event.target.value)}
             >
-              {channels.map(channel => (
+              {registeredChannels.map(channel => (
                 <option key={channel.id} value={channel.id}>{channel.name}</option>
               ))}
             </select>
@@ -3036,6 +3731,15 @@ export default function MainView() {
          sfuStatus === 'error'      ? 'サーバー未接続' :
          sfuStatus === 'restarting' ? '再構築中...' : '接続中...'}
       </div>
+
+      {/* サーバー再接続中オーバーレイ: 画面(GUI)はそのままに、映像エリア中央へ
+          スピナーを重ねる。操作を妨げないよう pointer-events は透過する。 */}
+      {sfuStatus !== 'connected' && (
+        <div className="reconnect-overlay" role="status" aria-live="polite">
+          <div className="reconnect-spinner" aria-hidden="true" />
+          <div className="reconnect-text">サーバーと接続中...</div>
+        </div>
+      )}
 
       {/* ── カメラエラー表示 ── */}
       {camError && (
@@ -3223,8 +3927,9 @@ export default function MainView() {
             devices={audioInDevices}
             selectedId={selectedAudioInId}
             onDeviceChange={(id) => changeMediaDevice('audioIn', id)}
-            title="マイク"
+            title={`マイク（${formatShortcutKey(settingsDraft.shortcuts?.micToggle || defaultShortcuts.micToggle)}）`}
             label="マイク"
+            shortcutKey={formatShortcutKey(settingsDraft.shortcuts?.micToggle || defaultShortcuts.micToggle)}
           />
 
           {/* カメラ */}
@@ -3236,8 +3941,9 @@ export default function MainView() {
             devices={videoDevices}
             selectedId={selectedVideoId}
             onDeviceChange={(id) => changeMediaDevice('video', id)}
-            title="カメラ"
+            title={`カメラ（${formatShortcutKey(settingsDraft.shortcuts?.cameraToggle || defaultShortcuts.cameraToggle)}）`}
             label="カメラ"
+            shortcutKey={formatShortcutKey(settingsDraft.shortcuts?.cameraToggle || defaultShortcuts.cameraToggle)}
           />
 
           {/* スピーカー */}
@@ -3249,8 +3955,9 @@ export default function MainView() {
             devices={audioOutDevices}
             selectedId={selectedAudioOutId}
             onDeviceChange={changeSpeaker}
-            title="スピーカー"
+            title={`スピーカー（${formatShortcutKey(settingsDraft.shortcuts?.speakerToggle || defaultShortcuts.speakerToggle)}）`}
             label="スピーカー"
+            shortcutKey={formatShortcutKey(settingsDraft.shortcuts?.speakerToggle || defaultShortcuts.speakerToggle)}
           />
 
           {/* 画面共有 */}
@@ -3268,6 +3975,21 @@ export default function MainView() {
           </button>
         </div>
 
+        {privateCall && (
+          <div className="ctrl-group private-call-center">
+            <button
+              type="button"
+              className="ctrl-btn private-call-end-btn"
+              onClick={endPrivateCall}
+              title="個別通話を終了"
+              aria-label="個別通話を終了"
+            >
+              <PhoneOff size={20} />
+              <span className="ctrl-btn-label">通話終了</span>
+            </button>
+          </div>
+        )}
+
         <div className="ctrl-group mode-group">
           {/* プレゼンスモード（商談中/不在/帰宅） */}
           <button
@@ -3279,6 +4001,7 @@ export default function MainView() {
           >
             <Briefcase size={20} />
             <span className="ctrl-btn-label">商談中</span>
+            <kbd className="ctrl-btn-kbd" aria-hidden="true">{formatShortcutKey(settingsDraft.shortcuts?.busyMode || defaultShortcuts.busyMode)}</kbd>
           </button>
           <button
             className={`ctrl-btn mode-btn ${presenceMode === 'away' ? 'mode-active away' : ''}`}
@@ -3289,6 +4012,7 @@ export default function MainView() {
           >
             <Clock size={20} />
             <span className="ctrl-btn-label">不在</span>
+            <kbd className="ctrl-btn-kbd" aria-hidden="true">{formatShortcutKey(settingsDraft.shortcuts?.awayMode || defaultShortcuts.awayMode)}</kbd>
           </button>
           <button
             className={`ctrl-btn mode-btn ${presenceMode === 'gohome' ? 'mode-active gohome' : ''}`}
@@ -3299,6 +4023,7 @@ export default function MainView() {
           >
             <Moon size={20} />
             <span className="ctrl-btn-label">帰宅</span>
+            <kbd className="ctrl-btn-kbd" aria-hidden="true">{formatShortcutKey(settingsDraft.shortcuts?.goHomeMode || defaultShortcuts.goHomeMode)}</kbd>
           </button>
 
           <div className="ctrl-separator" aria-hidden="true" />
@@ -3361,7 +4086,7 @@ export default function MainView() {
                     value={settingsDraft.channelId}
                     onChange={e => updateSettingsDraft('channelId', e.target.value)}
                   >
-                    {channels.map(channel => (
+                    {registeredChannels.map(channel => (
                       <option key={channel.id} value={channel.id}>{channel.name}</option>
                     ))}
                   </select>
@@ -3426,6 +4151,7 @@ export default function MainView() {
                 </div>
                 <p className="field-hint">
                   現在のサーバーに約{Math.round(FAILOVER_AFTER_MS / 1000)}秒間接続できず、もう一方のサーバーが応答する場合は自動的に切り替えて再接続します。
+                  再接続時は両サーバーの接続拠点数を確認し、他拠点が接続している方へ優先的に接続します（画面左下のトグルで手動切替も可能）。
                 </p>
               </div>
 
@@ -3507,29 +4233,60 @@ export default function MainView() {
               </div>
 
               <div className="settings-section">
-                <h2>通知音（呼び出し音）</h2>
+                <h2>音量</h2>
                 <div className="field">
-                  <label>音量: {settingsDraft.callVolume ?? 100}%</label>
+                  <label>通話音声: {settingsDraft.voiceVolume ?? 100}%</label>
                   <div className="ringtone-volume-row">
                     <input
                       type="range"
                       min="0"
                       max="100"
                       step="5"
-                      value={settingsDraft.callVolume ?? 100}
-                      onChange={e => updateSettingsDraft('callVolume', Number(e.target.value))}
+                      value={settingsDraft.voiceVolume ?? 100}
+                      onChange={e => updateSettingsDraft('voiceVolume', Number(e.target.value))}
                     />
-                    <button type="button" className="btn-sub" onClick={() => previewCallTone(settingsDraft.callVolume ?? 100)}>
+                  </div>
+                  <p className="field-hint">会議中に聞こえる相手拠点・画面共有音声の音量です。</p>
+                </div>
+                <div className="field">
+                  <label>着信音: {settingsDraft.ringtoneVolume ?? settingsDraft.callVolume ?? 100}%</label>
+                  <div className="ringtone-volume-row">
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={settingsDraft.ringtoneVolume ?? settingsDraft.callVolume ?? 100}
+                      onChange={e => updateSettingsDraft('ringtoneVolume', Number(e.target.value))}
+                    />
+                    <button type="button" className="btn-sub" onClick={() => previewCallTone(settingsDraft.ringtoneVolume ?? settingsDraft.callVolume ?? 100)}>
                       試聴
                     </button>
                   </div>
                   <p className="field-hint">商談中モード中は自動的に50%へ下がります。音量は「保存して反映」で確定します。</p>
                 </div>
                 <div className="field">
+                  <label>効果音: {settingsDraft.effectsVolume ?? 100}%</label>
+                  <div className="ringtone-volume-row">
+                    <input
+                      type="range"
+                      min="0"
+                      max="100"
+                      step="5"
+                      value={settingsDraft.effectsVolume ?? 100}
+                      onChange={e => updateSettingsDraft('effectsVolume', Number(e.target.value))}
+                    />
+                    <button type="button" className="btn-sub" onClick={() => playSystemSound('notification', { volume: sanitizeVolumePercent(settingsDraft.effectsVolume ?? 100) / 100 })}>
+                      試聴
+                    </button>
+                  </div>
+                  <p className="field-hint">ミュート切替、チャンネル移動、画面共有などのシステム効果音です。</p>
+                </div>
+                <div className="field">
                   <label>着信音</label>
                   <div className="ringtone-current">
                     <Music size={14} />
-                    <span>{customRingtone?.name || '既定のベル音'}</span>
+                    <span>{customRingtone?.name || '既定の着信音'}</span>
                     {customRingtone && (
                       <button type="button" className="btn-sub" onClick={() => applyCustomRingtone(null)}>
                         既定に戻す

@@ -13,9 +13,31 @@ let productionIndexUrl = null;
 let controlServer = null;
 let pendingRemoteConfig = null;
 
+// 二重起動防止: 同じ端末で2つ目のアプリが起動すると、同一 instanceId のセッションが
+// サーバー上で衝突し、その拠点が全拠点から「頻繁に再接続する不安定な拠点」に見える。
+// 2つ目の起動は既存ウィンドウを前面に出して即終了する。
+// ロック取得は whenReady 内（再起動ディレイ後）に行う: Windows の自己再起動は
+// 「新プロセスを spawn → 旧プロセスが exit」の順のため、起動直後に取得すると
+// 旧プロセスのロック解放とレースして正当な再起動まで拒否してしまう。
+app.on('second-instance', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
+
 const CONTROL_HOST = process.env.SFU_CLIENT_CONTROL_HOST || '0.0.0.0';
 const CONTROL_PORT = Number.parseInt(process.env.SFU_CLIENT_CONTROL_PORT || '39210', 10);
 const CONTROL_TOKEN = process.env.SFU_CLIENT_CONTROL_TOKEN || '';
+
+// 常時接続アプリのため、ウィンドウが最小化・背面でもタイマーやレンダリングを
+// 間引かせない。間引かれるとテレメトリ(1秒周期)が数十秒〜1分間隔まで落ち、
+// サーバーが「応答なし」と誤検知して再起動指示を送る→復帰→また間引かれる、
+// という再接続ループの原因になる。
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -28,6 +50,17 @@ function relaunchArgs() {
 async function honorRestartDelay() {
   const delayMs = Number.parseInt(process.env.SFU_RESTART_DELAY_MS || '0', 10);
   if (Number.isFinite(delayMs) && delayMs > 0) await delay(Math.min(delayMs, 5000));
+}
+
+// relaunch直後は旧プロセスがロックを保持したまま終了処理中のことがあるため、
+// 一度の失敗で即終了せず短い間隔で再試行する（失敗即終了だと「再起動したはずの
+// アプリが起動していない」無人拠点の停止事故になる）。
+async function acquireSingleInstanceLock(retries = 5, intervalMs = 600) {
+  for (let attempt = 0; attempt < retries; attempt += 1) {
+    if (app.requestSingleInstanceLock()) return true;
+    await delay(intervalMs);
+  }
+  return false;
 }
 
 async function ensureMacMediaAccess() {
@@ -78,6 +111,51 @@ function restartApp() {
 
   app.exit(0);
 }
+
+/**
+ * メモリ肥大の自己回復。常時接続で数日稼働すると、GPUプロセスやレンダラーの
+ * ネイティブリソース肥大がスワップ→OSフリーズ（遠隔復旧不可）に到達しうる。
+ * レンダラーの reload では GPU プロセスは回収できないため、全プロセス合算と
+ * GPUプロセス単体をしきい値監視し、超過が2回連続したらアプリごと再起動する。
+ * 再起動は restartApp()（自動再接続あり・約10秒）で、OSフリーズより遥かに軽い。
+ *   SFU_CLIENT_MEM_RESTART_MB=3200 / SFU_CLIENT_GPU_MEM_RESTART_MB=1800 (0で無効)
+ */
+const MEM_RESTART_MB = Number(process.env.SFU_CLIENT_MEM_RESTART_MB ?? 3200);
+const GPU_MEM_RESTART_MB = Number(process.env.SFU_CLIENT_GPU_MEM_RESTART_MB ?? 1800);
+let memoryBreachCount = 0;
+
+function checkMemoryPressure() {
+  if (restartInProgress) return;
+  let totalMb = 0;
+  let gpuMb = 0;
+  try {
+    for (const metric of app.getAppMetrics()) {
+      const mb = (metric.memory?.workingSetSize || 0) / 1024; // workingSetSize はKB
+      totalMb += mb;
+      if (metric.type === 'GPU') gpuMb = Math.max(gpuMb, mb);
+    }
+  } catch {
+    return;
+  }
+
+  const overTotal = MEM_RESTART_MB > 0 && totalMb >= MEM_RESTART_MB;
+  const overGpu = GPU_MEM_RESTART_MB > 0 && gpuMb >= GPU_MEM_RESTART_MB;
+  if (!overTotal && !overGpu) {
+    memoryBreachCount = 0;
+    return;
+  }
+
+  memoryBreachCount += 1;
+  console.warn(`[Memory] pressure detected total=${Math.round(totalMb)}MB gpu=${Math.round(gpuMb)}MB strike=${memoryBreachCount}`);
+  // 一時的なスパイクでの誤再起動を避けるため、2回連続(約10分継続)で発動する
+  if (memoryBreachCount >= 2) {
+    console.error(`[Memory] restarting app to reclaim resources (total=${Math.round(totalMb)}MB, gpu=${Math.round(gpuMb)}MB)`);
+    restartApp();
+  }
+}
+
+const memoryWatchTimer = setInterval(checkMemoryPressure, 5 * 60 * 1000);
+memoryWatchTimer.unref?.();
 
 function requestQuickRestart(source = 'main') {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
@@ -297,6 +375,8 @@ function createWindow() {
       // ユーザー操作なしでも <video>/<audio> の自動再生を許可（カメラ映像が
       // muted/autoplay ポリシーでブロックされて黒画面になるのを防ぐ）
       autoplayPolicy: 'no-user-gesture-required',
+      // 最小化・背面でも接続維持処理(テレメトリ/同期/復旧)を間引かせない
+      backgroundThrottling: false,
     },
   });
 
@@ -359,6 +439,13 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   await honorRestartDelay();
+
+  if (!(await acquireSingleInstanceLock())) {
+    console.warn('[Startup] 既にこのアプリが起動しているため終了します（二重起動防止）');
+    app.exit(0);
+    return;
+  }
+
   await ensureMacMediaAccess();
 
   // カメラ・マイク権限を許可

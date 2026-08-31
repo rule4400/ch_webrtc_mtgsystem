@@ -70,15 +70,18 @@ async function run() {
   });
 
   let socket;
+  let targetSocket;
   let viewerSocket;
   const adminLogs = [];
   const stats = [];
+  const systemStateChangedMessages = [];
 
   child.stdout.on('data', chunk => process.stdout.write(chunk));
   child.stderr.on('data', chunk => process.stderr.write(chunk));
   child.on('message', message => {
     if (message?.type === 'admin-log') adminLogs.push(message.data);
     if (message?.type === 'stats') stats.push(message.data);
+    if (message?.type === 'system-state-changed') systemStateChangedMessages.push(message);
   });
 
   try {
@@ -147,6 +150,9 @@ async function run() {
 
     const deleteAck = await emitAck(socket, 'deleteChannel', { channelId: createdChannelId });
     if (!deleteAck?.ok || deleteAck.deletedChannelId !== createdChannelId) throw new Error('deleteChannel ack failed');
+    if (!systemStateChangedMessages.some(message => message.state?.channels?.some(channel => channel.id === 'ops'))) {
+      throw new Error('durable system-state-changed IPC message was not emitted');
+    }
 
     const restoreChannelAck = await emitAck(socket, 'setChannel', { channelId: 'ops' });
     if (restoreChannelAck?.channelId !== 'ops') throw new Error('setChannel restore ack failed');
@@ -173,6 +179,77 @@ async function run() {
       connection: { telemetryRttMs: 3, appStatus: 'connected' },
     });
     if (!telemetry?.ok) throw new Error('telemetry ack failed');
+
+    targetSocket = io(`http://127.0.0.1:${httpPort}`, { transports: ['websocket'], timeout: 3000 });
+    await onceWithTimeout(targetSocket, 'connect', 5000);
+    targetSocket.emit('setMetadata', { locationName: 'smoke-target', appType: 'client', appVersion: '0.4.0', channelId: 'general' });
+
+    let privateIncoming = null;
+    const callerPrivateStarted = [];
+    const targetPrivateStarted = [];
+    const callerPrivateEnded = [];
+    const targetPrivateEnded = [];
+    socket.on('privateCallStarted', payload => callerPrivateStarted.push(payload));
+    targetSocket.on('privateCallStarted', payload => targetPrivateStarted.push(payload));
+    socket.on('privateCallEnded', payload => callerPrivateEnded.push(payload));
+    targetSocket.on('privateCallEnded', payload => targetPrivateEnded.push(payload));
+    targetSocket.on('incomingCall', (payload, ack) => {
+      privateIncoming = payload;
+      ack?.({ ok: true });
+    });
+
+    const privateCallAck = await emitAck(socket, 'callPeer', { targetSocketId: targetSocket.id });
+    if (!privateCallAck?.ok || !privateCallAck.privateChannelId) throw new Error('private callPeer ack failed');
+    await wait(250);
+    if (
+      privateIncoming?.fromSocketId !== socket.id ||
+      privateIncoming?.callMode !== 'private' ||
+      privateIncoming?.fromChannelId !== privateCallAck.privateChannelId ||
+      privateIncoming?.fromChannelName !== '個別'
+    ) {
+      throw new Error('private incomingCall payload was not delivered');
+    }
+    if (!callerPrivateStarted.some(event => event.channelId === privateCallAck.privateChannelId)) {
+      throw new Error('caller did not enter private channel');
+    }
+
+    const privateAnswerAck = await emitAck(targetSocket, 'callAck', { callId: privateCallAck.callId, action: 'answered' });
+    if (!privateAnswerAck?.ok || privateAnswerAck.privateChannelId !== privateCallAck.privateChannelId) {
+      throw new Error('private call answer ack failed');
+    }
+    await wait(250);
+    if (!targetPrivateStarted.some(event => event.channelId === privateCallAck.privateChannelId)) {
+      throw new Error('target did not enter private channel');
+    }
+    const callerPrivateState = await emitAck(socket, 'getSystemState', {});
+    const targetPrivateState = await emitAck(targetSocket, 'getSystemState', {});
+    if (callerPrivateState.self?.channelId !== privateCallAck.privateChannelId) throw new Error('caller system state did not move to private channel');
+    if (targetPrivateState.self?.channelId !== privateCallAck.privateChannelId) throw new Error('target system state did not move to private channel');
+    if (!callerPrivateState.channels?.some(channel => channel.id === privateCallAck.privateChannelId && channel.private === true)) {
+      throw new Error('private channel was not published in system state');
+    }
+
+    const privateEndAck = await emitAck(socket, 'endPrivateCall', {});
+    if (!privateEndAck?.ok || privateEndAck.channelId !== 'ops' || privateEndAck.shouldMuteMic !== true) {
+      throw new Error('private call end ack failed');
+    }
+    await wait(300);
+    const callerReturnedState = await emitAck(socket, 'getSystemState', {});
+    const targetReturnedState = await emitAck(targetSocket, 'getSystemState', {});
+    if (callerReturnedState.self?.channelId !== 'ops') throw new Error('caller did not return to previous channel after private call');
+    if (targetReturnedState.self?.channelId !== 'general') throw new Error('target did not return to previous channel after private call');
+    if (callerReturnedState.channels?.some(channel => channel.id === privateCallAck.privateChannelId)) {
+      throw new Error('private channel remained after all members left');
+    }
+    if (!callerPrivateEnded.some(event => event.channelId === 'ops' && event.shouldMuteMic === true)) {
+      throw new Error('caller privateCallEnded event missing mute instruction');
+    }
+    if (!targetPrivateEnded.some(event => event.channelId === 'general' && event.shouldMuteMic === true)) {
+      throw new Error('target privateCallEnded event missing auto-return');
+    }
+
+    targetSocket.disconnect();
+    targetSocket = null;
 
     viewerSocket = io(`http://127.0.0.1:${httpPort}`, { transports: ['websocket'], timeout: 3000 });
     await onceWithTimeout(viewerSocket, 'connect', 5000);
@@ -202,20 +279,6 @@ async function run() {
     if (!viewerPresenceEvents.some(event => event?.active === true)) {
       throw new Error('viewerPresence active event was not delivered to client');
     }
-
-    let peerCallOk = false;
-    viewerSocket.on('incomingCall', (payload, ack) => {
-      peerCallOk =
-        payload.fromSocketId === socket.id &&
-        payload.fromName === 'smoke-client' &&
-        payload.fromChannelId === 'ops' &&
-        payload.fromChannelName === 'Ops';
-      ack?.({ ok: true });
-    });
-    const callAck = await emitAck(socket, 'callPeer', { targetSocketId: viewerSocket.id });
-    if (!callAck?.ok) throw new Error('callPeer ack failed');
-    await wait(250);
-    if (!peerCallOk) throw new Error('incomingCall was not delivered to target peer');
 
     const caps = await emitAck(socket, 'getRouterRtpCapabilities', {});
     if (!Array.isArray(caps?.codecs)) throw new Error('router capabilities missing');
@@ -299,6 +362,7 @@ async function run() {
     console.log('[smoke] signaling, telemetry, admin commands ok');
   } finally {
     viewerSocket?.disconnect();
+    targetSocket?.disconnect();
     socket?.disconnect();
     child.kill('SIGTERM');
     await wait(300);

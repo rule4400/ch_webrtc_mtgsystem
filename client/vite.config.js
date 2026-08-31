@@ -1,5 +1,8 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { fileURLToPath, URL } from 'node:url'
+
+const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 
 export default defineConfig({
   base: './',
@@ -14,4 +17,11 @@ export default defineConfig({
       },
     },
   ],
+  server: {
+    // 既定は 5173。PORT 指定時のみ従う（開発プレビューでポートが塞がっている場合用）
+    port: Number(process.env.PORT) || 5173,
+    fs: {
+      allow: [repoRoot],
+    },
+  },
 })

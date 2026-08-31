@@ -21,6 +21,30 @@ app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 二重起動防止: 同一端末からの重複セッションはサーバー上で衝突し、
+// 「頻繁に再接続する不安定な拠点」に見える原因になる。
+// relaunch直後は旧プロセスがロックを保持したまま終了処理中のことがあるため、
+// 一度の失敗で即終了せず短い間隔で再試行する（失敗即終了だと「再起動したはずの
+// アプリが起動していない」無人拠点の停止事故になる）。
+async function acquireSingleInstanceLock(retries = 5, intervalMs = 600) {
+  for (let attempt = 0; attempt < retries; attempt += 1) {
+    if (app.requestSingleInstanceLock()) return true;
+    await delay(intervalMs);
+  }
+  return false;
+}
+app.on('second-instance', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
+
 function loadProductionApp() {
   const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
   productionIndexUrl = pathToFileURL(indexPath).toString();
@@ -143,7 +167,13 @@ async function findDisplayMediaSource(selection) {
   return sources.find(source => source.id === selection?.id) || sources[0] || null;
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  if (!(await acquireSingleInstanceLock())) {
+    console.warn('[Startup] 既にこのアプリが起動しているため終了します（二重起動防止）');
+    app.exit(0);
+    return;
+  }
+
   session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
     callback(['media', 'display-capture', 'fullscreen'].includes(permission));
   });

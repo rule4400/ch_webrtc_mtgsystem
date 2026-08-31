@@ -21,3 +21,6 @@ server/node_modules/
 server-gui/release/
 server-gui/node_modules/
 server-gui/resources/mediasoup-workers/
+
+# ffmpeg同梱バイナリ(prepare-ffmpeg.cjs が生成)
+server-gui/resources/ffmpeg/

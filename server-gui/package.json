@@ -1,11 +1,11 @@
 {
   "name": "checkhouse-meeting-server-gui",
-  "version": "1.1.5",
+  "version": "1.4.0",
   "description": "CHECKHOUSE Meeting System server controller",
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
-    "prepare:resources": "node scripts/prepare-bundled-server.cjs",
+    "prepare:resources": "node scripts/prepare-bundled-server.cjs && node scripts/prepare-ffmpeg.cjs",
     "package": "npm run prepare:resources && electron-builder build --mac --arm64 && electron-builder build --win --x64",
     "package:mac": "npm run prepare:resources && electron-builder build --mac --arm64",
     "package:win": "npm run prepare:resources && electron-builder build --win --x64",
@@ -34,13 +34,19 @@
         "filter": [
           "index.js",
           "config.js",
+          "recording.js",
           "package.json",
-          ".env.example"
+          ".env.example",
+          "public/**"
         ]
       },
       {
         "from": "resources/mediasoup-workers",
         "to": "mediasoup-workers"
+      },
+      {
+        "from": "resources/ffmpeg",
+        "to": "ffmpeg"
       }
     ]
   },

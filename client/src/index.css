@@ -587,6 +587,77 @@ body.resizing-sidebar {
   pointer-events: none;
 }
 
+/* ── サーバー再接続オーバーレイ（画面はそのまま、中央にスピナーだけ重ねる）── */
+.reconnect-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 110;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: rgba(8, 10, 14, 0.45);
+  backdrop-filter: blur(1.5px);
+  pointer-events: none;
+}
+
+.reconnect-text {
+  color: #e2e8f0;
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-shadow: 0 1px 6px rgba(0, 0, 0, 0.7);
+}
+
+.reconnect-spinner {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 4px solid rgba(255, 255, 255, 0.18);
+  border-top-color: #60a5fa;
+  animation: reconnectSpin 0.9s linear infinite;
+}
+
+.reconnect-spinner.small {
+  width: 20px;
+  height: 20px;
+  border-width: 3px;
+}
+
+@keyframes reconnectSpin {
+  to { transform: rotate(360deg); }
+}
+
+/* 他拠点タイル上の「サーバー接続中」表示（復旧中/切断猶予中の拠点） */
+.tile-reconnect-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(8, 10, 14, 0.6);
+  pointer-events: none;
+}
+
+.tile-reconnect-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #cbd5e1;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.video-cell.mini .tile-reconnect-overlay .camoff-name,
+.video-cell.compact .tile-reconnect-overlay .camoff-name {
+  font-size: 0.9rem;
+}
+
 .member-context-menu {
   position: fixed;
   z-index: 760;
@@ -1001,9 +1072,10 @@ body.resizing-sidebar {
 
 .tile-volume-menu {
   position: absolute;
-  right: 10px;
-  bottom: 42px;
-  z-index: 8;
+  left: 50%;
+  top: calc(50% + 40px);
+  transform: translateX(-50%);
+  z-index: 70; /* 中央ホバーオーバーレイ(z-index:40)より前面 */
   width: min(220px, calc(100% - 20px));
   border: 1px solid rgba(255,255,255,0.14);
   border-radius: 8px;
@@ -1176,6 +1248,7 @@ body.resizing-sidebar {
 
 /* ── コントロールバー ──────────────────────────────── */
 .control-bar {
+  position: relative;
   height: var(--ctrl-h);
   display: flex;
   align-items: center;
@@ -1199,6 +1272,7 @@ body.resizing-sidebar {
 }
 
 .ctrl-btn {
+  position: relative; /* ショートカットバッジ(.ctrl-btn-kbd)の基準 */
   min-width: 58px;
   height: 56px;
   padding: 0 10px;
@@ -1214,6 +1288,30 @@ body.resizing-sidebar {
   gap: 3px;
   transition: background 0.15s, transform 0.1s;
   font-size: 0.85rem;
+}
+
+/* ボタン右上のショートカットキー表示。absolute配置なのでレイアウト寸法に影響しない */
+.ctrl-btn-kbd {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  min-width: 13px;
+  padding: 1px 3px;
+  border-radius: 4px;
+  background: rgba(0,0,0,0.35);
+  border: 1px solid rgba(255,255,255,0.22);
+  color: rgba(255,255,255,0.72);
+  font-family: inherit;
+  font-size: 0.52rem;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
+  text-align: center;
+  pointer-events: none;
+}
+.ctrl-btn.danger .ctrl-btn-kbd {
+  border-color: rgba(255,255,255,0.35);
+  color: rgba(255,255,255,0.9);
 }
 
 /* アイコン下の補足ラベル */
@@ -1233,6 +1331,25 @@ body.resizing-sidebar {
 }
 .ctrl-btn.danger:hover {
   background: var(--danger-dark);
+}
+.private-call-center {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  padding: 6px;
+  background: rgba(127, 29, 29, 0.36);
+  border-color: rgba(248, 113, 113, 0.45);
+  box-shadow: 0 12px 30px rgba(0,0,0,0.26);
+}
+.private-call-end-btn {
+  min-width: 96px;
+  background: #dc2626;
+  color: #fff;
+  border: 1px solid rgba(255,255,255,0.18);
+}
+.private-call-end-btn:hover {
+  background: #b91c1c;
 }
 .leave-btn {
   width: auto;
@@ -1490,6 +1607,15 @@ body.resizing-sidebar {
 @media (max-width: 680px) {
   .settings-panel { width: min(460px, 100%); }
   .settings-body { grid-template-columns: 1fr; }
+  .control-bar {
+    overflow-x: auto;
+    justify-content: flex-start;
+  }
+  .private-call-center {
+    position: static;
+    transform: none;
+    flex-shrink: 0;
+  }
 }
 
 .field-hint {
@@ -1640,19 +1766,20 @@ body.resizing-sidebar {
    v0.2.0: タイルホバー操作バー / 発信中ベル / 画面共有
    ════════════════════════════════════════════════════════ */
 
-/* ── タイルホバー操作バー ──
-   普段は非表示。マウスオーバー時のみ半透明バーを映像上端に表示する。 */
+/* ── タイルホバー操作オーバーレイ ──
+   普段は非表示。マウスオーバー時のみタイル中央に大きめの半透明パネル
+   （不透明度60%）を表示する。ボタンはホバーで一言説明の吹き出しを出す。 */
 .video-cell .tile-actions {
   position: absolute;
-  top: 8px;
+  top: 50%;
   left: 50%;
-  transform: translateX(-50%);
+  transform: translate(-50%, -50%);
   display: flex;
-  gap: 4px;
-  padding: 4px;
-  border-radius: 9px;
-  background: rgba(10,10,10,0.74);
-  border: 1px solid rgba(255,255,255,0.14);
+  gap: 8px;
+  padding: 10px;
+  border-radius: 16px;
+  background: rgba(10,10,10,0.6);
+  border: 1px solid rgba(255,255,255,0.16);
   backdrop-filter: blur(8px);
   opacity: 0;
   pointer-events: none;
@@ -1667,26 +1794,69 @@ body.resizing-sidebar {
   opacity: 1;
   pointer-events: auto;
 }
-.video-cell.compact .tile-actions { top: 4px; padding: 3px; }
+.video-cell.compact .tile-actions { gap: 6px; padding: 7px; border-radius: 13px; }
+.video-cell.mini .tile-actions { gap: 4px; padding: 5px; border-radius: 11px; }
 
 .tile-btn {
-  min-width: 28px;
-  height: 28px;
-  padding: 0 6px;
-  border-radius: 6px;
+  position: relative;
+  min-width: 46px;
+  height: 46px;
+  padding: 0 8px;
+  border-radius: 11px;
   border: none;
-  background: transparent;
-  color: rgba(255,255,255,0.85);
+  background: rgba(255,255,255,0.12);
+  color: rgba(255,255,255,0.92);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  transition: background 0.12s, transform 0.1s;
 }
-.tile-btn:hover { background: rgba(255,255,255,0.18); }
+.tile-btn:hover { background: rgba(255,255,255,0.26); transform: scale(1.06); }
 .tile-btn.active { background: rgba(138,180,248,0.32); color: var(--blue, #8ab4f8); }
-.tile-btn.danger-active { background: rgba(234,67,53,0.5); color: #fff; }
+.tile-btn.danger-active { background: rgba(234,67,53,0.55); color: #fff; }
 .tile-btn.call:hover { background: rgba(74,222,128,0.32); color: #4ade80; }
-.tile-vol-text { font-size: 0.68rem; font-weight: 700; }
+.tile-vol-text { font-size: 0.82rem; font-weight: 700; }
+
+.video-cell.compact .tile-btn { min-width: 38px; height: 38px; border-radius: 9px; }
+.video-cell.compact .tile-btn svg { width: 17px; height: 17px; }
+.video-cell.compact .tile-vol-text { font-size: 0.72rem; }
+.video-cell.mini .tile-btn { min-width: 30px; height: 30px; border-radius: 8px; padding: 0 5px; }
+.video-cell.mini .tile-btn svg { width: 14px; height: 14px; }
+.video-cell.mini .tile-vol-text { font-size: 0.62rem; }
+
+/* ボタンホバー時の一言説明（吹き出し）。data-tip 属性の内容を表示する */
+.tile-btn::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 9px);
+  left: 50%;
+  transform: translateX(-50%) translateY(2px);
+  padding: 5px 10px;
+  border-radius: 7px;
+  background: rgba(8,8,8,0.92);
+  border: 1px solid rgba(255,255,255,0.18);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  z-index: 60;
+}
+.tile-btn:hover::after {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+.tile-btn:not([data-tip])::after { display: none; }
+/* 小さいタイルでは吹き出しをボタンの下に出す（上端で見切れるのを防ぐ） */
+.video-cell.mini .tile-btn::after {
+  bottom: auto;
+  top: calc(100% + 7px);
+  font-size: 0.66rem;
+}
 
 .tile-muted-badge {
   position: absolute;
@@ -2406,4 +2576,88 @@ body.resizing-sidebar {
 .sub-server-line {
   color: #f59e0b !important;
   font-weight: 700;
+}
+
+/* サーバー切り替えトグル（サイドバー左下: メイン⇄サブ） */
+.server-switch {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 2px;
+  user-select: none;
+}
+
+.server-switch.collapsed {
+  justify-content: center;
+  padding: 4px 0;
+}
+
+.server-switch-label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.server-switch-label.on {
+  color: #7dd3fc;
+  font-weight: 700;
+}
+
+.server-switch-label.on.sub {
+  color: #f59e0b;
+}
+
+.server-switch-track {
+  position: relative;
+  width: 34px;
+  min-width: 34px;
+  height: 18px;
+  border-radius: 9px;
+  border: 1px solid rgba(125,211,252,0.5);
+  background: rgba(125,211,252,0.18);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.server-switch-track:hover {
+  border-color: rgba(255,255,255,0.55);
+}
+
+.server-switch-track.sub {
+  border-color: rgba(245,158,11,0.6);
+  background: rgba(245,158,11,0.25);
+}
+
+.server-switch-knob {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #7dd3fc;
+  transition: transform 0.15s ease, background 0.15s ease;
+}
+
+.server-switch-track.sub .server-switch-knob {
+  transform: translateX(16px);
+  background: #f59e0b;
+}
+
+/* 小さいウィンドウではサイドバー下部が隠れるが、サーバー切り替えは
+   「すぐ操作できること」が要件のため、footerをコンパクトな横並びで残す */
+@media (max-width: 700px) {
+  .sidebar-footer {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 6px 2px 0;
+  }
+
+  .sidebar-footer .update-mini {
+    min-height: 26px;
+    padding: 0 8px;
+  }
 }
