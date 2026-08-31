@@ -1,0 +1,104 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: main
+    schedule:
+      interval: weekly
+      day: monday
+      time: "02:50"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(deps/actions)
+
+  - package-ecosystem: npm
+    directory: /client
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: Asia/Tokyo
+    target-branch: main
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps/client)
+
+  - package-ecosystem: npm
+    directory: /screen-share
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:10"
+      timezone: Asia/Tokyo
+    target-branch: main
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps/screen-share)
+
+  - package-ecosystem: npm
+    directory: /viewer
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:20"
+      timezone: Asia/Tokyo
+    target-branch: main
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps/viewer)
+
+  - package-ecosystem: npm
+    directory: /recording-viewer
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:30"
+      timezone: Asia/Tokyo
+    target-branch: main
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps/recording-viewer)
+
+  - package-ecosystem: npm
+    directory: /server
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:40"
+      timezone: Asia/Tokyo
+    target-branch: main
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps/server)
+
+  - package-ecosystem: npm
+    directory: /server-gui
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:50"
+      timezone: Asia/Tokyo
+    target-branch: main
+    open-pull-requests-limit: 5
+    rebase-strategy: auto
+    labels:
+      - dependencies
+    commit-message:
+      prefix: chore(deps/server-gui)

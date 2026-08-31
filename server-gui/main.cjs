@@ -1,7 +1,18 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, session, shell } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { pathToFileURL } = require('url');
+const {
+  enforcePrivateFileModeSync,
+  readPrivateFileSync,
+  writePrivateFileAtomicSync,
+} = require('./private-file.cjs');
+const {
+  createScanGenerationGuard,
+  scanUpdateFolder,
+  watchFolderForFreshScan,
+} = require('./update-folder.cjs');
 
 // パッケージ化されたElectronアプリ(macOS)でnodeが見つからないENOENTエラーを防ぐためのPATH補完
 function fixMacPath() {
@@ -39,92 +50,145 @@ let restartTimer = null;
 let restartAttempts = 0;
 let stoppingServer = false;
 let isQuitting = false;
+const GUI_INDEX_URL = pathToFileURL(path.join(__dirname, 'index.html')).toString();
+
+function isTrustedGuiUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  if (!value) return false;
+  try {
+    const target = new URL(value);
+    const expected = new URL(GUI_INDEX_URL);
+    return target.protocol === 'file:' && target.pathname === expected.pathname;
+  } catch {
+    return false;
+  }
+}
+
+function requireTrustedIpcSender(event) {
+  const senderFrame = event.senderFrame;
+  const senderUrl = senderFrame?.url || '';
+  if (!mainWindow || mainWindow.isDestroyed() ||
+      event.sender !== mainWindow.webContents || !senderFrame ||
+      senderFrame !== mainWindow.webContents.mainFrame || !isTrustedGuiUrl(senderUrl)) {
+    throw new Error('untrusted IPC sender');
+  }
+}
+
+// 管理GUIのIPCはサーバー起動・端末再起動・秘密設定の保存まで行える。
+// 個々のhandlerで検証を忘れないよう、登録時に送信元検証を強制する。
+function handleTrusted(channel, listener) {
+  ipcMain.handle(channel, (event, ...args) => {
+    requireTrustedIpcSender(event);
+    return listener(event, ...args);
+  });
+}
+
+function onTrusted(channel, listener) {
+  ipcMain.on(channel, (event, ...args) => {
+    try {
+      requireTrustedIpcSender(event);
+    } catch (err) {
+      console.warn(`[Security] blocked IPC ${channel}: ${err.message}`);
+      return;
+    }
+    listener(event, ...args);
+  });
+}
+
+// 二重起動防止: GUIを2つ起動すると内蔵サーバーも2つ起動しようとして
+// ポート競合や設定ファイルの取り合いになる。2つ目は既存ウィンドウを前面へ。
+if (!app.requestSingleInstanceLock()) {
+  app.exit(0);
+}
+app.on('second-instance', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
 
 const SERVER_RUNTIME_DIR = 'server-runtime';
 const CLIENT_REGISTRY_FILE = 'registered-clients.json';
 const SYSTEM_SETTINGS_FILE = 'system-settings.json';
+const PRIVATE_CHANNEL_PREFIX = 'private-';
+// schemaVersion が無い旧録画設定は v0 として扱う。安全性優先の既定値への
+// 移行を成功時に一度だけ行い、以後の利用者の選択は上書きしない。
+const RECORDING_SETTINGS_SCHEMA_VERSION = 1;
 const DEFAULT_SYSTEM_SETTINGS = {
   channels: [
     { id: 'general', name: '一般' },
     { id: 'support', name: 'サポート' },
   ],
   latestVersions: {
-    client: '0.1.0',
-    viewer: '0.1.0',
-    'screen-share': '0.1.0',
-    server: '1.0.0',
-    'server-gui': '1.0.0',
+    client: '0.6.0',
+    viewer: '0.1.1',
+    'screen-share': '0.2.1',
+    server: '1.4.0',
+    'server-gui': '1.4.0',
   },
   updatePackages: {},
   updateFolder: '',
+  // メディア接続ポート設定(UTM/FW対策)。サーバープロセス起動時に環境変数として
+  // 渡される。rtcPort: 固定ポート(空=従来のポート範囲)、extraTcpPorts: 443等の
+  // 追加TCP待受(カンマ区切り)、announcedIp: ICE候補として広告するIP
+  // (空=自動: サーバー自身の非内部IPv4を広告)。STUN/TURN は直結できない
+  // 拠点向けの代替ICE経路としてクライアントへ配布する。
+  network: {
+    rtcPort: '',
+    extraTcpPorts: '',
+    announcedIp: '',
+    stunUrls: '',
+    turnUrls: '',
+    turnUser: '',
+    turnPass: '',
+  },
+  // ルーティン再起動(HH:MM、複数可)。serverRestartTimes はサーバープロセスの
+  // 計画再起動(GUI監視下で自動復帰)、clientRestartTimes は全拠点クライアントへ
+  // systemState 経由で同期され、各拠点が指定時刻にアプリを再起動する。
+  maintenance: { serverRestartTimes: [], clientRestartTimes: [] },
+  // サーバー録画設定。稼働中サーバーへは IPC(set-recording-settings) で即時適用され、
+  // サーバー側でも recording-settings.json (userData配下) に永続化される。
+  recording: {
+    schemaVersion: RECORDING_SETTINGS_SCHEMA_VERSION,
+    enabled: false,
+    recordingsDir: '',        // 空 = userData/recordings。NASのマウント先も指定可
+    dbDir: '',                // 空 = 保存先内の recording-db
+    stagingDir: '',           // 空 = userData/recording-staging（必ずローカル推奨）
+    retentionDays: 14,
+    segmentSeconds: 300,
+    compressionMode: 'none',  // 会議優先。strong / standard / light / none
+    recordScreen: false,
+    recordAudio: true,        // 音声(マイク/画面共有音声)も録音。OFF=映像のみ
+    timestampOverlay: false,  // ONは必ず再エンコードが必要
+    ffmpegPath: '',           // 空 = 自動検出(同梱ffmpeg → システム)
+    compressionConcurrency: 1, // 会議優先で1。0 = 自動（現在の実効値は1）
+    minFreeGb: 10,            // 保存先に常に確保する最低空き容量(GB)
+  },
 };
 
 // ── アップデート配布フォルダ ──────────────────────────────
 // ファイル名からアプリ種別とバージョンを自動判別する。
 // 例: CHECKHOUSE-Meeting-Client-0.3.0-arm64.dmg → client / 0.3.0
 
-const UPDATE_FILE_EXT = /\.(dmg|pkg|zip|exe|msi|appimage|deb|7z)$/i;
 let updateFolderWatcher = null;
 let updateFolderScanTimer = null;
-
-function detectAppTypeFromFilename(name) {
-  const lower = String(name || '').toLowerCase();
-  if (/screen[-_ ]?share/.test(lower)) return 'screen-share';
-  if (lower.includes('viewer')) return 'viewer';
-  if (lower.includes('client')) return 'client';
-  if (/server[-_ ]?gui/.test(lower)) return 'server-gui';
-  if (lower.includes('server')) return 'server';
-  return null;
-}
-
-function detectVersionFromFilename(name) {
-  const match = String(name || '').match(/(\d+\.\d+\.\d+(?:[-.][0-9A-Za-z.]+)?)/);
-  return match ? match[1] : '';
-}
-
-function scanUpdateFolder(dir) {
-  const result = { folder: dir || '', files: [], packages: {} };
-  if (!dir || !fs.existsSync(dir)) return result;
-
-  let names = [];
-  try {
-    names = fs.readdirSync(dir).filter(name => UPDATE_FILE_EXT.test(name));
-  } catch (err) {
-    safeSend('server-log', `WARN: アップデートフォルダを読み取れません: ${err.message}`);
-    return result;
-  }
-
-  for (const name of names) {
-    let stat;
-    try {
-      stat = fs.statSync(path.join(dir, name));
-    } catch {
-      continue;
-    }
-    const appType = detectAppTypeFromFilename(name);
-    const version = detectVersionFromFilename(name);
-    const file = { name, appType, version, size: stat.size, mtimeMs: stat.mtimeMs };
-    result.files.push(file);
-
-    if (!appType || !version) continue;
-    const existing = result.packages[appType];
-    // 同一アプリが複数ある場合は新しい mtime を採用
-    if (!existing || stat.mtimeMs > existing.mtimeMs) {
-      result.packages[appType] = {
-        version,
-        url: `/updates/${encodeURIComponent(name)}`,
-        notes: `自動検出: ${name}`,
-        fileName: name,
-        mtimeMs: stat.mtimeMs,
-      };
-    }
-  }
-  return result;
-}
+const updateScanGuard = createScanGenerationGuard();
 
 /** スキャン結果を system-settings に反映し、稼働中サーバーへも配信する */
-function applyUpdateScan(dir, { announce = true } = {}) {
-  const scan = scanUpdateFolder(dir);
+async function applyUpdateScan(dir, { announce = true } = {}) {
+  const generation = updateScanGuard.begin();
+  let scan;
+  try {
+    scan = await scanUpdateFolder(dir);
+  } catch (err) {
+    safeSend('server-log', `WARN: アップデートフォルダを読み取れません: ${err.message}`);
+    scan = { folder: dir || '', files: [], packages: {} };
+  }
+  // A slower NAS scan must never overwrite a newer folder selection/clear.
+  if (!updateScanGuard.isCurrent(generation)) {
+    return { ...scan, settings: readSystemSettings(), stale: true };
+  }
   const settings = readSystemSettings();
   settings.updateFolder = dir || '';
 
@@ -155,6 +219,10 @@ function applyUpdateScan(dir, { announce = true } = {}) {
 }
 
 function watchUpdateFolder(dir) {
+  if (updateFolderScanTimer) {
+    clearTimeout(updateFolderScanTimer);
+    updateFolderScanTimer = null;
+  }
   if (updateFolderWatcher) {
     try { updateFolderWatcher.close(); } catch { /* ignore */ }
     updateFolderWatcher = null;
@@ -165,7 +233,12 @@ function watchUpdateFolder(dir) {
     updateFolderWatcher = fs.watch(dir, () => {
       // 連続イベントをまとめて1.5秒後に自動再スキャン（自動取得）
       clearTimeout(updateFolderScanTimer);
-      updateFolderScanTimer = setTimeout(() => applyUpdateScan(dir), 1500);
+      updateFolderScanTimer = setTimeout(() => {
+        updateFolderScanTimer = null;
+        void applyUpdateScan(dir).catch(err => {
+          safeSend('server-log', `WARN: アップデートフォルダの再スキャンに失敗: ${err.message}`);
+        });
+      }, 1500);
     });
   } catch (err) {
     safeSend('server-log', `WARN: アップデートフォルダの監視を開始できません: ${err.message}`);
@@ -180,9 +253,41 @@ function systemSettingsPath() {
   return path.join(app.getPath('userData'), SYSTEM_SETTINGS_FILE);
 }
 
-function readClientRegistry() {
+// GUI自体の稼働状態（前回サーバーを動かしていたか）。アプリ再起動・OS再起動後に
+// サーバーを自動復帰させるために使う。遠隔管理が前提のため「GUIを起動したのに
+// サーバーが止まったまま」を防ぐことが最優先。
+function guiStatePath() {
+  return path.join(app.getPath('userData'), 'gui-state.json');
+}
+
+function readGuiState() {
   try {
-    const items = JSON.parse(fs.readFileSync(clientRegistryPath(), 'utf8'));
+    const raw = JSON.parse(fs.readFileSync(guiStatePath(), 'utf8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeGuiState(patch) {
+  try {
+    const next = { ...readGuiState(), ...patch };
+    fs.mkdirSync(path.dirname(guiStatePath()), { recursive: true });
+    fs.writeFileSync(guiStatePath(), JSON.stringify(next, null, 2));
+  } catch { /* 保存失敗でも動作は継続 */ }
+}
+
+function readClientRegistry() {
+  const filePath = clientRegistryPath();
+  let serialized;
+  try {
+    serialized = readPrivateFileSync(filePath, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT') return [];
+    throw err;
+  }
+  try {
+    const items = JSON.parse(serialized);
     return Array.isArray(items) ? items : [];
   } catch {
     return [];
@@ -190,8 +295,7 @@ function readClientRegistry() {
 }
 
 function writeClientRegistry(items) {
-  fs.mkdirSync(path.dirname(clientRegistryPath()), { recursive: true });
-  fs.writeFileSync(clientRegistryPath(), JSON.stringify(items, null, 2));
+  writePrivateFileAtomicSync(clientRegistryPath(), JSON.stringify(items, null, 2));
 }
 
 function stableId(value, fallback = 'general') {
@@ -210,6 +314,7 @@ function sanitizeChannels(channels) {
   for (const entry of channels.slice(0, 32)) {
     const id = stableId(entry?.id || entry?.name, '');
     const name = shortText(entry?.name || id, 48);
+    if (entry?.private || entry?.temporary || id.startsWith(PRIVATE_CHANNEL_PREFIX)) continue;
     if (!id || !name || seen.has(id)) continue;
     seen.add(id);
     items.push({ id, name });
@@ -217,7 +322,108 @@ function sanitizeChannels(channels) {
   return items.length ? items : DEFAULT_SYSTEM_SETTINGS.channels;
 }
 
-function sanitizeSystemSettings(input = {}) {
+function sanitizePortText(value) {
+  const n = Number(String(value ?? '').trim());
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? String(n) : '';
+}
+
+function sanitizeIpListText(value) {
+  return String(value ?? '')
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => /^\d{1,3}(\.\d{1,3}){3}$/.test(part))
+    .join(',');
+}
+
+function sanitizeIceUrlListText(value, allowedSchemes) {
+  const allowed = new Set(allowedSchemes.map(item => String(item).toLowerCase()));
+  return String(value ?? '')
+    .split(',')
+    .map(part => part.trim())
+    .filter(part => {
+      if (!part || part.length > 512 || /[\s\u0000-\u001f\u007f]/.test(part)) return false;
+      const match = /^(stuns?|turns?):(?:\[[0-9a-f:]+\]|[a-z0-9.-]+)(?::(\d{1,5}))?(?:\?transport=(udp|tcp))?$/i.exec(part);
+      if (!match || !allowed.has(match[1].toLowerCase())) return false;
+      return !match[2] || Number(match[2]) <= 65535;
+    })
+    .slice(0, 16)
+    .join(',');
+}
+
+function sanitizeNetwork(input) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const extraTcpPorts = String(raw.extraTcpPorts ?? '')
+    .split(',')
+    .map(part => sanitizePortText(part))
+    .filter(Boolean)
+    .join(',');
+  return {
+    rtcPort: sanitizePortText(raw.rtcPort),
+    extraTcpPorts,
+    // ANNOUNCED_IP。空 = 自動（サーバー自身の非内部IPv4を全て広告）。
+    // カンマ区切りで複数指定可（server/config.js が分割して解釈する）。
+    announcedIp: sanitizeIpListText(raw.announcedIp),
+    stunUrls: sanitizeIceUrlListText(raw.stunUrls, ['stun', 'stuns']),
+    turnUrls: sanitizeIceUrlListText(raw.turnUrls, ['turn', 'turns']),
+    turnUser: shortText(raw.turnUser, 256),
+    turnPass: shortText(raw.turnPass, 256),
+  };
+}
+
+/** "HH:MM" 形式の時刻リストを検証・正規化する(ゼロ埋め・重複除去・昇順・最大12件) */
+function sanitizeRestartTimes(value) {
+  const list = Array.isArray(value)
+    ? value
+    : String(value ?? '').split(',');
+  const seen = new Set();
+  for (const item of list.slice(0, 32)) {
+    const match = /^\s*([01]?\d|2[0-3]):([0-5]\d)\s*$/.exec(String(item ?? ''));
+    if (!match) continue;
+    seen.add(`${match[1].padStart(2, '0')}:${match[2]}`);
+  }
+  return Array.from(seen).sort().slice(0, 12);
+}
+
+function sanitizeMaintenance(input) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  return {
+    serverRestartTimes: sanitizeRestartTimes(raw.serverRestartTimes),
+    clientRestartTimes: sanitizeRestartTimes(raw.clientRestartTimes),
+  };
+}
+
+function sanitizeRecording(input, { migrateLegacySafetyDefaults = false } = {}) {
+  const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const clampInt = (value, min, max, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
+  };
+  return {
+    schemaVersion: RECORDING_SETTINGS_SCHEMA_VERSION,
+    enabled: !!raw.enabled,
+    recordingsDir: shortText(raw.recordingsDir, 1024),
+    dbDir: shortText(raw.dbDir, 1024),
+    stagingDir: shortText(raw.stagingDir, 1024),
+    retentionDays: clampInt(raw.retentionDays, 1, 3650, 14),
+    segmentSeconds: clampInt(raw.segmentSeconds, 60, 3600, 300),
+    compressionMode: migrateLegacySafetyDefaults
+      ? 'none'
+      : (['strong', 'standard', 'light', 'none'].includes(raw.compressionMode)
+        ? raw.compressionMode : 'none'),
+    recordScreen: !!raw.recordScreen,
+    recordAudio: raw.recordAudio === undefined ? true : !!raw.recordAudio,
+    timestampOverlay: migrateLegacySafetyDefaults
+      ? false
+      : (raw.timestampOverlay === undefined ? false : !!raw.timestampOverlay),
+    ffmpegPath: shortText(raw.ffmpegPath, 1024),
+    compressionConcurrency: migrateLegacySafetyDefaults
+      ? 1
+      : clampInt(raw.compressionConcurrency, 0, 8, 1),
+    minFreeGb: clampInt(raw.minFreeGb, 1, 1000, 10),
+  };
+}
+
+function sanitizeSystemSettings(input = {}, { migrateLegacyRecording = false } = {}) {
   const raw = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   const latestVersions = {
     ...DEFAULT_SYSTEM_SETTINGS.latestVersions,
@@ -229,6 +435,11 @@ function sanitizeSystemSettings(input = {}) {
 
   return {
     channels: sanitizeChannels(raw.channels),
+    network: sanitizeNetwork(raw.network),
+    recording: sanitizeRecording(raw.recording, {
+      migrateLegacySafetyDefaults: migrateLegacyRecording,
+    }),
+    maintenance: sanitizeMaintenance(raw.maintenance),
     updateFolder: shortText(raw.updateFolder, 1024),
     latestVersions: Object.fromEntries(Object.entries(latestVersions).map(([key, value]) => [key, shortText(value, 48)])),
     updatePackages: Object.fromEntries(Object.entries(updatePackages).map(([key, value]) => {
@@ -246,36 +457,128 @@ function sanitizeSystemSettings(input = {}) {
 }
 
 function readSystemSettings() {
+  const filePath = systemSettingsPath();
+  let raw;
   try {
-    return sanitizeSystemSettings(JSON.parse(fs.readFileSync(systemSettingsPath(), 'utf8')));
-  } catch {
+    raw = JSON.parse(readPrivateFileSync(filePath, 'utf8'));
+  } catch (err) {
+    if (err?.code !== 'ENOENT' && !(err instanceof SyntaxError)) throw err;
     return sanitizeSystemSettings(DEFAULT_SYSTEM_SETTINGS);
   }
+
+  const rawRecording = raw && typeof raw.recording === 'object' && !Array.isArray(raw.recording)
+    ? raw.recording
+    : null;
+  const persistedVersion = Number(rawRecording?.schemaVersion);
+  const migrateLegacyRecording = !!rawRecording &&
+    (!Number.isInteger(persistedVersion) || persistedVersion < RECORDING_SETTINGS_SCHEMA_VERSION);
+  const clean = sanitizeSystemSettings(raw, { migrateLegacyRecording });
+
+  if (migrateLegacyRecording) {
+    try {
+      // schemaVersion を同時に保存するため、成功後は次回以降移行されない。
+      writeSystemSettings(clean);
+      console.log('[Recording] 旧録画設定を会議優先schemaへ移行しました');
+    } catch (err) {
+      // 保存に失敗しても、この起動中は安全な設定を使う。
+      console.warn(`[Recording] 旧録画設定の移行結果を保存できません: ${err.message}`);
+    }
+  }
+  return clean;
 }
 
 function writeSystemSettings(settings) {
   const clean = sanitizeSystemSettings(settings);
-  fs.mkdirSync(path.dirname(systemSettingsPath()), { recursive: true });
-  fs.writeFileSync(systemSettingsPath(), JSON.stringify(clean, null, 2));
+  writePrivateFileAtomicSync(systemSettingsPath(), JSON.stringify(clean, null, 2));
   return clean;
+}
+
+function recordingSettingsMirrorPath() {
+  return process.env.RECORDING_SETTINGS_FILE || path.join(app.getPath('userData'), 'recording-settings.json');
+}
+
+function writeRecordingSettingsMirror(rawRecording) {
+  const clean = sanitizeRecording(rawRecording);
+  writePrivateFileAtomicSync(recordingSettingsMirrorPath(), JSON.stringify(clean, null, 2));
+  return clean;
+}
+
+/**
+ * serverのrecording-settings.jsonをGUI表示用system-settingsへ取り込む。
+ * HTTP管理APIで変更した値が、次回GUI起動時に古いcopyで巻き戻るのを防ぐ。
+ */
+function syncRecordingSettingsFromMirror() {
+  const filePath = recordingSettingsMirrorPath();
+  let raw = null;
+  try {
+    raw = JSON.parse(readPrivateFileSync(filePath, 'utf8'));
+  } catch (err) {
+    if (err?.code !== 'ENOENT' && !(err instanceof SyntaxError)) throw err;
+  }
+  const current = readSystemSettings();
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    writeRecordingSettingsMirror(current.recording);
+    return current.recording;
+  }
+  const persistedVersion = Number(raw.schemaVersion);
+  const recording = sanitizeRecording(raw, {
+    migrateLegacySafetyDefaults: !Number.isInteger(persistedVersion) ||
+      persistedVersion < RECORDING_SETTINGS_SCHEMA_VERSION,
+  });
+  writeRecordingSettingsMirror(recording);
+  writeSystemSettings({ ...current, recording });
+  return recording;
+}
+
+function persistRecordingSettingsFromServer(rawRecording, source = 'server') {
+  const current = readSystemSettings();
+  const recording = sanitizeRecording(rawRecording);
+  const saved = writeSystemSettings({ ...current, recording });
+  safeSend('system-settings-updated', saved);
+  safeSend('server-log', `[Recording] サーバー側の録画設定をGUIへ同期しました source=${shortText(source, 80)}`);
+  return saved.recording;
+}
+
+function persistRuntimeSystemState(state, source = 'server') {
+  const current = readSystemSettings();
+  const raw = state && typeof state === 'object' && !Array.isArray(state) ? state : {};
+  const saved = writeSystemSettings({
+    ...current,
+    channels: raw.channels || current.channels,
+    latestVersions: raw.latestVersions || current.latestVersions,
+    updatePackages: raw.updatePackages || current.updatePackages,
+    maintenance: raw.maintenance || current.maintenance,
+  });
+  safeSend('server-log', `[Settings] サーバー設定を保存しました source=${shortText(source, 80)} channels=${saved.channels.length}`);
+  safeSend('system-settings-updated', saved);
+  return saved;
 }
 
 function shortText(value, max = 256) {
   return String(value ?? '').trim().slice(0, max);
 }
 
+function isLoopbackControlHost(value) {
+  const host = shortText(value, 180).toLowerCase().replace(/^\[|\]$/g, '');
+  return host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
 function sanitizeRegisteredClient(input = {}) {
   const id = shortText(input.id, 80) || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const host = shortText(input.host, 180);
   const port = Number.parseInt(input.port || '39210', 10);
+  const token = shortText(input.token, 512);
   if (!host) throw new Error('クライアントIP/ホストを入力してください');
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('管理ポートが不正です');
+  if (!isLoopbackControlHost(host) && token.length < 16) {
+    throw new Error('リモート管理するクライアントには16文字以上の認証tokenが必要です');
+  }
   return {
     id,
     name: shortText(input.name, 128) || host,
     host,
     port,
-    token: shortText(input.token, 512),
+    token,
     locationName: shortText(input.locationName, 128) || shortText(input.name, 128) || host,
     serverIp: shortText(input.serverIp, 128),
     serverPort: shortText(input.serverPort, 12) || '3000',
@@ -409,10 +712,24 @@ function createWindow() {
     height: 700,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
-      contextIsolation: true
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      backgroundThrottling: false,
     }
   });
-  mainWindow.loadFile('index.html');
+  mainWindow.loadURL(GUI_INDEX_URL);
+
+  const guardNavigation = (event, url) => {
+    if (isTrustedGuiUrl(url)) return;
+    event.preventDefault();
+    safeSend('server-log', `WARN: GUIの意図しないナビゲーションを拒否しました: ${shortText(url, 300)}`);
+  };
+  mainWindow.webContents.on('will-navigate', guardNavigation);
+  mainWindow.webContents.on('will-redirect', guardNavigation);
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-attach-webview', event => event.preventDefault());
 
   mainWindow.on('closed', () => {
     mainWindow = null;
@@ -427,7 +744,27 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  // 管理GUIはカメラ・マイク・位置情報等のWeb権限を使用しない。
+  session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+  session.defaultSession.setPermissionCheckHandler(() => false);
+  try {
+    syncRecordingSettingsFromMirror();
+  } catch (err) {
+    console.warn(`[Recording] 録画設定mirrorを同期できません: ${err.message}`);
+  }
   createWindow();
+
+  // 前回サーバー稼働中にGUIが終了(OS再起動・クラッシュ等)していた場合は
+  // 自動でサーバーを復帰させる。手動停止していた場合は復帰しない。
+  const guiState = readGuiState();
+  if (guiState.serverRunning) {
+    setTimeout(() => {
+      if (serverProcess) return;
+      safeSend('server-log', '--- 前回稼働状態を検出: サーバーを自動起動します ---');
+      restartAttempts = 0;
+      startServerProcess(guiState.serverDir || '', { automatic: true });
+    }, 800);
+  }
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -446,7 +783,7 @@ app.on('before-quit', () => {
   stopServerProcess();
 });
 
-ipcMain.handle('select-folder', async () => {
+handleTrusted('select-folder', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
     title: 'サーバー(server)フォルダを選択'
@@ -455,7 +792,7 @@ ipcMain.handle('select-folder', async () => {
   return result.filePaths[0];
 });
 
-ipcMain.handle('get-server-info', () => {
+handleTrusted('get-server-info', () => {
   const bundled = getBundledServerRuntimeDir();
   return {
     bundledServerDir: bundled,
@@ -464,45 +801,108 @@ ipcMain.handle('get-server-info', () => {
   };
 });
 
-ipcMain.handle('get-system-settings', () => {
+handleTrusted('get-system-settings', () => {
   return readSystemSettings();
 });
 
-ipcMain.handle('save-system-settings', (_event, rawSettings) => {
+/** サーバーを停止→完全終了を待って再起動する(メディアポート設定の適用用) */
+function restartServerProcess(reason) {
+  if (!serverProcess) return;
+  const dir = lastServerDir;
+  safeSend('server-log', `--- サーバーを再起動します: ${reason} ---`);
+  stopServerProcess({ manual: true });
+  const waitStart = Date.now();
+  const timer = setInterval(() => {
+    if (serverProcess) {
+      if (Date.now() - waitStart > 15000) {
+        clearInterval(timer);
+        safeSend('server-log', 'WARN: サーバー再起動待ちがタイムアウトしました。手動で起動してください。');
+      }
+      return;
+    }
+    clearInterval(timer);
+    restartAttempts = 0;
+    startServerProcess(dir, { automatic: true });
+  }, 300);
+}
+
+handleTrusted('save-system-settings', (_event, rawSettings) => {
+  const previousNetwork = JSON.stringify(readSystemSettings().network || {});
   const settings = writeSystemSettings(rawSettings);
   if (serverProcess) sendSystemSettingsToServer();
+  // メディアポート設定はサーバープロセスの起動時にしか適用できないため、
+  // 変更されていて稼働中なら自動で再起動して反映する。
+  if (serverProcess && JSON.stringify(settings.network || {}) !== previousNetwork) {
+    restartServerProcess('メディア接続ポート設定の変更適用');
+  }
   return settings;
 });
 
-ipcMain.handle('select-update-folder', async () => {
+// ── 録画設定 ─────────────────────────────────────────────
+
+handleTrusted('save-recording-settings', (_event, rawRecording) => {
+  const settings = writeSystemSettings({ ...readSystemSettings(), recording: rawRecording });
+  writeRecordingSettingsMirror(settings.recording);
+  if (serverProcess) {
+    sendToServer({ type: 'set-recording-settings', settings: settings.recording });
+    safeSend('server-log', `[Recording] 録画設定を保存して適用しました (有効=${settings.recording.enabled ? 'ON' : 'OFF'} 保持=${settings.recording.retentionDays}日)`);
+  } else {
+    safeSend('server-log', '[Recording] 録画設定を保存しました(次回サーバー起動時に適用されます)');
+  }
+  return settings.recording;
+});
+
+/** 録画保存先/DB保存先などの汎用フォルダ選択(NASのマウント先も選択可) */
+handleTrusted('select-any-folder', async (_event, title) => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ['openDirectory', 'createDirectory'],
+    title: shortText(title, 120) || 'フォルダを選択',
+  });
+  if (result.canceled) return null;
+  return result.filePaths[0];
+});
+
+/** 録画タイムライン(ブラウザUI)を開く */
+handleTrusted('open-recordings-ui', (_event, port) => {
+  const p = Number.parseInt(String(port || '3000'), 10);
+  if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error('サーバーポートが不正です');
+  return shell.openExternal(`http://127.0.0.1:${p}/recordings`);
+});
+
+handleTrusted('select-update-folder', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     properties: ['openDirectory'],
     title: 'アップデートファイルの配布フォルダを選択',
   });
   if (result.canceled) return null;
   const dir = result.filePaths[0];
-  const scan = applyUpdateScan(dir);
-  watchUpdateFolder(dir);
+  watchUpdateFolder(null);
+  const scan = await applyUpdateScan(dir);
+  watchFolderForFreshScan(scan, dir, watchUpdateFolder);
   return scan;
 });
 
-ipcMain.handle('scan-update-folder', () => {
+handleTrusted('scan-update-folder', async () => {
   const dir = readSystemSettings().updateFolder;
   if (!dir) return { folder: '', files: [], packages: {}, settings: readSystemSettings() };
-  watchUpdateFolder(dir);
-  return applyUpdateScan(dir);
-});
-
-ipcMain.handle('clear-update-folder', () => {
   watchUpdateFolder(null);
-  return applyUpdateScan('');
+  const scan = await applyUpdateScan(dir);
+  watchFolderForFreshScan(scan, dir, watchUpdateFolder);
+  return scan;
 });
 
-ipcMain.handle('list-registered-clients', () => {
+handleTrusted('clear-update-folder', async () => {
+  watchUpdateFolder(null);
+  const scan = await applyUpdateScan('');
+  watchFolderForFreshScan(scan, null, watchUpdateFolder);
+  return scan;
+});
+
+handleTrusted('list-registered-clients', () => {
   return readClientRegistry().map(publicRegisteredClient);
 });
 
-ipcMain.handle('save-registered-client', (_event, rawClient) => {
+handleTrusted('save-registered-client', (_event, rawClient) => {
   const existing = readClientRegistry();
   const matching = rawClient?.id
     ? existing.find(client => client.id === rawClient.id)
@@ -523,13 +923,13 @@ ipcMain.handle('save-registered-client', (_event, rawClient) => {
   return publicRegisteredClient(client);
 });
 
-ipcMain.handle('remove-registered-client', (_event, id) => {
+handleTrusted('remove-registered-client', (_event, id) => {
   const existing = readClientRegistry();
   writeClientRegistry(existing.filter(client => client.id !== id));
   return true;
 });
 
-ipcMain.handle('probe-registered-client', async (_event, id) => {
+handleTrusted('probe-registered-client', async (_event, id) => {
   const clients = readClientRegistry();
   const client = clients.find(item => item.id === id);
   if (!client) throw new Error('登録クライアントが見つかりません');
@@ -549,7 +949,7 @@ ipcMain.handle('probe-registered-client', async (_event, id) => {
   }
 });
 
-ipcMain.handle('configure-registered-client', async (_event, id, config = {}) => {
+handleTrusted('configure-registered-client', async (_event, id, config = {}) => {
   const clients = readClientRegistry();
   const client = clients.find(item => item.id === id);
   if (!client) throw new Error('登録クライアントが見つかりません');
@@ -569,7 +969,7 @@ ipcMain.handle('configure-registered-client', async (_event, id, config = {}) =>
   return { client: publicRegisteredClient(client), response };
 });
 
-ipcMain.handle('restart-registered-client', async (_event, id) => {
+handleTrusted('restart-registered-client', async (_event, id) => {
   const clients = readClientRegistry();
   const client = clients.find(item => item.id === id);
   if (!client) throw new Error('登録クライアントが見つかりません');
@@ -606,7 +1006,7 @@ function ensureBundledServerRuntime() {
   const runtimeDir = getBundledServerRuntimeDir();
   fs.mkdirSync(runtimeDir, { recursive: true });
 
-  for (const file of ['index.js', 'config.js', 'package.json', '.env.example']) {
+  for (const file of ['index.js', 'config.js', 'recording.js', 'published-files.js', 'package.json', '.env.example', path.join('public', 'recordings.html')]) {
     const src = path.join(sourceDir, file);
     if (fs.existsSync(src)) copyFileIfChanged(src, path.join(runtimeDir, file));
   }
@@ -614,7 +1014,11 @@ function ensureBundledServerRuntime() {
   const envPath = path.join(runtimeDir, '.env');
   if (!fs.existsSync(envPath)) {
     const examplePath = path.join(runtimeDir, '.env.example');
-    if (fs.existsSync(examplePath)) fs.copyFileSync(examplePath, envPath);
+    if (fs.existsSync(examplePath)) {
+      writePrivateFileAtomicSync(envPath, fs.readFileSync(examplePath));
+    }
+  } else {
+    enforcePrivateFileModeSync(envPath);
   }
   migrateGeneratedEnv(envPath);
 
@@ -622,15 +1026,20 @@ function ensureBundledServerRuntime() {
 }
 
 function migrateGeneratedEnv(envPath) {
-  if (!fs.existsSync(envPath)) return;
-  const env = fs.readFileSync(envPath, 'utf8');
+  let env;
+  try {
+    env = readPrivateFileSync(envPath, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT') return;
+    throw err;
+  }
   const looksGenerated =
     env.includes('# VPN内で全クライアントから到達できるSFUサーバーのIPを指定してください。') &&
     env.includes('ANNOUNCED_IP=10.0.0.10');
 
   if (!looksGenerated) return;
 
-  fs.writeFileSync(envPath, env.replace('ANNOUNCED_IP=10.0.0.10', 'ANNOUNCED_IP='));
+  writePrivateFileAtomicSync(envPath, env.replace('ANNOUNCED_IP=10.0.0.10', 'ANNOUNCED_IP='));
   safeSend('server-log', `WARN: 旧バージョンのサンプル ANNOUNCED_IP=10.0.0.10 を無効化しました。必要に応じて設定タブの .env を実際のVPN内IPに変更してください: ${envPath}`);
 }
 
@@ -641,6 +1050,38 @@ function getNodePathEnv() {
     path.resolve(__dirname, '..', 'server', 'node_modules'),
   ];
   return paths.filter(p => fs.existsSync(p)).join(path.delimiter);
+}
+
+/**
+ * 同梱 ffmpeg/ffprobe のパス解決。優先順:
+ *   1. パッケージ版リソース (resources/ffmpeg/<platform>-<arch>/)
+ *   2. 開発時: server/node_modules の ffmpeg-static / ffprobe-static
+ * 見つかったパスは FFMPEG_PATH / FFPROBE_PATH としてサーバープロセスへ渡す。
+ */
+function getBundledFfmpegPaths() {
+  const exeSuffix = process.platform === 'win32' ? '.exe' : '';
+  const platformArch = `${process.platform}-${process.arch}`;
+  const resourceDirs = [
+    path.join(process.resourcesPath, 'ffmpeg', platformArch),
+    path.join(__dirname, 'resources', 'ffmpeg', platformArch),
+  ];
+  for (const dir of resourceDirs) {
+    const ffmpeg = path.join(dir, `ffmpeg${exeSuffix}`);
+    if (fs.existsSync(ffmpeg)) {
+      const ffprobe = path.join(dir, `ffprobe${exeSuffix}`);
+      return { ffmpeg, ffprobe: fs.existsSync(ffprobe) ? ffprobe : null };
+    }
+  }
+  // 開発時: server/node_modules から
+  try {
+    const serverModules = path.resolve(__dirname, '..', 'server', 'node_modules');
+    const ffmpeg = require(path.join(serverModules, 'ffmpeg-static'));
+    const ffprobe = require(path.join(serverModules, 'ffprobe-static')).path;
+    if (ffmpeg && fs.existsSync(ffmpeg)) {
+      return { ffmpeg, ffprobe: ffprobe && fs.existsSync(ffprobe) ? ffprobe : null };
+    }
+  } catch { /* サーバー側の自動検出(recording.js)に任せる */ }
+  return null;
 }
 
 function getMediasoupWorkerBin() {
@@ -695,6 +1136,46 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
     NODE_PATH: getNodePathEnv(),
   };
   if (workerBin) env.MEDIASOUP_WORKER_BIN = workerBin;
+  // 通知音フォルダは userData 配下に置き、サーバー本体(server-runtime)を
+  // アップデートで入れ替えてもインポート済みの通知音が消えないようにする。
+  if (!env.RINGTONES_DIR) {
+    env.RINGTONES_DIR = path.join(app.getPath('userData'), 'ringtones');
+    try { fs.mkdirSync(env.RINGTONES_DIR, { recursive: true }); } catch { /* 起動は継続 */ }
+  }
+  // サーバーの永続状態(TCPフォールバック記憶など)は userData 配下に置き、
+  // サーバー本体の更新・再起動をまたいで引き継がれるようにする。
+  if (!env.SERVER_STATE_FILE) {
+    env.SERVER_STATE_FILE = path.join(app.getPath('userData'), 'sfu-state.json');
+  }
+  // 録画設定も userData 配下に永続化する(既定の録画保存先も userData/recordings になる)。
+  if (!env.RECORDING_SETTINGS_FILE) {
+    env.RECORDING_SETTINGS_FILE = path.join(app.getPath('userData'), 'recording-settings.json');
+  }
+  // 取込み中の生セグメントはNASへ直接書かず、必ずサーバーのローカル領域で
+  // 保全する。GUIで stagingDir が指定された場合は、起動後の設定同期で上書きされる。
+  if (!env.RECORDING_STAGING_DIR) {
+    env.RECORDING_STAGING_DIR = path.join(app.getPath('userData'), 'recording-staging');
+    try { fs.mkdirSync(env.RECORDING_STAGING_DIR, { recursive: true }); } catch { /* サーバー側でエラー表示 */ }
+  }
+  // 同梱 ffmpeg/ffprobe(録画用)。システムへの ffmpeg インストールは不要。
+  const bundledFfmpeg = getBundledFfmpegPaths();
+  if (bundledFfmpeg) {
+    if (!env.FFMPEG_PATH) env.FFMPEG_PATH = bundledFfmpeg.ffmpeg;
+    if (!env.FFPROBE_PATH && bundledFfmpeg.ffprobe) env.FFPROBE_PATH = bundledFfmpeg.ffprobe;
+    safeSend('server-log', `--- 同梱 ffmpeg: ${env.FFMPEG_PATH} ---`);
+  } else {
+    safeSend('server-log', 'WARN: 同梱 ffmpeg が見つかりません。録画にはシステムの ffmpeg または設定でのパス指定が必要です。');
+  }
+  // メディア接続ポート設定(GUIの設定タブ)。設定されている場合のみ環境変数として
+  // 渡す(dotenvは既存の環境変数を上書きしないため、GUI設定が .env より優先される)。
+  const network = readSystemSettings().network || {};
+  if (network.rtcPort) env.RTC_PORT = network.rtcPort;
+  if (network.extraTcpPorts) env.RTC_EXTRA_TCP_PORTS = network.extraTcpPorts;
+  if (network.announcedIp) env.ANNOUNCED_IP = network.announcedIp;
+  if (network.stunUrls) env.STUN_URLS = network.stunUrls;
+  if (network.turnUrls) env.TURN_URLS = network.turnUrls;
+  if (network.turnUser) env.TURN_USER = network.turnUser;
+  if (network.turnPass) env.TURN_PASS = network.turnPass;
   
   // Electron 同梱の Node ランタイムで内蔵サーバーを起動する。
   serverProcess = spawn(process.execPath, [path.join(serverDir, 'index.js')], {
@@ -723,6 +1204,10 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
       safeSend('server-stats', msg.data);
     } else if (msg.type === 'admin-log') {
       safeSend('server-log', msg.data);
+    } else if (msg.type === 'system-state-changed') {
+      persistRuntimeSystemState(msg.state, msg.source);
+    } else if (msg.type === 'recording-settings-changed') {
+      persistRecordingSettingsFromServer(msg.settings, msg.source);
     }
   });
 
@@ -736,47 +1221,61 @@ function startServerProcess(selectedPath, { automatic = false } = {}) {
   });
 
   safeSend('server-status', 'Running');
+  // 前回稼働状態として記録し、GUI再起動・OS再起動後の自動復帰に使う
+  writeGuiState({ serverRunning: true, serverDir: selectedPath || '' });
   setTimeout(() => {
     if (!serverProcess) return;
     sendSystemSettingsToServer();
+    // 録画設定を反映(サーバー側 recording-settings.json と同期)
+    sendToServer({ type: 'set-recording-settings', settings: readSystemSettings().recording });
     const updateFolder = readSystemSettings().updateFolder;
     if (updateFolder) {
       sendToServer({ type: 'set-update-dir', dir: updateFolder });
-      watchUpdateFolder(updateFolder);
+      watchUpdateFolder(null);
+      // 起動時に再スキャンして配布登録を実ファイルと同期する。
+      // 以前のバージョンで ._AppleDouble ファイル等が誤登録されたまま
+      // system-settings.json に残っていても、ここで正しい実体に上書きされる。
+      void applyUpdateScan(updateFolder, { announce: false })
+        .then(scan => watchFolderForFreshScan(scan, updateFolder, watchUpdateFolder))
+        .catch(err => {
+          safeSend('server-log', `WARN: 起動時のアップデートフォルダ同期に失敗: ${err.message}`);
+        });
     }
   }, 500);
 }
 
-ipcMain.on('start-server', (event, selectedPath) => {
+onTrusted('start-server', (_event, selectedPath) => {
   restartAttempts = 0;
   startServerProcess(selectedPath);
 });
 
-ipcMain.on('stop-server', () => {
+onTrusted('stop-server', () => {
   if (stoppingServer) return;
+  // 手動停止は明示の意思なので、次回GUI起動時の自動復帰も止める
+  writeGuiState({ serverRunning: false });
   stopServerProcess();
 });
 
 // Admin commands
-ipcMain.on('kick-client', (event, socketId) => {
+onTrusted('kick-client', (_event, socketId) => {
   sendToServer({ type: 'kick', socketId });
 });
 
-ipcMain.on('call-client', (_event, socketId) => {
+onTrusted('call-client', (_event, socketId) => {
   if (serverProcess) {
     safeSend('server-log', `[Admin] 呼び出しを送信: ${socketId}`);
     sendToServer({ type: 'call-client', socketId });
   }
 });
 
-ipcMain.on('restart-client', (_event, socketId) => {
+onTrusted('restart-client', (_event, socketId) => {
   if (serverProcess) {
     safeSend('server-log', `[Admin] クライアント個別再起動を送信: ${socketId}`);
     sendToServer({ type: 'restart-client', socketId });
   }
 });
 
-ipcMain.on('set-client-device', (_event, payload = {}) => {
+onTrusted('set-client-device', (_event, payload = {}) => {
   const { socketId, kind, deviceId } = payload;
   if (serverProcess) {
     safeSend('server-log', `[Admin] デバイス切替を送信: ${socketId} ${kind}`);
@@ -784,7 +1283,7 @@ ipcMain.on('set-client-device', (_event, payload = {}) => {
   }
 });
 
-ipcMain.on('set-client-media-state', (_event, payload = {}) => {
+onTrusted('set-client-media-state', (_event, payload = {}) => {
   const { socketId, kind, enabled } = payload;
   if (serverProcess) {
     const stateText = enabled ? 'ON' : 'OFF';
@@ -793,11 +1292,11 @@ ipcMain.on('set-client-media-state', (_event, payload = {}) => {
   }
 });
 
-ipcMain.on('refresh-client-devices', (_event, socketId) => {
+onTrusted('refresh-client-devices', (_event, socketId) => {
   sendToServer({ type: 'refresh-client-devices', socketId });
 });
 
-ipcMain.on('set-client-channel', (_event, payload = {}) => {
+onTrusted('set-client-channel', (_event, payload = {}) => {
   const { socketId, channelId } = payload;
   if (serverProcess) {
     safeSend('server-log', `[Admin] チャンネル変更を送信: ${socketId} -> ${channelId}`);
@@ -805,7 +1304,7 @@ ipcMain.on('set-client-channel', (_event, payload = {}) => {
   }
 });
 
-ipcMain.on('force-update', (_event, payload = {}) => {
+onTrusted('force-update', (_event, payload = {}) => {
   const appType = shortText(payload.appType || 'all', 24);
   if (serverProcess) {
     safeSend('server-log', `[Admin] 強制アップデート指示を送信: ${appType}`);
@@ -815,7 +1314,7 @@ ipcMain.on('force-update', (_event, payload = {}) => {
   }
 });
 
-ipcMain.on('restart-all', () => {
+onTrusted('restart-all', () => {
   if (serverProcess) {
     safeSend('server-log', '[Admin] 全クライアントへ再起動信号を送信しました');
     sendToServer({ type: 'restart-all' });

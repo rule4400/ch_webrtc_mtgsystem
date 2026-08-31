@@ -1,11 +1,13 @@
 {
   "name": "checkhouse-meeting-server",
-  "version": "1.1.0",
+  "version": "1.4.0",
   "description": "",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node scripts/smoke-signaling.cjs",
+    "test": "node scripts/test-recording-stability.cjs && node scripts/test-published-files.cjs && node scripts/smoke-signaling.cjs",
+    "test:recording": "node scripts/test-recording-stability.cjs",
+    "test:published": "node scripts/test-published-files.cjs",
     "smoke": "node scripts/smoke-signaling.cjs"
   },
   "keywords": [],
@@ -16,7 +18,12 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "mediasoup": "^3.20.0",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0",
+    "mediasoup": "^3.26.0",
     "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.3"
   }
 }

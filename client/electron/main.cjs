@@ -1,5 +1,6 @@
 const { app, BrowserWindow, desktopCapturer, ipcMain, session, systemPreferences, shell } = require('electron');
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const os = require('os');
@@ -13,12 +14,59 @@ let productionIndexUrl = null;
 let controlServer = null;
 let pendingRemoteConfig = null;
 
-const CONTROL_HOST = process.env.SFU_CLIENT_CONTROL_HOST || '0.0.0.0';
+// 二重起動防止: 同じ端末で2つ目のアプリが起動すると、同一 instanceId のセッションが
+// サーバー上で衝突し、その拠点が全拠点から「頻繁に再接続する不安定な拠点」に見える。
+// 2つ目の起動は既存ウィンドウを前面に出して即終了する。
+// ロック取得は whenReady 内（再起動ディレイ後）に行う: Windows の自己再起動は
+// 「新プロセスを spawn → 旧プロセスが exit」の順のため、起動直後に取得すると
+// 旧プロセスのロック解放とレースして正当な再起動まで拒否してしまう。
+app.on('second-instance', () => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+});
+
+const REQUESTED_CONTROL_HOST = String(process.env.SFU_CLIENT_CONTROL_HOST || '127.0.0.1').trim() || '127.0.0.1';
 const CONTROL_PORT = Number.parseInt(process.env.SFU_CLIENT_CONTROL_PORT || '39210', 10);
-const CONTROL_TOKEN = process.env.SFU_CLIENT_CONTROL_TOKEN || '';
+const CONTROL_TOKEN = String(process.env.SFU_CLIENT_CONTROL_TOKEN || '').trim();
+const CONTROL_ALLOW_REMOTE = process.env.SFU_CLIENT_CONTROL_ALLOW_REMOTE === '1';
+const CONTROL_REMOTE_REQUESTED = !isLoopbackHost(REQUESTED_CONTROL_HOST);
+const CONTROL_REMOTE_TOKEN_VALID = CONTROL_TOKEN.length >= 16;
+// 非loopbackの管理HTTP公開は「明示許可 + 認証token」が揃った場合だけ。
+// 旧設定が 0.0.0.0 のままでも、危険な状態で起動停止せずloopbackへ安全にフォールバックする。
+const CONTROL_REMOTE_ENABLED = CONTROL_REMOTE_REQUESTED && CONTROL_ALLOW_REMOTE && CONTROL_REMOTE_TOKEN_VALID;
+const CONTROL_HOST = CONTROL_REMOTE_REQUESTED && !CONTROL_REMOTE_ENABLED
+  ? '127.0.0.1'
+  : REQUESTED_CONTROL_HOST;
+
+// 常時接続アプリのため、ウィンドウが最小化・背面でもタイマーやレンダリングを
+// 間引かせない。間引かれるとテレメトリ(1秒周期)が数十秒〜1分間隔まで落ち、
+// サーバーが「応答なし」と誤検知して再起動指示を送る→復帰→また間引かれる、
+// という再接続ループの原因になる。
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isLoopbackHost(value) {
+  const host = String(value || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host);
+}
+
+function isLoopbackAddress(value) {
+  const address = String(value || '').trim().toLowerCase();
+  return address === '::1' || address.startsWith('::ffff:127.') || /^127(?:\.\d{1,3}){3}$/.test(address);
+}
+
+function safeTokenEqual(actual, expected) {
+  const actualDigest = crypto.createHash('sha256').update(String(actual || ''), 'utf8').digest();
+  const expectedDigest = crypto.createHash('sha256').update(String(expected || ''), 'utf8').digest();
+  return crypto.timingSafeEqual(actualDigest, expectedDigest);
 }
 
 function relaunchArgs() {
@@ -28,6 +76,17 @@ function relaunchArgs() {
 async function honorRestartDelay() {
   const delayMs = Number.parseInt(process.env.SFU_RESTART_DELAY_MS || '0', 10);
   if (Number.isFinite(delayMs) && delayMs > 0) await delay(Math.min(delayMs, 5000));
+}
+
+// relaunch直後は旧プロセスがロックを保持したまま終了処理中のことがあるため、
+// 一度の失敗で即終了せず短い間隔で再試行する（失敗即終了だと「再起動したはずの
+// アプリが起動していない」無人拠点の停止事故になる）。
+async function acquireSingleInstanceLock(retries = 5, intervalMs = 600) {
+  for (let attempt = 0; attempt < retries; attempt += 1) {
+    if (app.requestSingleInstanceLock()) return true;
+    await delay(intervalMs);
+  }
+  return false;
 }
 
 async function ensureMacMediaAccess() {
@@ -79,6 +138,51 @@ function restartApp() {
   app.exit(0);
 }
 
+/**
+ * メモリ肥大の自己回復。常時接続で数日稼働すると、GPUプロセスやレンダラーの
+ * ネイティブリソース肥大がスワップ→OSフリーズ（遠隔復旧不可）に到達しうる。
+ * レンダラーの reload では GPU プロセスは回収できないため、全プロセス合算と
+ * GPUプロセス単体をしきい値監視し、超過が2回連続したらアプリごと再起動する。
+ * 再起動は restartApp()（自動再接続あり・約10秒）で、OSフリーズより遥かに軽い。
+ *   SFU_CLIENT_MEM_RESTART_MB=3200 / SFU_CLIENT_GPU_MEM_RESTART_MB=1800 (0で無効)
+ */
+const MEM_RESTART_MB = Number(process.env.SFU_CLIENT_MEM_RESTART_MB ?? 3200);
+const GPU_MEM_RESTART_MB = Number(process.env.SFU_CLIENT_GPU_MEM_RESTART_MB ?? 1800);
+let memoryBreachCount = 0;
+
+function checkMemoryPressure() {
+  if (restartInProgress) return;
+  let totalMb = 0;
+  let gpuMb = 0;
+  try {
+    for (const metric of app.getAppMetrics()) {
+      const mb = (metric.memory?.workingSetSize || 0) / 1024; // workingSetSize はKB
+      totalMb += mb;
+      if (metric.type === 'GPU') gpuMb = Math.max(gpuMb, mb);
+    }
+  } catch {
+    return;
+  }
+
+  const overTotal = MEM_RESTART_MB > 0 && totalMb >= MEM_RESTART_MB;
+  const overGpu = GPU_MEM_RESTART_MB > 0 && gpuMb >= GPU_MEM_RESTART_MB;
+  if (!overTotal && !overGpu) {
+    memoryBreachCount = 0;
+    return;
+  }
+
+  memoryBreachCount += 1;
+  console.warn(`[Memory] pressure detected total=${Math.round(totalMb)}MB gpu=${Math.round(gpuMb)}MB strike=${memoryBreachCount}`);
+  // 一時的なスパイクでの誤再起動を避けるため、2回連続(約10分継続)で発動する
+  if (memoryBreachCount >= 2) {
+    console.error(`[Memory] restarting app to reclaim resources (total=${Math.round(totalMb)}MB, gpu=${Math.round(gpuMb)}MB)`);
+    restartApp();
+  }
+}
+
+const memoryWatchTimer = setInterval(checkMemoryPressure, 5 * 60 * 1000);
+memoryWatchTimer.unref?.();
+
 function requestQuickRestart(source = 'main') {
   if (!mainWindow || mainWindow.isDestroyed()) return false;
   console.log(`[QuickRestart] forwarding to renderer source=${source}`);
@@ -93,6 +197,63 @@ function loadProductionApp() {
   const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
   productionIndexUrl = pathToFileURL(indexPath).toString();
   return mainWindow.loadURL(productionIndexUrl);
+}
+
+function isTrustedRendererUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  if (!value) return false;
+  try {
+    const target = new URL(value);
+    if (process.env.NODE_ENV === 'development') {
+      return target.protocol === 'http:' &&
+        ['localhost', '127.0.0.1', '::1'].includes(target.hostname) &&
+        target.port === '5173';
+    }
+    if (!productionIndexUrl || target.protocol !== 'file:') return false;
+    const expected = new URL(productionIndexUrl);
+    return target.pathname === expected.pathname;
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedWebContents(webContents) {
+  return !!mainWindow &&
+    !mainWindow.isDestroyed() &&
+    webContents === mainWindow.webContents &&
+    isTrustedRendererUrl(webContents.getURL());
+}
+
+function isTrustedPermissionContext(webContents, requestingUrl) {
+  if (!isTrustedWebContents(webContents)) return false;
+  const candidate = String(requestingUrl || '').trim();
+  // file:// の securityOrigin はパスを含まないため、メインフレームURLで判定する。
+  if (!candidate || candidate === 'null' || candidate === 'file://') return true;
+  return isTrustedRendererUrl(candidate);
+}
+
+function requireTrustedIpcSender(event) {
+  const senderFrame = event.senderFrame;
+  const senderUrl = senderFrame?.url || '';
+  if (!isTrustedWebContents(event.sender) || !senderFrame ||
+      senderFrame !== mainWindow.webContents.mainFrame || !isTrustedRendererUrl(senderUrl)) {
+    throw new Error('untrusted IPC sender');
+  }
+}
+
+function parseExternalHttpUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  if (!value || value.length > 2048) throw new Error('invalid external url');
+  let target;
+  try {
+    target = new URL(value);
+  } catch {
+    throw new Error('invalid external url');
+  }
+  if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) {
+    throw new Error('invalid external url');
+  }
+  return target.toString();
 }
 
 function remoteConfigPath() {
@@ -208,10 +369,22 @@ function readJsonBody(req) {
 }
 
 function authorized(req) {
-  if (!CONTROL_TOKEN) return true;
-  const auth = req.headers.authorization || '';
-  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  return req.headers['x-sfu-token'] === CONTROL_TOKEN || bearer === CONTROL_TOKEN;
+  const auth = String(req.headers.authorization || '');
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const headerToken = Array.isArray(req.headers['x-sfu-token'])
+    ? req.headers['x-sfu-token'][0]
+    : req.headers['x-sfu-token'];
+
+  if (CONTROL_TOKEN) {
+    return safeTokenEqual(headerToken, CONTROL_TOKEN) || safeTokenEqual(bearer, CONTROL_TOKEN);
+  }
+
+  // token無しはloopback上のCLI/Server GUIとの後方互換用に限定。
+  // Origin/Sec-Fetch-Site付きのブラウザ越しリクエストを拒否し、
+  // 悪意あるWebページからlocalhostへPOSTするCSRFを防ぐ。
+  const origin = String(req.headers.origin || '').trim();
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
+  return isLoopbackAddress(req.socket.remoteAddress) && !origin && fetchSite !== 'cross-site';
 }
 
 function startControlServer() {
@@ -220,6 +393,14 @@ function startControlServer() {
     return;
   }
   if (controlServer) return;
+
+  if (CONTROL_REMOTE_REQUESTED && !CONTROL_REMOTE_ENABLED) {
+    const missing = [
+      !CONTROL_ALLOW_REMOTE ? 'SFU_CLIENT_CONTROL_ALLOW_REMOTE=1' : '',
+      !CONTROL_REMOTE_TOKEN_VALID ? 'SFU_CLIENT_CONTROL_TOKEN (at least 16 characters)' : '',
+    ].filter(Boolean).join(' and ');
+    console.warn(`[Control] unsafe remote bind ${REQUESTED_CONTROL_HOST} rejected; using 127.0.0.1 (required: ${missing})`);
+  }
 
   controlServer = http.createServer(async (req, res) => {
     try {
@@ -241,6 +422,10 @@ function startControlServer() {
       }
 
       if (req.method === 'POST' && url.pathname === '/configure') {
+        const contentType = String(req.headers['content-type'] || '').toLowerCase();
+        if (!contentType.startsWith('application/json')) {
+          return sendJson(res, 415, { ok: false, error: 'application/json required' });
+        }
         const body = await readJsonBody(req);
         const config = await applyClientConfig(body, { reload: body.reload === true });
         return sendJson(res, 200, { ok: true, config });
@@ -267,6 +452,11 @@ function startControlServer() {
   controlServer.on('error', err => {
     console.error(`[Control] server error: ${err.message}`);
   });
+  controlServer.requestTimeout = 10_000;
+  controlServer.headersTimeout = 8_000;
+  controlServer.keepAliveTimeout = 5_000;
+  controlServer.maxRequestsPerSocket = 100;
+  controlServer.maxConnections = 64;
   controlServer.listen(CONTROL_PORT, CONTROL_HOST, () => {
     console.log(`[Control] listening on ${CONTROL_HOST}:${CONTROL_PORT}${CONTROL_TOKEN ? ' token=required' : ' token=none'}`);
   });
@@ -293,10 +483,13 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      webSecurity: false,      // file:// からのローカルリソース読み込みを許可
+      sandbox: true,
+      webSecurity: true,
       // ユーザー操作なしでも <video>/<audio> の自動再生を許可（カメラ映像が
       // muted/autoplay ポリシーでブロックされて黒画面になるのを防ぐ）
       autoplayPolicy: 'no-user-gesture-required',
+      // 最小化・背面でも接続維持処理(テレメトリ/同期/復旧)を間引かせない
+      backgroundThrottling: false,
     },
   });
 
@@ -326,15 +519,17 @@ function createWindow() {
     }, 3000);
   });
 
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (isDev || !productionIndexUrl) return;
-    if (url === productionIndexUrl || url.startsWith(`${productionIndexUrl}#`)) return;
+  const guardNavigation = (event, url) => {
+    if (isTrustedRendererUrl(url)) return;
     event.preventDefault();
     console.warn(`[Navigation] blocked unexpected top-level navigation: ${url}`);
-    loadProductionApp();
-  });
+    if (!isDev) loadProductionApp();
+  };
+  mainWindow.webContents.on('will-navigate', guardNavigation);
+  mainWindow.webContents.on('will-redirect', guardNavigation);
 
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-attach-webview', event => event.preventDefault());
 
   mainWindow.webContents.on('render-process-gone', (_e, details) => {
     console.error(`[Renderer] gone: ${details.reason}`);
@@ -359,15 +554,25 @@ function createWindow() {
 
 app.whenReady().then(async () => {
   await honorRestartDelay();
+
+  if (!(await acquireSingleInstanceLock())) {
+    console.warn('[Startup] 既にこのアプリが起動しているため終了します（二重起動防止）');
+    app.exit(0);
+    return;
+  }
+
   await ensureMacMediaAccess();
 
-  // カメラ・マイク権限を許可
-  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    const allowed = ['media', 'mediaKeySystem', 'geolocation', 'notifications', 'fullscreen', 'display-capture'];
-    callback(allowed.includes(permission));
+  // 自アプリのメインフレームに対し、会議に必要な権限だけを許可する。
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const allowed = ['media', 'fullscreen', 'display-capture'];
+    callback(allowed.includes(permission) &&
+      isTrustedPermissionContext(webContents, details?.requestingUrl));
   });
-  session.defaultSession.setPermissionCheckHandler((_wc, permission) => {
-    return ['media', 'mediaKeySystem', 'fullscreen', 'display-capture'].includes(permission);
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
+    const allowed = ['media', 'fullscreen', 'display-capture'];
+    return allowed.includes(permission) &&
+      isTrustedPermissionContext(webContents, details?.requestingUrl || requestingOrigin);
   });
 
   createWindow();
@@ -389,18 +594,30 @@ app.on('before-quit', () => {
   stopControlServer();
 });
 
-ipcMain.on('restart-app', () => {
+ipcMain.on('restart-app', event => {
+  try {
+    requireTrustedIpcSender(event);
+  } catch (err) {
+    console.warn(`[IPC] restart-app rejected: ${err.message}`);
+    return;
+  }
   restartApp();
 });
 
-ipcMain.handle('open-external', async (_event, url) => {
-  const target = String(url || '').trim();
-  if (!/^https?:\/\//i.test(target)) throw new Error('invalid update url');
+ipcMain.handle('open-external', async (event, url) => {
+  requireTrustedIpcSender(event);
+  const target = parseExternalHttpUrl(url);
   await shell.openExternal(target);
   return true;
 });
 
-ipcMain.on('quick-restart-result', (_event, result) => {
+ipcMain.on('quick-restart-result', (event, result) => {
+  try {
+    requireTrustedIpcSender(event);
+  } catch (err) {
+    console.warn(`[IPC] quick-restart-result rejected: ${err.message}`);
+    return;
+  }
   console.log(`[QuickRestart] renderer result ${JSON.stringify(result || {})}`);
 });
 
@@ -428,12 +645,16 @@ function normalizeDesktopSource(source) {
   };
 }
 
-ipcMain.handle('get-screen-capture-status', async () => ({
-  platform: process.platform,
-  permissionStatus: getScreenCaptureStatus(),
-}));
+ipcMain.handle('get-screen-capture-status', async event => {
+  requireTrustedIpcSender(event);
+  return {
+    platform: process.platform,
+    permissionStatus: getScreenCaptureStatus(),
+  };
+});
 
-ipcMain.handle('list-desktop-sources', async (_event, options = {}) => {
+ipcMain.handle('list-desktop-sources', async (event, options = {}) => {
+  requireTrustedIpcSender(event);
   const mode = options.mode === 'window' ? 'window' : 'screen';
   try {
     const sources = await desktopCapturer.getSources({
@@ -460,7 +681,8 @@ ipcMain.handle('list-desktop-sources', async (_event, options = {}) => {
 });
 
 // macOSの画面収録権限: 繰り返しダイアログを出さず、設定画面への案内で対応する
-ipcMain.handle('open-screen-capture-settings', async () => {
+ipcMain.handle('open-screen-capture-settings', async event => {
+  requireTrustedIpcSender(event);
   if (process.platform === 'darwin') {
     await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
     return true;

@@ -1,4 +1,6 @@
-# WebRTC会議室システム：Windows対応・バグ修正版 利用ガイド
+# WebRTC会議室システム：旧利用ガイド（参考資料）
+
+> この文書は初期構築時点の記録で、version、成果物名、`ANNOUNCED_IP`の挙動、認証手順が現行実装と異なります。現行の導入・運用はリポジトリ直下の`README.md`、`server/.env.example`、`docs/recording.md`、`SECURITY.md`を参照してください。
 
 カメラのプレビューが映らない（権限がない）問題の修正と、システム全体のWindows対応（クロスプラットフォーム化）が完了しました。
 

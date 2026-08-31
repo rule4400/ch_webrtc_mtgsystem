@@ -1,11 +1,13 @@
 {
   "name": "checkhouse-meeting-server-gui",
-  "version": "1.0.0",
+  "version": "1.4.0",
   "description": "CHECKHOUSE Meeting System server controller",
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
-    "prepare:resources": "node scripts/prepare-bundled-server.cjs",
+    "test": "node scripts/test-private-file.cjs && node scripts/test-update-scan.cjs",
+    "verify:binary-manifest": "node scripts/verify-binary-manifest.cjs",
+    "prepare:resources": "node scripts/prepare-bundled-server.cjs && node scripts/prepare-ffmpeg.cjs",
     "package": "npm run prepare:resources && electron-builder build --mac --arm64 && electron-builder build --win --x64",
     "package:mac": "npm run prepare:resources && electron-builder build --mac --arm64",
     "package:win": "npm run prepare:resources && electron-builder build --win --x64",
@@ -34,13 +36,20 @@
         "filter": [
           "index.js",
           "config.js",
+          "recording.js",
+          "published-files.js",
           "package.json",
-          ".env.example"
+          ".env.example",
+          "public/**"
         ]
       },
       {
         "from": "resources/mediasoup-workers",
         "to": "mediasoup-workers"
+      },
+      {
+        "from": "resources/ffmpeg",
+        "to": "ffmpeg"
       }
     ]
   },
@@ -48,11 +57,11 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "mediasoup": "^3.20.0",
+    "mediasoup": "^3.26.0",
     "socket.io": "^4.8.3"
   },
   "devDependencies": {
-    "electron": "^42.3.0",
-    "electron-builder": "^26.8.1"
+    "electron": "^42.10.1",
+    "electron-builder": "^26.15.3"
   }
 }

@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import packageInfo from '../../package.json';
 import { Download, Hash, MicOff, MonitorPlay, Settings, Volume2, VolumeX, VideoOff } from 'lucide-react';
 import { ViewerWebRTCManager } from '../services/viewer-webrtc';
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = packageInfo.version;
 const APP_TYPE = 'viewer';
 const DEFAULT_SYSTEM_STATE = {
   brand: 'CHECKHOUSE Meeting System',
@@ -10,6 +11,20 @@ const DEFAULT_SYSTEM_STATE = {
   latestVersions: { [APP_TYPE]: APP_VERSION },
   updatePackages: {},
 };
+
+function isNewerVersion(latest, current) {
+  if (!latest || latest === current) return false;
+  const parse = value => String(value).trim().replace(/^v/i, '').split('.').map(part => parseInt(part, 10));
+  const a = parse(latest);
+  const b = parse(current);
+  if (a.some(Number.isNaN) || b.some(Number.isNaN)) return latest !== current;
+  const length = Math.max(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = (a[index] || 0) - (b[index] || 0);
+    if (difference !== 0) return difference > 0;
+  }
+  return false;
+}
 
 function getGridCols(n) {
   if (n <= 1) return 1;
@@ -41,12 +56,14 @@ function trackReport(track) {
 const defaultViewerConfig = {
   serverIp: '127.0.0.1',
   serverPort: '3000',
+  authToken: '',
   viewerName: '閲覧端末',
 };
 const QUICK_RESTART_CONNECT_WINDOW_MS = 5000;
 
 async function connectWithinStartupWindow(manager, serverUrl, viewerName, options = {}) {
   let timedOut = false;
+  let timeoutId = null;
   const connectPromise = manager.connect(serverUrl, viewerName, options)
     .then(() => 'connected')
     .catch((err) => {
@@ -57,12 +74,16 @@ async function connectWithinStartupWindow(manager, serverUrl, viewerName, option
       throw err;
     });
   const timeoutPromise = new Promise(resolve => {
-    setTimeout(() => {
+    timeoutId = setTimeout(() => {
       timedOut = true;
       resolve('pending');
     }, QUICK_RESTART_CONNECT_WINDOW_MS);
   });
-  return Promise.race([connectPromise, timeoutPromise]);
+  try {
+    return await Promise.race([connectPromise, timeoutPromise]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
 function sanitizeViewerConfig(config) {
@@ -73,11 +94,13 @@ function sanitizeViewerConfig(config) {
     ? rawPort
     : defaultViewerConfig.serverPort;
   const viewerName = String(raw.viewerName || defaultViewerConfig.viewerName).trim() || defaultViewerConfig.viewerName;
+  const authToken = typeof raw.authToken === 'string' ? raw.authToken.trim().slice(0, 2048) : '';
 
   return {
     ...raw,
     serverIp,
     serverPort,
+    authToken,
     viewerName,
   };
 }
@@ -125,14 +148,339 @@ async function probeServerReady(config, timeoutMs = 800) {
   }
 }
 
+const LAST_FRAME_HOLD_MS = 20 * 1000;
+const LAST_FRAME_SAMPLE_MS = 2000;
+const LAST_FRAME_STALL_GRACE_MS = 3000;
+const LAST_FRAME_MAX_WIDTH = 640;
+const LAST_FRAME_MAX_HEIGHT = 360;
+
+// 瞬断時の最終フレームは URL 化せず canvas に保持し、20秒で必ず解除する。
+function useLastFrameHold({ videoRef, stream, enabled, outageHint = false }) {
+  const canvasRef = useRef(null);
+  const enabledRef = useRef(enabled);
+  const outageHintRef = useRef(outageHint);
+  const streamRef = useRef(stream);
+  const previousStreamRef = useRef(stream);
+  const hasSnapshotRef = useRef(false);
+  const snapshotCapturedAtRef = useRef(0);
+  const lastProgressAtRef = useRef(0);
+  const progressStreamRef = useRef(stream);
+  const progressMediaTimeRef = useRef(Number.NaN);
+  const progressDecodedFramesRef = useRef(Number.NaN);
+  const outageStartedAtRef = useRef(0);
+  const outageExpiredRef = useRef(false);
+  const holdTimerRef = useRef(null);
+  const statusRef = useRef('healthy');
+  const [holdStatus, setHoldStatus] = useState('healthy');
+
+  useEffect(() => {
+    enabledRef.current = enabled;
+    outageHintRef.current = outageHint;
+    streamRef.current = stream;
+    if (progressStreamRef.current !== stream) {
+      progressStreamRef.current = stream;
+      progressMediaTimeRef.current = Number.NaN;
+      progressDecodedFramesRef.current = Number.NaN;
+    }
+  }, [enabled, outageHint, stream]);
+
+  const updateStatus = useCallback((next) => {
+    if (statusRef.current === next) return;
+    statusRef.current = next;
+    setHoldStatus(next);
+  }, []);
+  const clearHoldTimer = useCallback(() => {
+    if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
+    holdTimerRef.current = null;
+  }, []);
+  const clearSnapshot = useCallback(() => {
+    hasSnapshotRef.current = false;
+    snapshotCapturedAtRef.current = 0;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+    canvas.width = 1;
+    canvas.height = 1;
+  }, []);
+  const resetOutage = useCallback((discardSnapshot = false) => {
+    clearHoldTimer();
+    outageStartedAtRef.current = 0;
+    outageExpiredRef.current = false;
+    updateStatus('healthy');
+    if (discardSnapshot) {
+      lastProgressAtRef.current = 0;
+      clearSnapshot();
+    }
+  }, [clearHoldTimer, clearSnapshot, updateStatus]);
+  const beginOutage = useCallback((observedAt = Date.now()) => {
+    if (!enabledRef.current) return;
+    const now = Date.now();
+    const capturedAt = snapshotCapturedAtRef.current;
+    const observedCandidate = Number.isFinite(observedAt)
+      ? Math.min(now, Math.max(0, observedAt))
+      : now;
+    const candidate = capturedAt > 0
+      ? Math.min(observedCandidate, capturedAt)
+      : observedCandidate;
+    if (!outageStartedAtRef.current) {
+      outageStartedAtRef.current = candidate;
+    }
+    if (outageExpiredRef.current || !hasSnapshotRef.current || capturedAt <= 0) {
+      updateStatus('fallback');
+      return;
+    }
+    updateStatus('holding');
+    clearHoldTimer();
+    const remaining = Math.max(0, LAST_FRAME_HOLD_MS - (now - outageStartedAtRef.current));
+    if (remaining === 0) {
+      outageExpiredRef.current = true;
+      updateStatus('fallback');
+      return;
+    }
+    holdTimerRef.current = setTimeout(() => {
+      holdTimerRef.current = null;
+      outageExpiredRef.current = true;
+      updateStatus('fallback');
+    }, remaining);
+  }, [clearHoldTimer, updateStatus]);
+  const captureSnapshot = useCallback(({
+    expectedStream = streamRef.current,
+    allowInactiveTrack = false,
+    capturedAt = Date.now(),
+  } = {}) => {
+    if (!enabledRef.current || (!allowInactiveTrack && outageHintRef.current) || document.hidden) return false;
+    const video = videoRef.current;
+    const track = expectedStream?.getVideoTracks?.()[0] || null;
+    if (!video || !expectedStream || video.srcObject !== expectedStream ||
+        (!allowInactiveTrack &&
+          (!track || track.readyState !== 'live' || track.muted || !track.enabled || video.ended)) ||
+        video.readyState < 2 || !video.videoWidth || !video.videoHeight) return false;
+    const scale = Math.min(
+      1,
+      LAST_FRAME_MAX_WIDTH / video.videoWidth,
+      LAST_FRAME_MAX_HEIGHT / video.videoHeight,
+    );
+    const width = Math.max(1, Math.round(video.videoWidth * scale));
+    const height = Math.max(1, Math.round(video.videoHeight * scale));
+    const canvas = canvasRef.current;
+    if (!canvas) return false;
+    try {
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const context = canvas.getContext('2d', { alpha: false });
+      if (!context) return false;
+      context.drawImage(video, 0, 0, width, height);
+      hasSnapshotRef.current = true;
+      const now = Date.now();
+      snapshotCapturedAtRef.current = Number.isFinite(capturedAt)
+        ? Math.min(now, Math.max(0, capturedAt))
+        : now;
+      return true;
+    } catch {
+      return false;
+    }
+  }, [videoRef]);
+  const captureBeforeOutage = useCallback((expectedStream, capturedAt = Date.now()) => {
+    if (outageExpiredRef.current || statusRef.current === 'fallback') return false;
+    return captureSnapshot({ expectedStream, allowInactiveTrack: true, capturedAt });
+  }, [captureSnapshot]);
+  const captureAndRecover = useCallback((capturedAt = Date.now()) => {
+    if (!captureSnapshot({ capturedAt })) return false;
+    lastProgressAtRef.current = capturedAt;
+    if (outageStartedAtRef.current || statusRef.current !== 'healthy') resetOutage(false);
+    return true;
+  }, [captureSnapshot, resetOutage]);
+
+  useEffect(() => () => {
+    clearHoldTimer();
+    clearSnapshot();
+  }, [clearHoldTimer, clearSnapshot]);
+  useEffect(() => {
+    if (holdStatus === 'fallback') clearSnapshot();
+  }, [clearSnapshot, holdStatus]);
+  useEffect(() => {
+    const previous = previousStreamRef.current;
+    previousStreamRef.current = stream;
+    if (enabled && (!stream || (previous && previous !== stream))) {
+      const observedAt = Date.now();
+      const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || observedAt;
+      if (previous) captureBeforeOutage(previous, lastFrameAt);
+      beginOutage(lastFrameAt);
+    }
+  }, [beginOutage, captureBeforeOutage, enabled, stream]);
+  useEffect(() => {
+    if (!enabled) {
+      resetOutage(true);
+      return;
+    }
+    if (outageHint) {
+      const observedAt = Date.now();
+      const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || observedAt;
+      captureBeforeOutage(stream, lastFrameAt);
+      beginOutage(lastFrameAt);
+    }
+  }, [beginOutage, captureBeforeOutage, enabled, outageHint, resetOutage, stream]);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const video = videoRef.current;
+    if (!video) return undefined;
+    let lastProgressCheckAt = 0;
+    const fail = () => {
+      const observedAt = Date.now();
+      const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || observedAt;
+      captureBeforeOutage(stream, lastFrameAt);
+      beginOutage(lastFrameAt);
+    };
+    const recover = () => captureAndRecover(Date.now());
+    const noteProgress = () => {
+      const now = Date.now();
+      if (now - lastProgressCheckAt < 200) return;
+      lastProgressCheckAt = now;
+      const currentStream = streamRef.current;
+      const currentTrack = currentStream?.getVideoTracks?.()[0] || null;
+      if (video.srcObject === currentStream && currentTrack?.readyState === 'live' &&
+          !currentTrack.muted && currentTrack.enabled && video.readyState >= 2 &&
+          !video.paused && !video.ended) {
+        const mediaTime = Number(video.currentTime);
+        let decodedFrames = Number.NaN;
+        try {
+          decodedFrames = Number(video.getVideoPlaybackQuality?.().totalVideoFrames);
+        } catch { /* currentTime fallback below */ }
+        if (!Number.isFinite(decodedFrames)) decodedFrames = Number(video.webkitDecodedFrameCount);
+        if (progressStreamRef.current !== currentStream) {
+          progressStreamRef.current = currentStream;
+          progressMediaTimeRef.current = Number.NaN;
+          progressDecodedFramesRef.current = Number.NaN;
+        }
+        const hasFrameCounter = Number.isFinite(decodedFrames);
+        const progressed = hasFrameCounter
+          ? (Number.isFinite(progressDecodedFramesRef.current) &&
+            decodedFrames > progressDecodedFramesRef.current)
+          : (Number.isFinite(progressMediaTimeRef.current) && Number.isFinite(mediaTime) &&
+            mediaTime > progressMediaTimeRef.current + 0.01);
+        progressMediaTimeRef.current = mediaTime;
+        progressDecodedFramesRef.current = decodedFrames;
+        if (progressed) lastProgressAtRef.current = now;
+      }
+    };
+    const failureEvents = ['waiting', 'stalled', 'emptied', 'abort', 'error', 'ended', 'pause'];
+    const recoveryEvents = ['loadeddata'];
+    failureEvents.forEach(name => video.addEventListener(name, fail));
+    recoveryEvents.forEach(name => video.addEventListener(name, recover));
+    video.addEventListener('timeupdate', noteProgress);
+
+    const track = stream?.getVideoTracks?.()[0] || null;
+    const unmute = () => { video.play().catch(() => {}); };
+    track?.addEventListener('mute', fail);
+    track?.addEventListener('ended', fail);
+    track?.addEventListener('unmute', unmute);
+    stream?.addEventListener?.('addtrack', fail);
+    stream?.addEventListener?.('removetrack', fail);
+    return () => {
+      failureEvents.forEach(name => video.removeEventListener(name, fail));
+      recoveryEvents.forEach(name => video.removeEventListener(name, recover));
+      video.removeEventListener('timeupdate', noteProgress);
+      track?.removeEventListener('mute', fail);
+      track?.removeEventListener('ended', fail);
+      track?.removeEventListener('unmute', unmute);
+      stream?.removeEventListener?.('addtrack', fail);
+      stream?.removeEventListener?.('removetrack', fail);
+    };
+  }, [beginOutage, captureAndRecover, captureBeforeOutage, enabled, stream, videoRef]);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let lastMediaTime = Number.NaN;
+    let lastDecodedFrames = Number.NaN;
+    if (!lastProgressAtRef.current) lastProgressAtRef.current = Date.now();
+    const inspect = () => {
+      if (!enabledRef.current || document.hidden) return;
+      if (outageHintRef.current) {
+        beginOutage(outageStartedAtRef.current || lastProgressAtRef.current);
+        return;
+      }
+      const now = Date.now();
+      const video = videoRef.current;
+      const currentStream = streamRef.current;
+      const track = currentStream?.getVideoTracks?.()[0] || null;
+      if (!video || !currentStream || video.srcObject !== currentStream ||
+          !track || track.readyState !== 'live' || track.muted || !track.enabled ||
+          video.readyState < 2 || video.ended) {
+        const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || now;
+        captureBeforeOutage(currentStream, lastFrameAt);
+        beginOutage(lastFrameAt);
+        return;
+      }
+      const mediaTime = Number(video.currentTime);
+      let decodedFrames = Number.NaN;
+      try {
+        decodedFrames = Number(video.getVideoPlaybackQuality?.().totalVideoFrames);
+      } catch { /* currentTime fallback below */ }
+      if (!Number.isFinite(decodedFrames)) decodedFrames = Number(video.webkitDecodedFrameCount);
+      const hasFrameCounter = Number.isFinite(decodedFrames);
+      const hasBaseline = hasFrameCounter
+        ? Number.isFinite(lastDecodedFrames)
+        : Number.isFinite(lastMediaTime);
+      const progressed = hasFrameCounter
+        ? (hasBaseline && decodedFrames > lastDecodedFrames)
+        : (hasBaseline && Number.isFinite(mediaTime) && mediaTime > lastMediaTime + 0.01);
+      lastMediaTime = mediaTime;
+      lastDecodedFrames = decodedFrames;
+      if (!hasBaseline) {
+        lastProgressAtRef.current = now;
+        return;
+      }
+      if (progressed) {
+        captureAndRecover(now);
+      } else if (video.paused || now - lastProgressAtRef.current >= LAST_FRAME_STALL_GRACE_MS) {
+        const lastFrameAt = lastProgressAtRef.current || snapshotCapturedAtRef.current || now;
+        captureBeforeOutage(currentStream, lastFrameAt);
+        beginOutage(lastFrameAt);
+      }
+    };
+    inspect();
+    const id = setInterval(inspect, LAST_FRAME_SAMPLE_MS);
+    return () => clearInterval(id);
+  }, [beginOutage, captureAndRecover, captureBeforeOutage, enabled, stream, videoRef]);
+
+  useEffect(() => {
+    const checkDeadline = () => {
+      if (!document.hidden && statusRef.current === 'holding') {
+        beginOutage(outageStartedAtRef.current || Date.now());
+      }
+    };
+    document.addEventListener('visibilitychange', checkDeadline);
+    return () => document.removeEventListener('visibilitychange', checkDeadline);
+  }, [beginOutage]);
+
+  return {
+    canvasRef,
+    holdingLastFrame: holdStatus === 'holding',
+    lastFrameFallback: holdStatus === 'fallback',
+  };
+}
+
 const VideoCell = React.memo(function VideoCell({
-  label, stream, videoPaused, audioPaused, speakerDeviceId, speakerMuted,
+  label, stream, videoPaused, audioPaused, speakerDeviceId, speakerMuted, reconnecting = false,
 }) {
   const videoRef = useRef(null);
+  const {
+    canvasRef: lastFrameCanvasRef,
+    holdingLastFrame,
+    lastFrameFallback,
+  } = useLastFrameHold({
+    videoRef,
+    stream,
+    enabled: !videoPaused,
+    outageHint: reconnecting,
+  });
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    let disposed = false;
+    let removeRetryListeners = () => {};
 
     video.muted = !!(speakerMuted || audioPaused);
     if (video.srcObject !== stream) video.srcObject = stream || null;
@@ -142,11 +490,12 @@ const VideoCell = React.memo(function VideoCell({
       const promise = video.play();
       if (promise?.catch) {
         promise.catch(() => {
+          if (disposed) return;
           const retry = () => {
             video.play().catch(() => {});
-            cleanup();
+            removeRetryListeners();
           };
-          const cleanup = () => {
+          removeRetryListeners = () => {
             document.removeEventListener('click', retry);
             document.removeEventListener('keydown', retry);
           };
@@ -157,6 +506,10 @@ const VideoCell = React.memo(function VideoCell({
     };
 
     play();
+    return () => {
+      disposed = true;
+      removeRetryListeners();
+    };
   }, [stream, speakerMuted, audioPaused]);
 
   useEffect(() => {
@@ -167,7 +520,7 @@ const VideoCell = React.memo(function VideoCell({
     }
   }, [speakerDeviceId]);
 
-  const cameraOff = !!videoPaused || !stream?.getVideoTracks().length;
+  const cameraOff = !!videoPaused || !stream?.getVideoTracks().length || lastFrameFallback;
 
   return (
     <div className="video-cell">
@@ -184,7 +537,28 @@ const VideoCell = React.memo(function VideoCell({
         }}
       />
 
-      {cameraOff && (
+      <canvas
+        ref={lastFrameCanvasRef}
+        aria-hidden="true"
+        style={{
+          position: 'absolute', inset: 0, zIndex: 5,
+          width: '100%', height: '100%', objectFit: 'contain',
+          background: '#000', display: holdingLastFrame ? 'block' : 'none',
+          pointerEvents: 'none',
+        }}
+      />
+      {holdingLastFrame && (
+        <div style={{
+          position: 'absolute', top: 8, right: 8, zIndex: 6,
+          padding: '3px 7px', borderRadius: 4,
+          color: 'rgba(255,255,255,0.78)', background: 'rgba(0,0,0,0.55)',
+          fontSize: '0.65rem', pointerEvents: 'none',
+        }}>
+          映像復旧待機中（最終映像）
+        </div>
+      )}
+
+      {cameraOff && !holdingLastFrame && (
         <div className="cam-off-overlay">
           <VideoOff size={30} color="rgba(255,255,255,0.3)" />
           <span style={{ color: 'rgba(255,255,255,0.35)', fontSize: '0.75rem', marginTop: 8 }}>
@@ -228,19 +602,23 @@ export default function ViewerView() {
   const quickRestartInFlightRef = useRef(false);
   const quickRestartHandlerRef = useRef(null);
   const serverProbeInFlightRef = useRef(false);
+  const sessionGenerationRef = useRef(0);
+  const sessionStartInFlightRef = useRef(null);
+  const disposedRef = useRef(false);
 
   const channels = Array.isArray(systemState.channels) && systemState.channels.length
     ? systemState.channels
     : DEFAULT_SYSTEM_STATE.channels;
   const updatePackage = systemState.updatePackages?.[APP_TYPE] || null;
   const latestVersion = systemState.latestVersions?.[APP_TYPE] || APP_VERSION;
-  const updateAvailable = latestVersion && latestVersion !== APP_VERSION;
+  const updateAvailable = isNewerVersion(latestVersion, APP_VERSION);
 
-  const refreshAudioOutputs = useCallback(async (preferredId = null) => {
+  const refreshAudioOutputs = useCallback(async (preferredId = null, options = {}) => {
     try {
       if (!navigator.mediaDevices?.enumerateDevices) return [];
       const devices = await navigator.mediaDevices.enumerateDevices();
       const outputs = devices.filter(device => device.kind === 'audiooutput');
+      if (options.isCurrent && !options.isCurrent()) return outputs;
       setAudioOutDevices(outputs);
       const currentId = preferredId ?? selectedAudioOutIdRef.current;
       if (!currentId && outputs[0]?.deviceId) {
@@ -269,6 +647,10 @@ export default function ViewerView() {
   }, [peers, status, error, speakerMuted, audioOutDevices, selectedAudioOutId, systemState, updateNotice]);
 
   const releaseViewerRuntime = useCallback(({ status: nextStatus = 'connecting', updateState = true } = {}) => {
+    // 進行中の初期化も無効化し、後から完了した古い接続が
+    // managerRef や React state を上書きしないようにする。
+    sessionGenerationRef.current += 1;
+    sessionStartInFlightRef.current = null;
     const manager = managerRef.current;
     managerRef.current = null;
     if (manager) {
@@ -290,64 +672,107 @@ export default function ViewerView() {
     }
   }, []);
 
-  const startViewerSession = useCallback(async () => {
-    const config = loadViewerConfig();
-    configRef.current = config;
-    selectedAudioOutIdRef.current = config.selectedAudioOutId || '';
-    setSelectedAudioOutId(config.selectedAudioOutId || '');
+  const startViewerSession = useCallback(() => {
+    if (disposedRef.current) {
+      return Promise.resolve({ manager: null, connectionState: 'disposed' });
+    }
+    if (sessionStartInFlightRef.current) return sessionStartInFlightRef.current.promise;
 
-    await refreshAudioOutputs(config.selectedAudioOutId || '');
+    // この関数が直接再実行された場合も、1端末1socketを保つ。
+    if (managerRef.current) releaseViewerRuntime({ updateState: false });
+    const generation = sessionGenerationRef.current + 1;
+    sessionGenerationRef.current = generation;
+    const isCurrent = () => !disposedRef.current && sessionGenerationRef.current === generation;
+    const startEntry = { generation, promise: null };
 
-    const manager = new ViewerWebRTCManager();
-    managerRef.current = manager;
+    const startPromise = (async () => {
+      const config = loadViewerConfig();
+      configRef.current = config;
+      selectedAudioOutIdRef.current = config.selectedAudioOutId || '';
+      if (isCurrent()) setSelectedAudioOutId(config.selectedAudioOutId || '');
 
-    manager.onPeerUpdated = (socketId, peer) => {
-      setPeers(prev => {
-        const next = new Map(prev);
-        next.set(socketId, peer);
-        return next;
-      });
-    };
-    manager.onPeerRemoved = (socketId) => {
-      setPeers(prev => {
-        const next = new Map(prev);
-        next.delete(socketId);
-        return next;
-      });
-    };
-    manager.onConnectionChange = (ok) => setStatus(ok ? 'connected' : 'error');
-    manager.onSystemStateUpdated = (state = {}) => {
-      setSystemState({ ...DEFAULT_SYSTEM_STATE, ...state });
-    };
-    manager.onUpdateCommand = (payload) => {
-      if (payload?.appType && payload.appType !== APP_TYPE && payload.appType !== 'all') return;
-      setUpdateNotice(payload);
-    };
-    manager.onRestartCommand = (payload) => quickRestartHandlerRef.current?.(payload);
-    manager.onAdminSetDevice = (payload) => {
-      if (!adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
-      return adminHandlersRef.current.setDevice(payload);
-    };
-    manager.onAdminSetMediaState = (payload) => {
-      if (!adminHandlersRef.current.setMediaState) throw new Error('media state control is not ready');
-      return adminHandlersRef.current.setMediaState(payload);
-    };
-    manager.onAdminRefreshDevices = () => {
-      if (!adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
-      return adminHandlersRef.current.refreshDevices();
-    };
+      await refreshAudioOutputs(config.selectedAudioOutId || '', { isCurrent });
+      if (!isCurrent()) return { manager: null, connectionState: 'superseded' };
 
-    const serverUrl = serverUrlFromViewerConfig(config);
-    const connectionState = await connectWithinStartupWindow(manager, serverUrl, config.viewerName, {
-      appVersion: APP_VERSION,
+      const manager = new ViewerWebRTCManager();
+      managerRef.current = manager;
+      const isManagerCurrent = () => isCurrent() && managerRef.current === manager;
+
+      manager.onPeerUpdated = (socketId, peer) => {
+        if (!isManagerCurrent()) return;
+        setPeers(prev => {
+          const next = new Map(prev);
+          next.set(socketId, peer);
+          return next;
+        });
+      };
+      manager.onPeerRemoved = (socketId) => {
+        if (!isManagerCurrent()) return;
+        setPeers(prev => {
+          const next = new Map(prev);
+          next.delete(socketId);
+          return next;
+        });
+      };
+      manager.onConnectionChange = (ok) => {
+        if (isManagerCurrent()) setStatus(ok ? 'connected' : 'error');
+      };
+      manager.onSystemStateUpdated = (state = {}) => {
+        if (isManagerCurrent()) setSystemState({ ...DEFAULT_SYSTEM_STATE, ...state });
+      };
+      manager.onUpdateCommand = (payload) => {
+        if (!isManagerCurrent()) return;
+        if (payload?.appType && payload.appType !== APP_TYPE && payload.appType !== 'all') return;
+        setUpdateNotice(payload);
+      };
+      manager.onRestartCommand = (payload) => {
+        if (isManagerCurrent()) quickRestartHandlerRef.current?.(payload);
+      };
+      manager.onAdminSetDevice = (payload) => {
+        if (!isManagerCurrent() || !adminHandlersRef.current.setDevice) throw new Error('device control is not ready');
+        return adminHandlersRef.current.setDevice(payload);
+      };
+      manager.onAdminSetMediaState = (payload) => {
+        if (!isManagerCurrent() || !adminHandlersRef.current.setMediaState) throw new Error('media state control is not ready');
+        return adminHandlersRef.current.setMediaState(payload);
+      };
+      manager.onAdminRefreshDevices = () => {
+        if (!isManagerCurrent() || !adminHandlersRef.current.refreshDevices) throw new Error('device refresh is not ready');
+        return adminHandlersRef.current.refreshDevices();
+      };
+
+      const serverUrl = serverUrlFromViewerConfig(config);
+      let connectionState;
+      try {
+        connectionState = await connectWithinStartupWindow(manager, serverUrl, config.viewerName, {
+          appVersion: APP_VERSION,
+          authToken: config.authToken,
+        });
+      } catch (err) {
+        if (!isManagerCurrent()) {
+          manager.disconnect();
+          return { manager: null, connectionState: 'superseded' };
+        }
+        throw err;
+      }
+      if (!isManagerCurrent()) {
+        manager.disconnect();
+        return { manager: null, connectionState: 'superseded' };
+      }
+      setStatus(connectionState === 'connected' ? 'connected' : 'connecting');
+      setError(null);
+      return { manager, connectionState };
+    })();
+
+    startEntry.promise = startPromise;
+    sessionStartInFlightRef.current = startEntry;
+    return startPromise.finally(() => {
+      if (sessionStartInFlightRef.current === startEntry) sessionStartInFlightRef.current = null;
     });
-    setStatus(connectionState === 'connected' ? 'connected' : 'connecting');
-    setError(null);
-    return { manager, connectionState };
-  }, [refreshAudioOutputs]);
+  }, [refreshAudioOutputs, releaseViewerRuntime]);
 
   const performQuickRestart = useCallback(async (payload = {}) => {
-    if (quickRestartInFlightRef.current) return;
+    if (disposedRef.current || quickRestartInFlightRef.current) return;
     quickRestartInFlightRef.current = true;
     const startedAt = Date.now();
     const reason = payload?.reason || payload?.source || 'server-command';
@@ -356,8 +781,12 @@ export default function ViewerView() {
       releaseViewerRuntime({ status: 'restarting' });
       setError(null);
       setUiResetToken(token => token + 1);
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      // requestAnimationFrame は最小化・遮蔽中に停止するため、必ず進む
+      // タイマーで描画機会を一度譲ってから再構築する。
+      await new Promise(resolve => setTimeout(resolve, 50));
+      if (disposedRef.current) return;
       const { connectionState } = await startViewerSession();
+      if (disposedRef.current || connectionState === 'superseded' || connectionState === 'disposed') return;
       window.electronAPI?.quickRestartResult?.({
         ok: true,
         reason,
@@ -365,6 +794,7 @@ export default function ViewerView() {
         elapsedMs: Date.now() - startedAt,
       });
     } catch (err) {
+      if (disposedRef.current) return;
       console.error('[ViewerQuickRestart] failed:', err);
       setStatus('error');
       setError(err.message);
@@ -391,12 +821,13 @@ export default function ViewerView() {
   }, []);
 
   useEffect(() => {
-    let disposed = false;
+    disposedRef.current = false;
+    const handleDeviceChange = () => refreshAudioOutputs();
     const init = async () => {
       try {
         await startViewerSession();
       } catch (err) {
-        if (disposed) return;
+        if (disposedRef.current) return;
         console.error('[Viewer]', err);
         setStatus('error');
         setError(err.message);
@@ -404,11 +835,11 @@ export default function ViewerView() {
     };
 
     init();
-    navigator.mediaDevices?.addEventListener?.('devicechange', refreshAudioOutputs);
+    navigator.mediaDevices?.addEventListener?.('devicechange', handleDeviceChange);
 
     return () => {
-      disposed = true;
-      navigator.mediaDevices?.removeEventListener?.('devicechange', refreshAudioOutputs);
+      disposedRef.current = true;
+      navigator.mediaDevices?.removeEventListener?.('devicechange', handleDeviceChange);
       releaseViewerRuntime({ updateState: false });
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -428,6 +859,7 @@ export default function ViewerView() {
       try {
         const config = sanitizeViewerConfig(configRef.current.serverIp ? configRef.current : loadViewerConfig());
         const reachable = await probeServerReady(config);
+        if (disposedRef.current) return;
         if (!reachable) {
           setStatus(prev => (prev === 'restarting' ? prev : 'error'));
           return;
@@ -440,7 +872,7 @@ export default function ViewerView() {
           await startViewerSession();
         }
       } catch (err) {
-        console.warn('[ViewerServerProbe]', err.message);
+        if (!disposedRef.current) console.warn('[ViewerServerProbe]', err.message);
       } finally {
         serverProbeInFlightRef.current = false;
       }
@@ -478,6 +910,7 @@ export default function ViewerView() {
     const requiresReconnect =
       previous.serverIp !== merged.serverIp ||
       previous.serverPort !== merged.serverPort ||
+      previous.authToken !== merged.authToken ||
       previous.viewerName !== merged.viewerName;
 
     configRef.current = merged;
@@ -736,6 +1169,16 @@ export default function ViewerView() {
                   />
                 </div>
               </div>
+              <div className="field">
+                <label>接続トークン</label>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={settingsDraft.authToken || ''}
+                  onChange={event => updateSettingsDraft('authToken', event.target.value)}
+                  placeholder="サーバーの SFU_AUTH_TOKEN"
+                />
+              </div>
             </div>
 
             <button className="btn-join" onClick={saveViewerSettings}>
@@ -756,15 +1199,16 @@ export default function ViewerView() {
           </div>
         ) : (
           <>
-	          {peerList.map(([socketId, peer]) => (
-	            <VideoCell
-	              key={`${uiResetToken}-${socketId}`}
-	              label={peer.locationName}
+          {peerList.map(([socketId, peer]) => (
+            <VideoCell
+              key={`${uiResetToken}-${socketId}`}
+              label={peer.locationName}
               stream={peer.stream}
               videoPaused={peer.videoPaused}
               audioPaused={peer.audioPaused}
               speakerDeviceId={selectedAudioOutId}
               speakerMuted={speakerMuted}
+              reconnecting={status !== 'connected'}
             />
           ))}
           {screenShares.map(([socketId, peer]) => (
@@ -776,6 +1220,7 @@ export default function ViewerView() {
               audioPaused={!!peer.screenAudioPaused}
               speakerDeviceId={selectedAudioOutId}
               speakerMuted={speakerMuted}
+              reconnecting={status !== 'connected'}
             />
           ))}
           </>

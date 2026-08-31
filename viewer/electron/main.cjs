@@ -7,6 +7,17 @@ const { readWindowState, trackWindowState, applyWindowState } = require('./windo
 let mainWindow;
 let restartInProgress = false;
 let productionIndexUrl = null;
+let rendererRecoveryTimer = null;
+let rendererRecoveryReason = '';
+let rendererRecoveryAttempts = 0;
+let rendererStableTimer = null;
+let isQuitting = false;
+
+// 無人常設ビューアーでも、最小化・背面化によるタイマー間引きで
+// signaling/ICE復旧ループが停止しないようにする。
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -58,6 +69,100 @@ function loadProductionApp() {
   return mainWindow.loadURL(productionIndexUrl);
 }
 
+function isTrustedRendererUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  if (!value) return false;
+  try {
+    const target = new URL(value);
+    if (process.env.NODE_ENV === 'development') {
+      return target.protocol === 'http:' &&
+        ['localhost', '127.0.0.1', '::1'].includes(target.hostname) &&
+        target.port === '5173';
+    }
+    if (!productionIndexUrl || target.protocol !== 'file:') return false;
+    return target.pathname === new URL(productionIndexUrl).pathname;
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedWebContents(webContents) {
+  return !!mainWindow &&
+    !mainWindow.isDestroyed() &&
+    webContents === mainWindow.webContents &&
+    isTrustedRendererUrl(webContents.getURL());
+}
+
+function isTrustedPermissionContext(webContents, requestingUrl) {
+  if (!isTrustedWebContents(webContents)) return false;
+  const candidate = String(requestingUrl || '').trim();
+  if (!candidate || candidate === 'null' || candidate === 'file://') return true;
+  return isTrustedRendererUrl(candidate);
+}
+
+function requireTrustedIpcSender(event) {
+  const senderFrame = event.senderFrame;
+  const senderUrl = senderFrame?.url || '';
+  if (!isTrustedWebContents(event.sender) || !senderFrame ||
+      senderFrame !== mainWindow.webContents.mainFrame || !isTrustedRendererUrl(senderUrl)) {
+    throw new Error('untrusted IPC sender');
+  }
+}
+
+function parseExternalHttpUrl(rawUrl) {
+  const value = String(rawUrl || '').trim();
+  if (!value || value.length > 2048) throw new Error('invalid external url');
+  let target;
+  try {
+    target = new URL(value);
+  } catch {
+    throw new Error('invalid external url');
+  }
+  if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password) {
+    throw new Error('invalid external url');
+  }
+  return target.toString();
+}
+
+function clearRendererRecoveryTimer() {
+  if (rendererRecoveryTimer) clearTimeout(rendererRecoveryTimer);
+  rendererRecoveryTimer = null;
+  rendererRecoveryReason = '';
+}
+
+function markRendererHealthy() {
+  clearRendererRecoveryTimer();
+  if (rendererStableTimer) clearTimeout(rendererStableTimer);
+  rendererStableTimer = setTimeout(() => {
+    rendererStableTimer = null;
+    rendererRecoveryAttempts = 0;
+  }, 30_000);
+  rendererStableTimer.unref?.();
+}
+
+function scheduleRendererRecovery(reason) {
+  if (isQuitting || restartInProgress || rendererRecoveryTimer || !mainWindow || mainWindow.isDestroyed()) return;
+  if (rendererStableTimer) clearTimeout(rendererStableTimer);
+  rendererStableTimer = null;
+  const delayMs = Math.min(15_000, 1_000 * (2 ** Math.min(rendererRecoveryAttempts, 4)));
+  rendererRecoveryAttempts += 1;
+  rendererRecoveryReason = reason;
+  console.error(`[Renderer] ${reason}; recovery scheduled in ${delayMs}ms (attempt=${rendererRecoveryAttempts})`);
+  rendererRecoveryTimer = setTimeout(async () => {
+    rendererRecoveryTimer = null;
+    rendererRecoveryReason = '';
+    if (isQuitting || restartInProgress || !mainWindow || mainWindow.isDestroyed()) return;
+    try {
+      if (process.env.NODE_ENV === 'development') mainWindow.webContents.reloadIgnoringCache();
+      else await loadProductionApp();
+    } catch (err) {
+      console.error(`[Renderer] recovery failed: ${err.message}`);
+      scheduleRendererRecovery('recovery-load-failed');
+    }
+  }, delayMs);
+  rendererRecoveryTimer.unref?.();
+}
+
 function createWindow() {
   const windowState = readWindowState({ width: 1280, height: 800 });
   mainWindow = new BrowserWindow({
@@ -70,8 +175,10 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      webSecurity: false,
+      sandbox: true,
+      webSecurity: true,
       autoplayPolicy: 'no-user-gesture-required',
+      backgroundThrottling: false,
     },
   });
 
@@ -88,36 +195,47 @@ function createWindow() {
     loadProductionApp();
   }
 
-  mainWindow.on('closed', () => { mainWindow = null; });
+  mainWindow.on('closed', () => {
+    clearRendererRecoveryTimer();
+    if (rendererStableTimer) clearTimeout(rendererStableTimer);
+    rendererRecoveryTimer = null;
+    rendererStableTimer = null;
+    mainWindow = null;
+  });
 
   mainWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.error(`[Load] failed code=${code} url=${url} ${desc}`);
-    setTimeout(() => {
-      if (!mainWindow || mainWindow.isDestroyed()) return;
-      if (isDev) mainWindow.reload();
-      else loadProductionApp();
-    }, 3000);
+    scheduleRendererRecovery(`load-failed:${code}`);
   });
 
-  mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (isDev || !productionIndexUrl) return;
-    if (url === productionIndexUrl || url.startsWith(`${productionIndexUrl}#`)) return;
+  const guardNavigation = (event, url) => {
+    if (isTrustedRendererUrl(url)) return;
     event.preventDefault();
     console.warn(`[Navigation] blocked unexpected top-level navigation: ${url}`);
-    loadProductionApp();
-  });
+    if (!isDev) loadProductionApp();
+  };
+  mainWindow.webContents.on('will-navigate', guardNavigation);
+  mainWindow.webContents.on('will-redirect', guardNavigation);
 
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-attach-webview', event => event.preventDefault());
 
   mainWindow.webContents.on('render-process-gone', (_e, details) => {
-    console.error(`[Renderer] gone: ${details.reason}`);
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+    scheduleRendererRecovery(`process-gone:${details.reason}`);
   });
 
   mainWindow.on('unresponsive', () => {
-    console.error('[Window] unresponsive, reloading renderer');
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.reload();
+    scheduleRendererRecovery('window-unresponsive');
   });
+
+  mainWindow.on('responsive', () => {
+    if (rendererRecoveryTimer && rendererRecoveryReason === 'window-unresponsive') {
+      console.log('[Renderer] responsiveness restored before reload');
+      markRendererHealthy();
+    }
+  });
+
+  mainWindow.webContents.on('did-finish-load', markRendererHealthy);
 
   mainWindow.webContents.on('console-message', (_e, level, message) => {
     const tag = ['LOG', 'WARN', 'ERROR', 'INFO'][level] || 'LOG';
@@ -128,12 +246,14 @@ function createWindow() {
 app.whenReady().then(async () => {
   await honorRestartDelay();
 
-  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    const allowed = ['media', 'mediaKeySystem', 'fullscreen', 'display-capture'];
-    callback(allowed.includes(permission));
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const allowed = ['media', 'fullscreen'];
+    callback(allowed.includes(permission) &&
+      isTrustedPermissionContext(webContents, details?.requestingUrl));
   });
-  session.defaultSession.setPermissionCheckHandler((_wc, permission) => {
-    return ['media', 'mediaKeySystem', 'fullscreen', 'display-capture'].includes(permission);
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
+    return ['media', 'fullscreen'].includes(permission) &&
+      isTrustedPermissionContext(webContents, details?.requestingUrl || requestingOrigin);
   });
 
   createWindow();
@@ -147,17 +267,37 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-ipcMain.on('restart-app', () => {
+app.on('before-quit', () => {
+  isQuitting = true;
+  clearRendererRecoveryTimer();
+  if (rendererStableTimer) clearTimeout(rendererStableTimer);
+  rendererRecoveryTimer = null;
+  rendererStableTimer = null;
+});
+
+ipcMain.on('restart-app', event => {
+  try {
+    requireTrustedIpcSender(event);
+  } catch (err) {
+    console.warn(`[IPC] restart-app rejected: ${err.message}`);
+    return;
+  }
   restartApp();
 });
 
-ipcMain.handle('open-external', async (_event, url) => {
-  const target = String(url || '').trim();
-  if (!/^https?:\/\//i.test(target)) throw new Error('invalid update url');
+ipcMain.handle('open-external', async (event, url) => {
+  requireTrustedIpcSender(event);
+  const target = parseExternalHttpUrl(url);
   await shell.openExternal(target);
   return true;
 });
 
-ipcMain.on('quick-restart-result', (_event, result) => {
+ipcMain.on('quick-restart-result', (event, result) => {
+  try {
+    requireTrustedIpcSender(event);
+  } catch (err) {
+    console.warn(`[IPC] quick-restart-result rejected: ${err.message}`);
+    return;
+  }
   console.log(`[QuickRestart] renderer result ${JSON.stringify(result || {})}`);
 });

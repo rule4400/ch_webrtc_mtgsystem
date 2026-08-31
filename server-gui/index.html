@@ -2,12 +2,22 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'">
   <title>CHECKHOUSE Meeting System Server</title>
   <style>
+    /* ─────────────────────────────────────────────────────────
+       サーバー管理GUI
+       設計方針:
+         - 監視ファースト: サマリーと接続端末の状態は常時表示（タブ切替不要）
+         - どんなウィンドウ幅でも全メニュー・全ボタン・全情報が見える
+           （flex-wrap / auto-fit minmax / 狭幅では1カラム化。固定幅グリッド禁止）
+         - クライアント状態はリアルタイム表示（折りたたみ無し・更新鮮度表示付き）
+       ───────────────────────────────────────────────────────── */
     :root {
-      --bg: #101214;
+      --bg: #0f1114;
       --surface: #171a1f;
-      --surface-2: #20242b;
+      --surface-2: #1e232a;
       --surface-3: #2a3038;
       --border: rgba(255,255,255,0.1);
       --text: #eef2f5;
@@ -26,18 +36,11 @@
       overflow: hidden;
       color: var(--text);
       background: var(--bg);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      letter-spacing: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Kaku Gothic ProN", Roboto, sans-serif;
     }
 
-    button, select, input {
-      font: inherit;
-    }
-
-    button {
-      border: 0;
-      cursor: pointer;
-    }
+    button, select, input, textarea { font: inherit; }
+    button { border: 0; cursor: pointer; }
 
     .shell {
       display: grid;
@@ -46,22 +49,23 @@
       min-width: 0;
     }
 
+    /* ── 上部バー（ブランド / サーバー状態 / 起動・停止）────── */
     .topbar {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      min-height: 60px;
-      padding: 0 20px;
-      background: #15181d;
+      gap: 10px 14px;
+      padding: 10px 16px;
+      background: #14171c;
       border-bottom: 1px solid var(--border);
     }
 
     .brand {
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 10px;
       min-width: 0;
+      margin-right: auto;
     }
 
     .brand-mark {
@@ -73,37 +77,37 @@
       background: linear-gradient(135deg, var(--blue), var(--green));
       color: #071016;
       font-weight: 800;
+      flex-shrink: 0;
     }
 
     .brand-title {
-      font-size: 0.98rem;
+      font-size: 0.95rem;
       font-weight: 700;
+      white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      white-space: nowrap;
     }
 
     .brand-sub {
-      margin-top: 2px;
+      margin-top: 1px;
       color: var(--muted);
-      font-size: 0.74rem;
+      font-size: 0.72rem;
+      white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      white-space: nowrap;
     }
 
     .status-pill {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 11px;
+      padding: 7px 12px;
       border-radius: 999px;
       background: rgba(255,255,255,0.06);
       border: 1px solid var(--border);
       color: var(--muted);
       font-size: 0.78rem;
-      min-width: 112px;
-      justify-content: center;
+      white-space: nowrap;
     }
 
     .dot {
@@ -111,20 +115,13 @@
       height: 9px;
       border-radius: 50%;
       background: var(--red);
-      box-shadow: 0 0 14px currentColor;
+      box-shadow: 0 0 10px currentColor;
       color: var(--red);
-    }
-    .dot.running { background: var(--green); color: var(--green); }
-    .dot.healthy { background: var(--green); color: var(--green); }
-    .dot.degraded, .dot.warming { background: var(--amber); color: var(--amber); }
-    .dot.stale, .dot.offline { background: var(--red); color: var(--red); }
-
-    .top-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
       flex-shrink: 0;
     }
+    .dot.running, .dot.healthy { background: var(--green); color: var(--green); }
+    .dot.degraded, .dot.warming { background: var(--amber); color: var(--amber); }
+    .dot.stale, .dot.offline { background: var(--red); color: var(--red); }
 
     .btn {
       display: inline-flex;
@@ -132,53 +129,126 @@
       justify-content: center;
       gap: 8px;
       min-height: 34px;
-      padding: 0 13px;
-      border-radius: 6px;
+      padding: 0 14px;
+      border-radius: 7px;
       color: var(--text);
       background: var(--surface-3);
       border: 1px solid var(--border);
       font-size: 0.8rem;
       font-weight: 650;
+      white-space: nowrap;
     }
-    .btn:hover { filter: brightness(1.08); }
+    .btn:hover { filter: brightness(1.1); }
     .btn:disabled { opacity: 0.55; cursor: not-allowed; }
     .btn.primary { color: #061016; background: var(--green); border-color: transparent; }
     .btn.danger { color: #fff; background: var(--red); border-color: transparent; }
     .btn.ghost { background: rgba(255,255,255,0.05); }
 
-    .tabs {
+    /* ── 常時表示のサマリーバー（旧ダッシュボードのメトリクス）── */
+    .statusbar {
       display: flex;
+      flex-wrap: wrap;
       align-items: stretch;
-      gap: 2px;
-      padding: 0 14px;
-      background: #15181d;
+      gap: 8px;
+      padding: 8px 16px;
+      background: #101318;
       border-bottom: 1px solid var(--border);
-      min-height: 44px;
-      overflow-x: auto;
     }
 
-    .tab {
+    .stat {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 2px;
+      min-width: 96px;
+      padding: 6px 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 0.66rem;
+      white-space: nowrap;
+    }
+
+    .stat-value {
+      font-size: 1.02rem;
+      font-weight: 800;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 260px;
+    }
+
+    .stat-note {
+      color: var(--muted);
+      font-size: 0.64rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 260px;
+    }
+
+    .stat.fresh-warn { border-color: rgba(246,195,91,0.55); }
+    .stat.fresh-bad { border-color: rgba(239,91,91,0.6); }
+
+    .statusbar-actions {
       display: flex;
       align-items: center;
-      padding: 0 14px;
-      color: var(--muted);
+      gap: 8px;
+      margin-left: auto;
+    }
+
+    /* ── ナビ + コンテンツ ─────────────────────────────── */
+    .workspace {
+      display: grid;
+      grid-template-columns: 168px minmax(0, 1fr);
+      min-height: 0;
+    }
+
+    .nav {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 12px 10px;
+      background: #12151a;
+      border-right: 1px solid var(--border);
+      overflow-y: auto;
+    }
+
+    .nav-btn {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      min-height: 38px;
+      padding: 0 12px;
+      border-radius: 8px;
       background: transparent;
-      border-bottom: 2px solid transparent;
-      cursor: pointer;
-      font-size: 0.82rem;
-      font-weight: 650;
+      color: var(--muted);
+      font-size: 0.84rem;
+      font-weight: 700;
+      text-align: left;
+      white-space: nowrap;
     }
-    .tab:focus-visible {
-      outline: 2px solid var(--blue);
-      outline-offset: -2px;
-    }
-    .tab.active {
-      color: var(--text);
-      border-color: var(--blue);
+    .nav-btn:hover { background: rgba(255,255,255,0.06); color: var(--text); }
+    .nav-btn.active { background: rgba(90,176,255,0.14); color: var(--text); }
+    .nav-btn .nav-ico { width: 18px; text-align: center; flex-shrink: 0; }
+    .nav-btn .nav-count {
+      margin-left: auto;
+      min-width: 22px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      color: var(--muted);
+      font-size: 0.68rem;
+      text-align: center;
     }
 
     .content {
       min-height: 0;
+      min-width: 0;
       overflow: hidden;
     }
 
@@ -186,214 +256,198 @@
       display: none;
       height: 100%;
       min-height: 0;
-      padding: 16px;
+      padding: 14px 16px;
       overflow: auto;
       overscroll-behavior: contain;
     }
-    .panel.active { display: flex; flex-direction: column; }
-    .panel.active.dashboard-layout {
+    .panel.active { display: flex; flex-direction: column; gap: 12px; }
+
+    /* ── 接続端末カード（常時全情報表示・折りたたみ無し）───── */
+    .client-list {
       display: grid;
-      overflow: hidden;
-    }
-
-    .dashboard-layout {
-      grid-template-rows: auto 1fr;
-      gap: 14px;
-      min-height: 0;
-    }
-
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-      gap: 10px;
-    }
-
-    .metric {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-      min-height: 78px;
-      min-width: 0;
-    }
-
-    .metric-label {
-      color: var(--muted);
-      font-size: 0.72rem;
-      margin-bottom: 8px;
-    }
-
-    .metric-value {
-      font-size: 1.35rem;
-      font-weight: 800;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-
-    .metric-note {
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 0.72rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .client-grid {
-      min-height: 0;
-      max-height: 100%;
-      overflow: auto;
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 480px), 1fr));
       align-content: start;
       gap: 12px;
-      padding-right: 4px;
-      overscroll-behavior: contain;
     }
 
     .client-card {
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-left-width: 4px;
+      border-radius: 10px;
       min-width: 0;
       overflow: hidden;
-      content-visibility: auto;
-      contain-intrinsic-size: 96px;
     }
-
-    .client-card.healthy { border-color: rgba(56,217,150,0.45); }
-    .client-card.degraded, .client-card.warming { border-color: rgba(246,195,91,0.5); }
-    .client-card.stale, .client-card.offline { border-color: rgba(239,91,91,0.5); }
-
-    .client-card > summary {
-      list-style: none;
-      cursor: pointer;
-    }
-
-    .client-card > summary::-webkit-details-marker {
-      display: none;
-    }
+    .client-card.healthy { border-left-color: var(--green); }
+    .client-card.degraded, .client-card.warming { border-left-color: var(--amber); }
+    .client-card.stale, .client-card.offline { border-left-color: var(--red); }
 
     .client-head {
       display: flex;
       flex-wrap: wrap;
-      align-items: flex-start;
-      justify-content: space-between;
+      align-items: center;
       gap: 8px 12px;
-      padding: 12px;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.035);
       border-bottom: 1px solid var(--border);
-      background: rgba(255,255,255,0.025);
     }
 
-    .client-head > div:first-child {
-      min-width: 0;
-      flex: 1 1 180px;
-    }
-
-    .client-card:not([open]) .client-head {
-      border-bottom: 0;
-    }
-
-    .client-card[open] .client-head {
-      background: rgba(255,255,255,0.045);
-    }
+    .client-idbox { min-width: 0; flex: 1 1 200px; }
 
     .client-title {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 8px;
+      gap: 6px 8px;
       min-width: 0;
       font-weight: 760;
     }
 
     .client-name {
+      font-size: 0.95rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 100%;
+    }
+
+    .client-meta {
+      margin-top: 3px;
+      color: var(--muted);
+      font-size: 0.7rem;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
 
-    .client-meta {
-      margin-top: 4px;
+    /* 通信安定度アンテナ（クライアントUIと同じ5段階+色分け） */
+    .sig {
+      display: inline-flex;
+      align-items: flex-end;
+      gap: 2px;
+      padding: 3px 6px;
+      border-radius: 6px;
+      background: rgba(0,0,0,0.35);
+      flex-shrink: 0;
+    }
+    .sig i {
+      display: inline-block;
+      width: 3px;
+      border-radius: 1px;
+      background: rgba(255,255,255,0.2);
+    }
+    .sig .rtt {
+      margin-left: 5px;
       color: var(--muted);
-      font-size: 0.72rem;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      font-size: 0.66rem;
+      font-style: normal;
+      width: auto;
+      background: transparent;
     }
 
     .client-actions {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
-      align-items: center;
       justify-content: flex-end;
-      min-width: 0;
-      flex: 0 1 auto;
+      margin-left: auto;
     }
 
     .mini-btn {
       min-height: 28px;
-      padding: 0 9px;
-      border-radius: 5px;
+      padding: 0 10px;
+      border-radius: 6px;
       background: var(--surface-3);
       color: var(--text);
       border: 1px solid var(--border);
       font-size: 0.72rem;
       font-weight: 700;
+      white-space: nowrap;
     }
+    .mini-btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .mini-btn.danger { background: rgba(239,91,91,0.18); border-color: rgba(239,91,91,0.4); color: #ffb3b3; }
     .mini-btn.blue { background: rgba(90,176,255,0.15); border-color: rgba(90,176,255,0.38); color: #b8dcff; }
     .mini-btn.ok { background: rgba(56,217,150,0.14); border-color: rgba(56,217,150,0.34); color: #b8f7dc; }
     .mini-btn.warn { background: rgba(246,195,91,0.14); border-color: rgba(246,195,91,0.35); color: #ffe0a3; }
 
     .client-body {
-      padding: 12px;
+      padding: 10px 12px 12px;
       display: grid;
-      gap: 12px;
+      gap: 10px;
     }
 
     .kv-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
-      gap: 8px;
+      grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+      gap: 6px;
     }
 
+    .kv {
+      background: rgba(255,255,255,0.045);
+      border-radius: 6px;
+      padding: 6px 8px;
+      min-width: 0;
+    }
+    .kv span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.64rem;
+      margin-bottom: 3px;
+      white-space: nowrap;
+    }
+    .kv strong {
+      display: block;
+      font-size: 0.8rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .kv strong.q-good { color: var(--green); }
     .kv strong.q-fair { color: var(--amber); }
     .kv strong.q-poor { color: var(--red); }
     .kv strong.q-unknown { color: var(--muted); }
 
-    .kv {
-      background: rgba(255,255,255,0.045);
-      border-radius: 6px;
-      padding: 8px;
-      min-width: 0;
-    }
-
-    .kv span {
-      display: block;
-      color: var(--muted);
-      font-size: 0.68rem;
-      margin-bottom: 5px;
-    }
-
-    .kv strong {
-      display: block;
-      font-size: 0.82rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
     .section-title {
       color: var(--muted);
-      font-size: 0.7rem;
+      font-size: 0.66rem;
       font-weight: 760;
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      margin-bottom: 7px;
+      margin-bottom: 6px;
+    }
+
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      min-height: 24px;
+      align-items: center;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 22px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.06);
+      color: var(--muted);
+      font-size: 0.68rem;
+      border: 1px solid transparent;
+      max-width: 100%;
+      white-space: nowrap;
+    }
+    .chip.ok { color: #b8f7dc; background: rgba(56,217,150,0.12); border-color: rgba(56,217,150,0.24); }
+    .chip.warn { color: #ffe0a3; background: rgba(246,195,91,0.12); border-color: rgba(246,195,91,0.28); }
+    .chip.bad { color: #ffc0c0; background: rgba(239,91,91,0.12); border-color: rgba(239,91,91,0.28); }
+    .chip.blue { color: #b8dcff; background: rgba(90,176,255,0.12); border-color: rgba(90,176,255,0.24); }
+    .chip.violet { color: #ddd1ff; background: rgba(167,139,250,0.14); border-color: rgba(167,139,250,0.3); }
+    .chip.pulse { animation: chip-pulse 1.6s ease-in-out infinite; }
+
+    @keyframes chip-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.55; }
     }
 
     .device-grid {
@@ -403,14 +457,12 @@
     }
 
     .device-control { min-width: 0; }
-
     .device-control label {
       display: block;
       color: var(--muted);
-      font-size: 0.68rem;
+      font-size: 0.66rem;
       margin-bottom: 4px;
     }
-
     .device-control select {
       width: 100%;
       min-width: 0;
@@ -425,54 +477,31 @@
     }
     .device-control select:disabled { color: #64748b; opacity: 0.7; }
 
-    .chip-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      min-height: 26px;
-    }
-
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      min-height: 24px;
-      padding: 0 8px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.06);
-      color: var(--muted);
-      font-size: 0.7rem;
-      border: 1px solid transparent;
-      max-width: 100%;
-    }
-    .chip.ok { color: #b8f7dc; background: rgba(56,217,150,0.12); border-color: rgba(56,217,150,0.24); }
-    .chip.warn { color: #ffe0a3; background: rgba(246,195,91,0.12); border-color: rgba(246,195,91,0.28); }
-    .chip.bad { color: #ffc0c0; background: rgba(239,91,91,0.12); border-color: rgba(239,91,91,0.28); }
-    .chip.blue { color: #b8dcff; background: rgba(90,176,255,0.12); border-color: rgba(90,176,255,0.24); }
-
     .monitor-list {
       display: grid;
-      gap: 6px;
-      max-height: 150px;
+      gap: 5px;
+      max-height: 140px;
       overflow: auto;
     }
 
     .monitor-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      display: flex;
+      flex-wrap: wrap;
       align-items: center;
-      gap: 6px;
-      min-height: 30px;
-      padding: 5px 7px;
+      gap: 5px 8px;
+      min-height: 28px;
+      padding: 4px 8px;
       background: rgba(255,255,255,0.035);
       border-radius: 6px;
     }
 
     .monitor-name {
+      min-width: 0;
+      flex: 1 1 120px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      font-size: 0.76rem;
+      font-size: 0.74rem;
     }
 
     .empty {
@@ -484,6 +513,35 @@
       border-radius: 8px;
     }
 
+    /* ── メディア経路タブ ─────────────────────────── */
+    .route-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.78rem;
+    }
+
+    .route-table th,
+    .route-table td {
+      padding: 7px 10px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    .route-table th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.72rem;
+      white-space: nowrap;
+    }
+
+    .route-sub {
+      color: var(--muted);
+      font-size: 0.68rem;
+      margin-top: 2px;
+    }
+
+    /* ── ログ ──────────────────────────────────────── */
     .log-container {
       flex: 1;
       min-height: 0;
@@ -493,18 +551,13 @@
       border: 1px solid var(--border);
       border-radius: 8px;
       font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-      font-size: 0.78rem;
-      line-height: 1.45;
+      font-size: 0.76rem;
+      line-height: 1.5;
       white-space: pre-wrap;
+      overscroll-behavior: contain;
     }
 
-    .registry-wrap {
-      display: grid;
-      grid-template-rows: auto minmax(0, 1fr);
-      gap: 14px;
-      min-height: 0;
-    }
-
+    /* ── 事前登録 ──────────────────────────────────── */
     .registry-form {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -515,21 +568,14 @@
       border-radius: 8px;
     }
 
-    .registry-form .wide-field {
-      grid-column: span 2;
-    }
-
-    .registry-field {
-      min-width: 0;
-    }
-
+    .registry-field { min-width: 0; }
     .registry-field label {
       display: block;
       color: var(--muted);
       font-size: 0.7rem;
       margin-bottom: 5px;
+      white-space: nowrap;
     }
-
     .registry-field input {
       width: 100%;
       min-height: 34px;
@@ -541,7 +587,6 @@
       outline: none;
       min-width: 0;
     }
-
     .registry-field input:focus {
       border-color: rgba(90,176,255,0.55);
       box-shadow: 0 0 0 1px rgba(90,176,255,0.22);
@@ -561,10 +606,8 @@
     }
 
     .registry-grid {
-      min-height: 0;
-      overflow: auto;
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
       align-content: start;
       gap: 12px;
     }
@@ -581,8 +624,9 @@
 
     .registered-head {
       display: flex;
+      flex-wrap: wrap;
       justify-content: space-between;
-      gap: 10px;
+      gap: 6px 10px;
       min-width: 0;
     }
 
@@ -608,11 +652,12 @@
       gap: 6px;
     }
 
+    /* ── 設定 ──────────────────────────────────────── */
     .settings-wrap {
-      max-width: 860px;
+      max-width: 900px;
       width: 100%;
       display: grid;
-      gap: 14px;
+      gap: 12px;
       padding-bottom: 26px;
     }
 
@@ -621,12 +666,14 @@
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 14px;
+      min-width: 0;
     }
 
-    .settings-row label {
+    .settings-row > label {
       display: block;
       color: var(--muted);
       font-size: 0.75rem;
+      font-weight: 700;
       margin-bottom: 8px;
     }
 
@@ -638,12 +685,12 @@
       color: #cbd5e1;
       word-break: break-all;
       margin-bottom: 10px;
-      font-size: 0.82rem;
+      font-size: 0.8rem;
     }
 
     .settings-textarea {
       width: 100%;
-      min-height: 118px;
+      min-height: 110px;
       resize: vertical;
       color: var(--text);
       background: #080a0d;
@@ -660,25 +707,18 @@
       color: var(--muted);
       font-size: 0.72rem;
       margin-top: 7px;
+      line-height: 1.6;
     }
 
-    .update-grid {
-      display: grid;
-      gap: 8px;
-    }
+    .update-grid { display: grid; gap: 8px; }
 
     .update-row {
       display: grid;
-      grid-template-columns: 110px minmax(80px, 120px) minmax(0, 1fr);
+      grid-template-columns: minmax(90px, 110px) minmax(80px, 120px) minmax(0, 1fr);
       gap: 8px;
       align-items: center;
     }
-
-    .update-row span {
-      color: var(--muted);
-      font-size: 0.76rem;
-    }
-
+    .update-row span { color: var(--muted); font-size: 0.76rem; white-space: nowrap; }
     .update-row input {
       min-width: 0;
       min-height: 34px;
@@ -697,11 +737,7 @@
       margin-top: 12px;
     }
 
-    .update-files {
-      display: grid;
-      gap: 6px;
-      margin-top: 10px;
-    }
+    .update-files { display: grid; gap: 6px; margin-top: 10px; }
 
     .update-file-row {
       display: flex;
@@ -723,34 +759,28 @@
       white-space: nowrap;
     }
 
-    @media (max-width: 760px) {
-      .topbar {
-        align-items: flex-start;
-        flex-direction: column;
-        padding: 12px 14px;
+    /* ── レスポンシブ（全メニュー・全ボタンを常に見せる）────── */
+    @media (max-width: 900px) {
+      .workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+      .nav {
+        flex-direction: row;
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding: 8px 12px;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
       }
+      .nav-btn { flex-shrink: 0; }
+      .update-row { grid-template-columns: 1fr; }
+    }
 
-      .top-actions {
-        width: 100%;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-      }
-
-      .metrics {
-        grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
-      }
-
-      .panel {
-        padding: 12px;
-      }
-
-      .client-actions {
-        justify-content: flex-start;
-      }
-
-      .update-row {
-        grid-template-columns: 1fr;
-      }
+    @media (max-width: 640px) {
+      .topbar { padding: 10px 12px; }
+      .statusbar { padding: 8px 12px; }
+      .panel { padding: 12px; }
+      .stat { min-width: 84px; }
+      .client-actions { justify-content: flex-start; margin-left: 0; width: 100%; }
+      .statusbar-actions { margin-left: 0; width: 100%; justify-content: flex-end; }
     }
   </style>
 </head>
@@ -759,52 +789,65 @@
     <header class="topbar">
       <div class="brand">
         <div class="brand-mark">CH</div>
-        <div>
+        <div style="min-width:0">
           <div class="brand-title">CHECKHOUSE Meeting System</div>
           <div class="brand-sub">サーバー、端末、チャンネル、アップデート管理</div>
         </div>
       </div>
-      <div class="top-actions">
-        <div class="status-pill">
-          <span id="statusDot" class="dot"></span>
-          <span id="statusText">停止中</span>
-        </div>
-        <button id="startBtn" class="btn primary">起動</button>
-        <button id="stopBtn" class="btn danger">停止</button>
+      <div class="status-pill">
+        <span id="statusDot" class="dot"></span>
+        <span id="statusText">停止中</span>
       </div>
+      <div class="status-pill" id="statsAgePill" title="監視データの更新鮮度">
+        <span>更新</span>
+        <span id="statsAge">-</span>
+      </div>
+      <button id="startBtn" class="btn primary">サーバー起動</button>
+      <button id="stopBtn" class="btn danger">停止</button>
     </header>
 
-    <nav class="tabs" role="tablist" aria-label="Server dashboard sections">
-      <button type="button" class="tab active" data-target="dashboard" role="tab" aria-selected="true" aria-controls="dashboard">ダッシュボード</button>
-      <button type="button" class="tab" data-target="clients" role="tab" aria-selected="false" aria-controls="clients">接続端末</button>
-      <button type="button" class="tab" data-target="registered" role="tab" aria-selected="false" aria-controls="registered">事前登録</button>
-      <button type="button" class="tab" data-target="logs" role="tab" aria-selected="false" aria-controls="logs">ログ</button>
-      <button type="button" class="tab" data-target="settings" role="tab" aria-selected="false" aria-controls="settings">設定</button>
-    </nav>
+    <div class="statusbar" aria-label="サーバーサマリー">
+      <div class="stat"><span class="stat-label">接続端末</span><span class="stat-value" id="mPeers">0</span><span class="stat-note" id="mHealth">待機中</span></div>
+      <div class="stat"><span class="stat-label">送信 / 受信ストリーム</span><span class="stat-value" id="mStreams">0 / 0</span><span class="stat-note">映像・音声配信</span></div>
+      <div class="stat"><span class="stat-label">受信確認OK</span><span class="stat-value" id="mReceive">0</span><span class="stat-note">クライアント側監視</span></div>
+      <div class="stat"><span class="stat-label">通信品質</span><span class="stat-value" id="mQuality">-</span><span class="stat-note" id="mQualityNote">平均RTT / 安定度</span></div>
+      <div class="stat"><span class="stat-label">CPU / メモリ</span><span class="stat-value"><span id="mCpu">0.0%</span> / <span id="mMemory">0 MB</span></span><span class="stat-note" id="mUptime">起動時間 0s</span></div>
+      <div class="stat"><span class="stat-label">サーバーIP</span><span class="stat-value" id="mCurrentIp">-</span><span class="stat-note" id="mAnnounced" title="公開IP / 実IP">ANNOUNCED_IP</span></div>
+      <div class="stat"><span class="stat-label">RTPポート</span><span class="stat-value" id="mRtcPorts" style="font-size:0.85rem">-</span><span class="stat-note">UDP/TCP 範囲</span></div>
+      <div class="stat"><span class="stat-label">録画</span><span class="stat-value" id="mRecording" style="font-size:0.85rem">停止中</span><span class="stat-note" id="mRecordingNote">設定タブで有効化</span></div>
+      <div class="statusbar-actions">
+        <button id="openRecordingsBtn" class="btn ghost">📹 録画を見る</button>
+        <button id="restartAllBtn" class="btn danger">全端末を再構築</button>
+      </div>
+    </div>
 
-    <main class="content">
-      <section id="dashboard" class="panel active dashboard-layout" role="tabpanel">
-        <div class="metrics">
-          <div class="metric"><div class="metric-label">接続端末</div><div class="metric-value" id="mPeers">0</div><div class="metric-note" id="mHealth">待機中</div></div>
-          <div class="metric"><div class="metric-label">映像・音声配信</div><div class="metric-value" id="mStreams">0 / 0</div><div class="metric-note">送信 / 受信</div></div>
-          <div class="metric"><div class="metric-label">受信確認OK</div><div class="metric-value" id="mReceive">0</div><div class="metric-note">クライアント側監視</div></div>
-          <div class="metric"><div class="metric-label">サーバーIP</div><div class="metric-value" id="mCurrentIp">-</div><div class="metric-note" id="mAnnounced">ANNOUNCED_IP</div></div>
-          <div class="metric"><div class="metric-label">メモリ</div><div class="metric-value" id="mMemory">0 MB</div><div class="metric-note" id="mUptime">起動時間 0s</div></div>
-          <div class="metric"><div class="metric-label">CPU</div><div class="metric-value" id="mCpu">0.0%</div><div class="metric-note" id="mRtcPorts">RTP -</div></div>
-          <div class="metric"><div class="metric-label">通信品質</div><div class="metric-value" id="mQuality">-</div><div class="metric-note" id="mQualityNote">平均RTT / 安定度</div></div>
-          <div class="metric"><div class="metric-label">一括操作</div><button id="restartAllBtn" class="btn danger" style="width:100%; margin-top:4px;">全端末を再構築</button><div class="metric-note">接続中の全クライアント</div></div>
-        </div>
-        <div id="clientCards" class="client-grid">
-          <div class="empty">サーバー起動後、接続端末の状態がここに表示されます</div>
-        </div>
-      </section>
+    <div class="workspace">
+      <nav class="nav" role="tablist" aria-label="管理メニュー">
+        <button type="button" class="nav-btn active" data-target="monitor" role="tab" aria-selected="true">
+          <span class="nav-ico">📡</span>接続端末<span class="nav-count" id="navPeerCount">0</span>
+        </button>
+        <button type="button" class="nav-btn" data-target="registered" role="tab" aria-selected="false">
+          <span class="nav-ico">🗂</span>事前登録
+        </button>
+        <button type="button" class="nav-btn" data-target="mediaroute" role="tab" aria-selected="false">
+          <span class="nav-ico">📶</span>メディア経路
+        </button>
+        <button type="button" class="nav-btn" data-target="logs" role="tab" aria-selected="false">
+          <span class="nav-ico">📜</span>ログ
+        </button>
+        <button type="button" class="nav-btn" data-target="settings" role="tab" aria-selected="false">
+          <span class="nav-ico">⚙️</span>設定
+        </button>
+      </nav>
 
-      <section id="clients" class="panel" role="tabpanel" hidden>
-        <div id="clientCardsFull" class="client-grid"></div>
-      </section>
+      <main class="content">
+        <section id="monitor" class="panel active" role="tabpanel">
+          <div id="clientCards" class="client-list">
+            <div class="empty">サーバー起動後、接続端末の状態がここに表示されます</div>
+          </div>
+        </section>
 
-      <section id="registered" class="panel" role="tabpanel" hidden>
-        <div class="registry-wrap">
+        <section id="registered" class="panel" role="tabpanel" hidden>
           <div class="registry-form">
             <div class="registry-field">
               <label>管理名</label>
@@ -843,78 +886,287 @@
           <div id="registeredClients" class="registry-grid">
             <div class="empty">遠隔操作するクライアントを登録できます</div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section id="logs" class="panel" role="tabpanel" hidden>
-        <div class="log-container" id="logOutput">=== SFUサーバーログ ===</div>
-      </section>
+        <section id="mediaroute" class="panel" role="tabpanel" hidden>
+          <div class="settings-wrap">
+            <div class="settings-row">
+              <label>サーバー待受（STUN/ICE）の稼働状態</label>
+              <div class="chip-row" id="routeListen"><span class="chip">サーバー停止中</span></div>
+              <div class="settings-help">
+                通常はSFUへ直接接続し、直接経路を確立できない拠点だけ外部TURNを中継経路として利用します。
+                固定ポート運用時は「サーバーIP宛 TCP 3000 + UDP/TCP 固定ポート（+追加TCP待受）」を許可してください。
+              </div>
+            </div>
+            <div class="settings-row">
+              <label>外部 STUN/TURN サーバーの到達確認（STUN_URLS / TURN_URLS 設定時のみ）</label>
+              <div id="routeIceServers"><div class="empty">未設定（SFU直結モード）</div></div>
+            </div>
+            <div class="settings-row">
+              <label>拠点別メディア経路（実際に選択された経路と確立状態）</label>
+              <div id="routePeers"><div class="empty">接続端末がありません</div></div>
+            </div>
+          </div>
+        </section>
 
-      <section id="settings" class="panel" role="tabpanel" hidden>
-        <div class="settings-wrap">
-          <div class="settings-row">
-            <label>サーバー実行フォルダ</label>
-            <div class="path-display" id="pathDisplay">内蔵サーバーを使用します</div>
-            <button class="btn ghost" id="selectBtn">外部サーバーフォルダを選択</button>
-            <button class="btn ghost" id="useBundledBtn">内蔵サーバーに戻す</button>
-          </div>
-          <div class="settings-row">
-            <label>内蔵サーバー .env</label>
-            <div class="path-display" id="envDisplay">Loading...</div>
-          </div>
-          <div class="settings-row">
-            <label>システム設定ファイル</label>
-            <div class="path-display" id="systemSettingsPath">Loading...</div>
-          </div>
-          <div class="settings-row">
-            <label>チャンネル設定</label>
-            <textarea id="channelsText" class="settings-textarea" spellcheck="false"></textarea>
-            <div class="settings-help">1行につき「id,表示名」。例: general,一般</div>
-          </div>
-          <div class="settings-row">
-            <label>アップデート配布フォルダ（ファイル名からアプリを自動判別して配信）</label>
-            <div class="path-display" id="updateFolderDisplay">未設定</div>
-            <div class="settings-actions" style="margin-top:0">
-              <button class="btn ghost" id="selectUpdateFolderBtn">フォルダを選択</button>
-              <button class="btn ghost" id="rescanUpdateFolderBtn">再スキャン</button>
-              <button class="btn ghost" id="clearUpdateFolderBtn">解除</button>
-            </div>
-            <div id="updateFilesList" class="update-files"></div>
-            <div class="settings-help">
-              対応ファイル: dmg / pkg / zip / exe / msi など（ビルド済みのインストーラ/パッケージを配置してください）。
-              ファイル名に client / viewer / screen-share とバージョン番号（例: 0.3.0）を含めると自動登録されます。
-              フォルダは常時監視され、ファイル追加時に自動で配信情報を更新します。
-            </div>
-          </div>
-          <div class="settings-row">
-            <label>最新版 / 更新URL</label>
-            <div class="update-grid">
-              <div class="update-row">
-                <span>クライアント</span>
-                <input id="verClient" placeholder="0.1.0">
-                <input id="urlClient" placeholder="https://...">
-              </div>
-              <div class="update-row">
-                <span>閲覧用</span>
-                <input id="verViewer" placeholder="0.1.0">
-                <input id="urlViewer" placeholder="https://...">
-              </div>
-              <div class="update-row">
-                <span>画面共有用</span>
-                <input id="verScreenShare" placeholder="0.1.0">
-                <input id="urlScreenShare" placeholder="https://...">
+        <section id="logs" class="panel" role="tabpanel" hidden>
+          <div class="log-container" id="logOutput">=== SFUサーバーログ ===</div>
+        </section>
+
+        <section id="settings" class="panel" role="tabpanel" hidden>
+          <div class="settings-wrap">
+            <div class="settings-row">
+              <label>サーバー実行フォルダ</label>
+              <div class="path-display" id="pathDisplay">内蔵サーバーを使用します</div>
+              <div class="settings-actions" style="margin-top:0">
+                <button class="btn ghost" id="selectBtn">外部サーバーフォルダを選択</button>
+                <button class="btn ghost" id="useBundledBtn">内蔵サーバーに戻す</button>
               </div>
             </div>
-            <div class="settings-actions">
-              <button class="btn primary" id="saveSystemSettingsBtn">設定を保存して配信</button>
-              <button class="btn danger" id="forceUpdateClientsBtn">クライアント更新指示</button>
-              <button class="btn danger" id="forceUpdateViewersBtn">閲覧用更新指示</button>
-              <button class="btn danger" id="forceUpdateScreenShareBtn">画面共有更新指示</button>
+            <div class="settings-row">
+              <label>内蔵サーバー .env</label>
+              <div class="path-display" id="envDisplay">Loading...</div>
+            </div>
+            <div class="settings-row">
+              <label>システム設定ファイル</label>
+              <div class="path-display" id="systemSettingsPath">Loading...</div>
+            </div>
+            <div class="settings-row">
+              <label>チャンネル設定</label>
+              <textarea id="channelsText" class="settings-textarea" spellcheck="false"></textarea>
+              <div class="settings-help">1行につき「id,表示名」。例: general,一般</div>
+            </div>
+            <div class="settings-row">
+              <label>メディア接続ポート（UTM/ファイアウォール設置拠点対策）</label>
+              <div class="update-grid">
+                <div class="update-row">
+                  <span>固定ポート</span>
+                  <input id="netRtcPort" placeholder="例: 10000">
+                  <span>空欄 = 従来のポート範囲方式</span>
+                </div>
+                <div class="update-row">
+                  <span>追加TCP待受</span>
+                  <input id="netExtraTcp" placeholder="例: 443">
+                  <span>443しか通らない拠点向け(カンマ区切り可)</span>
+                </div>
+                <div class="update-row">
+                  <span>公開IP (ANNOUNCED_IP)</span>
+                  <input id="netAnnouncedIp" placeholder="自動（サーバー自身のIP）">
+                  <span>空欄 = 自動でこのサーバー自身のIPを広告。全拠点から到達できるVPN内IPを明示する場合に設定(カンマ区切り可)</span>
+                </div>
+                <div class="update-row">
+                  <span>STUN URL</span>
+                  <input id="netStunUrls" placeholder="例: stun:stun.example.jp:3478">
+                  <span>任意。複数はカンマ区切り</span>
+                </div>
+                <div class="update-row">
+                  <span>TURN URL</span>
+                  <input id="netTurnUrls" placeholder="例: turns:turn.example.jp:443?transport=tcp">
+                  <span>直結できない拠点の中継経路。UDP/TCP/TLSをカンマ区切りで併記可</span>
+                </div>
+                <div class="update-row">
+                  <span>TURN ユーザー名</span>
+                  <input id="netTurnUser" autocomplete="off">
+                  <span>TURNサーバーの認証情報</span>
+                </div>
+                <div class="update-row">
+                  <span>TURN パスワード</span>
+                  <input id="netTurnPass" type="password" autocomplete="new-password">
+                  <span>この端末のシステム設定ファイルに保存されます</span>
+                </div>
+              </div>
+              <div class="settings-help">
+                固定ポートを設定すると、全拠点のメディア(UDP/TCP)がこの1ポートに集約され、
+                UTM側の許可設定が「サーバーIP宛 TCP 3000 + UDP/TCP 固定ポート」だけで済みます。
+                追加TCP待受はSFUへの直接ICE-TCPであり、HTTPS/TURN-TLSではありません。直接接続を制限する
+                UTM拠点には、許可されやすい TURN-TLS（例: turns:ホスト名:443?transport=tcp）を併用してください。
+                「設定を保存して配信」を押すとサーバーが自動再起動して適用されます。
+              </div>
+            </div>
+            <div class="settings-row">
+              <label>ルーティン再起動（長時間稼働の不具合予防・時刻は複数指定可）</label>
+              <div class="update-grid">
+                <div class="update-row">
+                  <span>サーバー再起動時刻</span>
+                  <input id="maintServerTimes" placeholder="例: 04:00 （カンマ区切りで複数可）">
+                  <span>指定時刻にサーバープロセスを再起動します。終了後は自動復帰し、各拠点は自動再接続します（断は数秒）</span>
+                </div>
+                <div class="update-row">
+                  <span>クライアント再起動時刻</span>
+                  <input id="maintClientTimes" placeholder="例: 04:05 （カンマ区切りで複数可）">
+                  <span>全拠点へ同期され、各クライアントが指定時刻にアプリを再起動します（通話・画面共有中の拠点は終わってから実行）</span>
+                </div>
+              </div>
+              <div class="settings-help">
+                時刻は「HH:MM」の24時間表記です（サーバー/各拠点PCのローカル時刻で判定）。空欄で無効。
+                サーバーとクライアントの時刻は数分ずらすことを推奨します（例: サーバー 04:00、クライアント 04:05）。
+                「設定を保存して配信」で保存され、接続中の全拠点へ即時同期されます。
+                ※この設定はこのサーバー機にのみ保存されます。バックアップ構成では、
+                メイン/サブ両方のサーバーGUIに同じ時刻を設定してください（拠点は接続中の
+                サーバーの設定に従うため、片方だけだと接続先によって実施されない夜が生じます）。
+              </div>
+            </div>
+            <div class="settings-row">
+              <label>サーバー録画（各拠点のカメラ映像を自動録画・タイムライン再生）</label>
+              <div class="update-grid">
+                <div class="update-row">
+                  <span>録画</span>
+                  <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                    <input type="checkbox" id="recEnabled" style="width:16px;height:16px;accent-color:var(--accent, #4da3ff)">
+                    <span id="recEnabledLabel">無効</span>
+                  </label>
+                  <span>有効にすると接続中の全拠点のカメラ映像を常時録画します(カメラOFF中も記録されます)</span>
+                </div>
+                <div class="update-row">
+                  <span>録画データ保存先</span>
+                  <input id="recDir" placeholder="空欄 = アプリデータ内 recordings/">
+                  <button class="btn ghost" id="recDirBtn" style="justify-self:start">フォルダを選択</button>
+                </div>
+                <div class="update-row">
+                  <span>データベース保存先</span>
+                  <input id="recDbDir" placeholder="空欄 = 保存先内 recording-db/">
+                  <button class="btn ghost" id="recDbDirBtn" style="justify-self:start">フォルダを選択</button>
+                </div>
+                <div class="update-row">
+                  <span>ローカル一時保存先</span>
+                  <input id="recStagingDir" placeholder="空欄 = アプリデータ内 recording-staging/">
+                  <button class="btn ghost" id="recStagingDirBtn" style="justify-self:start">フォルダを選択</button>
+                </div>
+                <div class="update-row">
+                  <span>保持期間</span>
+                  <input id="recRetention" type="number" min="1" max="3650" placeholder="14">
+                  <span>日。経過したセグメントは1時間ごとの掃除で自動削除されます</span>
+                </div>
+                <div class="update-row">
+                  <span>セグメント長</span>
+                  <select id="recSegment">
+                    <option value="60">1分</option>
+                    <option value="180">3分</option>
+                    <option value="300" selected>5分</option>
+                    <option value="600">10分</option>
+                    <option value="900">15分</option>
+                  </select>
+                  <span>録画ファイルの分割単位（短いほど最新映像を早く再生できます）</span>
+                </div>
+                <div class="update-row">
+                  <span>圧縮（バックグラウンド）</span>
+                  <select id="recCompression">
+                    <option value="strong">高圧縮（480p・容量最小）</option>
+                    <option value="standard">標準（720p）</option>
+                    <option value="light">低圧縮（1080p・高画質）</option>
+                    <option value="none" selected>圧縮しない（推奨・会議優先）</option>
+                  </select>
+                  <span>「圧縮しない」は再エンコードを避け、会議のCPU/I/Oを優先します</span>
+                </div>
+                <div class="update-row">
+                  <span>画面共有も録画</span>
+                  <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                    <input type="checkbox" id="recScreen" style="width:16px;height:16px">
+                    <span>画面共有アプリの映像も記録する</span>
+                  </label>
+                  <span></span>
+                </div>
+                <div class="update-row">
+                  <span>音声も録音</span>
+                  <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                    <input type="checkbox" id="recAudio" style="width:16px;height:16px">
+                    <span>マイク音声（画面共有では画面の音声）も記録する</span>
+                  </label>
+                  <span>OFFにすると映像のみを録画します。保存すると録画中のセッションにも即時反映されます</span>
+                </div>
+                <div class="update-row">
+                  <span>圧縮の並列数</span>
+                  <select id="recConcurrency">
+                    <option value="0">自動（現在は1）</option>
+                    <option value="1" selected>1（推奨・会議優先）</option>
+                    <option value="2">2</option>
+                    <option value="3">3</option>
+                    <option value="4">4</option>
+                    <option value="6">6</option>
+                  </select>
+                  <span>自動も1ジョブです。会議中の負荷を実測した場合だけ増やしてください</span>
+                </div>
+                <div class="update-row">
+                  <span>最低空き容量</span>
+                  <input id="recMinFree" type="number" min="1" max="1000" placeholder="10">
+                  <span>GB。空きがこれを下回ると、保持期間内でも古い録画から自動削除して確保します</span>
+                </div>
+                <div class="update-row">
+                  <span>保存先の容量</span>
+                  <div class="path-display" id="recDiskInfo" style="margin:0">サーバー起動後に表示されます</div>
+                  <span>空き容量と、現在の録画ペースから計算した予想残り保存期間</span>
+                </div>
+                <div class="update-row">
+                  <span>日時の焼き込み</span>
+                  <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+                    <input type="checkbox" id="recTimestamp" style="width:16px;height:16px">
+                    <span>映像の右下にタイムスタンプ(年月日 時分秒)を表示する</span>
+                  </label>
+                  <span>ONにすると「圧縮しない」選択時も映像の再エンコードが必要です</span>
+                </div>
+                <div class="update-row">
+                  <span>ffmpeg パス</span>
+                  <input id="recFfmpeg" placeholder="空欄 = 自動(同梱ffmpegを使用)">
+                  <span>ffmpeg はアプリに同梱されています。特別な理由がなければ空欄のままにしてください</span>
+                </div>
+              </div>
+              <div class="settings-actions">
+                <button class="btn primary" id="saveRecordingBtn">録画設定を保存して適用</button>
+                <button class="btn ghost" id="openRecordingsBtn2">📹 録画タイムラインを開く</button>
+              </div>
+              <div class="settings-help">
+                会議の安定性を優先するため、取込み中の映像は「ローカル一時保存先」に書き、セグメント確定後に録画データ保存先へ保存します。
+                一時保存先はNASではなくサーバー内蔵SSDを指定し、通常は空欄（アプリデータ配下）のままにしてください。
+                最終保存先にはNAS等のマウント済みパス（例: /Volumes/nas/recordings、\\NAS\recordings）も指定できます。NASが利用できない間は新規録画を停め、復旧後に自動再開します。
+                過去の映像は「録画を見る」からブラウザで拠点別・複数拠点同時に再生できるほか、
+                専用アプリ「CHECKHOUSE Recording Viewer」でもサーバーまたはNAS上のデータを直接確認できます。
+              </div>
+            </div>
+            <div class="settings-row">
+              <label>アップデート配布フォルダ（ファイル名からアプリを自動判別して配信）</label>
+              <div class="path-display" id="updateFolderDisplay">未設定</div>
+              <div class="settings-actions" style="margin-top:0">
+                <button class="btn ghost" id="selectUpdateFolderBtn">フォルダを選択</button>
+                <button class="btn ghost" id="rescanUpdateFolderBtn">再スキャン</button>
+                <button class="btn ghost" id="clearUpdateFolderBtn">解除</button>
+              </div>
+              <div id="updateFilesList" class="update-files"></div>
+              <div class="settings-help">
+                対応ファイル: dmg / pkg / zip / exe / msi など（ビルド済みのインストーラ/パッケージを配置してください）。
+                ファイル名に client / viewer / screen-share とバージョン番号（例: 0.4.0）を含めると自動登録されます。
+                フォルダは常時監視され、ファイル追加時に自動で配信情報を更新します。
+              </div>
+            </div>
+            <div class="settings-row">
+              <label>最新版 / 更新URL</label>
+              <div class="update-grid">
+                <div class="update-row">
+                  <span>クライアント</span>
+                  <input id="verClient" placeholder="0.4.0">
+                  <input id="urlClient" placeholder="https://...">
+                </div>
+                <div class="update-row">
+                  <span>閲覧用</span>
+                  <input id="verViewer" placeholder="0.1.1">
+                  <input id="urlViewer" placeholder="https://...">
+                </div>
+                <div class="update-row">
+                  <span>画面共有用</span>
+                  <input id="verScreenShare" placeholder="0.2.1">
+                  <input id="urlScreenShare" placeholder="https://...">
+                </div>
+              </div>
+              <div class="settings-actions">
+                <button class="btn primary" id="saveSystemSettingsBtn">設定を保存して配信</button>
+                <button class="btn danger" id="forceUpdateClientsBtn">クライアント更新指示</button>
+                <button class="btn danger" id="forceUpdateViewersBtn">閲覧用更新指示</button>
+                <button class="btn danger" id="forceUpdateScreenShareBtn">画面共有更新指示</button>
+              </div>
             </div>
           </div>
-        </div>
-      </section>
-    </main>
+        </section>
+      </main>
+    </div>
   </div>
 
   <script>
@@ -925,6 +1177,8 @@
     const restartAllBtn = document.getElementById('restartAllBtn');
     const statusDot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
+    const statsAgeEl = document.getElementById('statsAge');
+    const statsAgePill = document.getElementById('statsAgePill');
     const logOutput = document.getElementById('logOutput');
     const pathDisplay = document.getElementById('pathDisplay');
     const envDisplay = document.getElementById('envDisplay');
@@ -936,6 +1190,18 @@
     const urlClient = document.getElementById('urlClient');
     const urlViewer = document.getElementById('urlViewer');
     const urlScreenShare = document.getElementById('urlScreenShare');
+    const netRtcPort = document.getElementById('netRtcPort');
+    const netExtraTcp = document.getElementById('netExtraTcp');
+    const netAnnouncedIp = document.getElementById('netAnnouncedIp');
+    const netStunUrls = document.getElementById('netStunUrls');
+    const netTurnUrls = document.getElementById('netTurnUrls');
+    const netTurnUser = document.getElementById('netTurnUser');
+    const netTurnPass = document.getElementById('netTurnPass');
+    const maintServerTimes = document.getElementById('maintServerTimes');
+    const maintClientTimes = document.getElementById('maintClientTimes');
+    const routeListen = document.getElementById('routeListen');
+    const routeIceServers = document.getElementById('routeIceServers');
+    const routePeers = document.getElementById('routePeers');
     const updateFolderDisplay = document.getElementById('updateFolderDisplay');
     const selectUpdateFolderBtn = document.getElementById('selectUpdateFolderBtn');
     const rescanUpdateFolderBtn = document.getElementById('rescanUpdateFolderBtn');
@@ -946,7 +1212,30 @@
     const forceUpdateViewersBtn = document.getElementById('forceUpdateViewersBtn');
     const forceUpdateScreenShareBtn = document.getElementById('forceUpdateScreenShareBtn');
     const clientCards = document.getElementById('clientCards');
-    const clientCardsFull = document.getElementById('clientCardsFull');
+    const navPeerCount = document.getElementById('navPeerCount');
+    const recEnabled = document.getElementById('recEnabled');
+    const recEnabledLabel = document.getElementById('recEnabledLabel');
+    const recDir = document.getElementById('recDir');
+    const recDbDir = document.getElementById('recDbDir');
+    const recStagingDir = document.getElementById('recStagingDir');
+    const recRetention = document.getElementById('recRetention');
+    const recSegment = document.getElementById('recSegment');
+    const recCompression = document.getElementById('recCompression');
+    const recScreen = document.getElementById('recScreen');
+    const recAudio = document.getElementById('recAudio');
+    const recTimestamp = document.getElementById('recTimestamp');
+    const recFfmpeg = document.getElementById('recFfmpeg');
+    const recConcurrency = document.getElementById('recConcurrency');
+    const recMinFree = document.getElementById('recMinFree');
+    const recDiskInfo = document.getElementById('recDiskInfo');
+    const saveRecordingBtn = document.getElementById('saveRecordingBtn');
+    const recDirBtn = document.getElementById('recDirBtn');
+    const recDbDirBtn = document.getElementById('recDbDirBtn');
+    const recStagingDirBtn = document.getElementById('recStagingDirBtn');
+    const openRecordingsBtn = document.getElementById('openRecordingsBtn');
+    const openRecordingsBtn2 = document.getElementById('openRecordingsBtn2');
+    const mRecording = document.getElementById('mRecording');
+    const mRecordingNote = document.getElementById('mRecordingNote');
     const registeredClientsEl = document.getElementById('registeredClients');
     const regName = document.getElementById('regName');
     const regHost = document.getElementById('regHost');
@@ -961,15 +1250,21 @@
 
     let currentServerPath = localStorage.getItem('sfuServerPath') || '';
     let latestStats = null;
+    let recordingSocketSet = new Set(); // 現在サーバー録画中の socketId 集合
     let deferredCardStats = null;
     let lastCardsHtml = '';
     let deviceSelectHoldUntil = 0;
     let registeredClients = [];
-    const expandedClientIds = new Set();
+    let serverRunning = false;
+    let lastStatsAt = 0;
     let systemSettings = {
       channels: [{ id: 'general', name: '一般' }],
-      latestVersions: { client: '0.1.0', viewer: '0.1.0', 'screen-share': '0.1.0' },
+      latestVersions: { client: '0.6.0', viewer: '0.1.1', 'screen-share': '0.2.1' },
       updatePackages: {},
+      network: {
+        rtcPort: '', extraTcpPorts: '', announcedIp: '',
+        stunUrls: '', turnUrls: '', turnUser: '', turnPass: '',
+      },
     };
     pathDisplay.innerText = currentServerPath || '内蔵サーバーを使用します';
 
@@ -988,11 +1283,26 @@
       unknown: '計測中',
     };
 
+    const presenceText = {
+      busy: '商談中',
+      away: '不在',
+      gohome: '帰宅',
+    };
+
+    const presenceChipClass = {
+      busy: 'warn pulse',
+      away: '',
+      gohome: 'violet',
+    };
+
+    // 通信安定度アンテナの色（クライアントUIと同一の5段階）
+    const SIGNAL_COLORS = ['#6b7280', '#ef5b5b', '#f97316', '#f6c35b', '#84cc16', '#38d996'];
+
     function activateTab(target) {
       const nextPanel = document.getElementById(target);
       if (!nextPanel) return;
 
-      document.querySelectorAll('.tab').forEach(tab => {
+      document.querySelectorAll('.nav-btn').forEach(tab => {
         const selected = tab.dataset.target === target;
         tab.classList.toggle('active', selected);
         tab.setAttribute('aria-selected', String(selected));
@@ -1005,9 +1315,12 @@
       });
     }
 
-    document.querySelectorAll('.tab').forEach(tab => {
+    document.querySelectorAll('.nav-btn').forEach(tab => {
       tab.addEventListener('click', () => {
         activateTab(tab.dataset.target);
+        if (tab.dataset.target === 'mediaroute' && latestStats) renderMediaRoute(latestStats);
+        // 設定タブを開いた時点の最新値を反映(表示中はstats更新で上書きしない)
+        if (tab.dataset.target === 'settings') renderSystemSettings(systemSettings);
       });
     });
 
@@ -1037,6 +1350,11 @@
 
     function shortId(id) {
       return String(id || '').slice(0, 8);
+    }
+
+    function channelName(channelId) {
+      const channels = Array.isArray(systemSettings.channels) ? systemSettings.channels : [];
+      return channels.find(channel => channel.id === channelId)?.name || channelId || 'general';
     }
 
     function setRegistryStatus(message, tone = 'muted') {
@@ -1087,8 +1405,19 @@
         ...(settings || {}),
         latestVersions: { ...(systemSettings.latestVersions || {}), ...((settings || {}).latestVersions || {}) },
         updatePackages: { ...(systemSettings.updatePackages || {}), ...((settings || {}).updatePackages || {}) },
+        network: { ...(systemSettings.network || {}), ...((settings || {}).network || {}) },
+        maintenance: { ...(systemSettings.maintenance || {}), ...((settings || {}).maintenance || {}) },
       };
       channelsText.value = channelsToText(systemSettings.channels);
+      netRtcPort.value = systemSettings.network?.rtcPort || '';
+      netExtraTcp.value = systemSettings.network?.extraTcpPorts || '';
+      netAnnouncedIp.value = systemSettings.network?.announcedIp || '';
+      netStunUrls.value = systemSettings.network?.stunUrls || '';
+      netTurnUrls.value = systemSettings.network?.turnUrls || '';
+      netTurnUser.value = systemSettings.network?.turnUser || '';
+      netTurnPass.value = systemSettings.network?.turnPass || '';
+      maintServerTimes.value = (systemSettings.maintenance?.serverRestartTimes || []).join(', ');
+      maintClientTimes.value = (systemSettings.maintenance?.clientRestartTimes || []).join(', ');
       updateFolderDisplay.innerText = systemSettings.updateFolder || '未設定';
       verClient.value = systemSettings.latestVersions?.client || '';
       verViewer.value = systemSettings.latestVersions?.viewer || '';
@@ -1096,17 +1425,116 @@
       urlClient.value = systemSettings.updatePackages?.client?.url || '';
       urlViewer.value = systemSettings.updatePackages?.viewer?.url || '';
       urlScreenShare.value = systemSettings.updatePackages?.['screen-share']?.url || '';
+      renderRecordingSettings(systemSettings.recording);
+    }
+
+    function renderRecordingSettings(recording) {
+      const rec = recording || {};
+      recEnabled.checked = !!rec.enabled;
+      recEnabledLabel.innerText = rec.enabled ? '有効' : '無効';
+      recDir.value = rec.recordingsDir || '';
+      recDbDir.value = rec.dbDir || '';
+      recStagingDir.value = rec.stagingDir || '';
+      recRetention.value = rec.retentionDays || 14;
+      recSegment.value = String(rec.segmentSeconds || 300);
+      recCompression.value = rec.compressionMode || 'none';
+      recScreen.checked = !!rec.recordScreen;
+      recAudio.checked = rec.recordAudio === undefined ? true : !!rec.recordAudio;
+      recTimestamp.checked = rec.timestampOverlay === undefined ? false : !!rec.timestampOverlay;
+      recFfmpeg.value = rec.ffmpegPath || '';
+      recConcurrency.value = String(rec.compressionConcurrency === undefined ? 1 : rec.compressionConcurrency);
+      recMinFree.value = rec.minFreeGb || 10;
+    }
+
+    function collectRecordingSettings() {
+      return {
+        enabled: recEnabled.checked,
+        recordingsDir: recDir.value.trim(),
+        dbDir: recDbDir.value.trim(),
+        stagingDir: recStagingDir.value.trim(),
+        retentionDays: Number(recRetention.value) || 14,
+        segmentSeconds: Number(recSegment.value) || 300,
+        compressionMode: recCompression.value,
+        recordScreen: recScreen.checked,
+        recordAudio: recAudio.checked,
+        timestampOverlay: recTimestamp.checked,
+        ffmpegPath: recFfmpeg.value.trim(),
+        compressionConcurrency: Number(recConcurrency.value || 1),
+        minFreeGb: Number(recMinFree.value) || 10,
+      };
+    }
+
+    recEnabled.addEventListener('change', () => {
+      recEnabledLabel.innerText = recEnabled.checked ? '有効' : '無効';
+    });
+
+    saveRecordingBtn.addEventListener('click', async () => {
+      try {
+        const saved = await window.api.saveRecordingSettings(collectRecordingSettings());
+        systemSettings = { ...systemSettings, recording: saved };
+        renderRecordingSettings(saved);
+        appendLog(`[Admin] 録画設定を保存しました (有効=${saved.enabled ? 'ON' : 'OFF'} 保持=${saved.retentionDays}日 圧縮=${saved.compressionMode})`);
+      } catch (err) {
+        appendLog(`ERROR: 録画設定の保存に失敗: ${err.message}`);
+      }
+    });
+
+    recDirBtn.addEventListener('click', async () => {
+      const dir = await window.api.selectAnyFolder('録画データの保存先を選択（NASのマウント先も可）');
+      if (dir) recDir.value = dir;
+    });
+    recDbDirBtn.addEventListener('click', async () => {
+      const dir = await window.api.selectAnyFolder('録画データベースの保存先を選択');
+      if (dir) recDbDir.value = dir;
+    });
+    recStagingDirBtn.addEventListener('click', async () => {
+      const dir = await window.api.selectAnyFolder('録画のローカル一時保存先を選択（サーバー内蔵SSD推奨）');
+      if (dir) recStagingDir.value = dir;
+    });
+
+    async function openRecordingsUi() {
+      if (!serverRunning) {
+        appendLog('WARN: 録画タイムラインを開くにはサーバーを起動してください');
+        return;
+      }
+      await window.api.openRecordingsUi(latestStats?.listenPort || 3000);
+    }
+    openRecordingsBtn.addEventListener('click', openRecordingsUi);
+    openRecordingsBtn2.addEventListener('click', openRecordingsUi);
+
+    // "04:00, 4:5" のようなカンマ区切り入力を HH:MM の配列へ正規化する
+    function parseRestartTimes(text) {
+      const seen = new Set();
+      for (const part of String(text || '').split(',')) {
+        const match = /^\s*([01]?\d|2[0-3]):([0-5]?\d)\s*$/.exec(part);
+        if (!match) continue;
+        seen.add(`${match[1].padStart(2, '0')}:${match[2].padStart(2, '0')}`);
+      }
+      return Array.from(seen).sort().slice(0, 12);
     }
 
     function collectSystemSettings() {
       return {
         channels: textToChannels(channelsText.value),
+        network: {
+          rtcPort: netRtcPort.value.trim(),
+          extraTcpPorts: netExtraTcp.value.trim(),
+          announcedIp: netAnnouncedIp.value.trim(),
+          stunUrls: netStunUrls.value.trim(),
+          turnUrls: netTurnUrls.value.trim(),
+          turnUser: netTurnUser.value.trim(),
+          turnPass: netTurnPass.value,
+        },
+        maintenance: {
+          serverRestartTimes: parseRestartTimes(maintServerTimes.value),
+          clientRestartTimes: parseRestartTimes(maintClientTimes.value),
+        },
         updateFolder: systemSettings.updateFolder || '',
         latestVersions: {
           ...(systemSettings.latestVersions || {}),
-          client: verClient.value.trim() || '0.1.0',
-          viewer: verViewer.value.trim() || '0.1.0',
-          'screen-share': verScreenShare.value.trim() || '0.1.0',
+          client: verClient.value.trim() || '0.6.0',
+          viewer: verViewer.value.trim() || '0.1.1',
+          'screen-share': verScreenShare.value.trim() || '0.2.1',
         },
         updatePackages: {
           ...(systemSettings.updatePackages || {}),
@@ -1222,8 +1650,39 @@
           data-kind="${escapeHtml(kind)}"
           data-enabled="${String(nextEnabled)}"
           ${disabled ? 'disabled' : ''}
-        >${escapeHtml(label)} ${suffix}</button>
+        >${escapeHtml(label)}を${suffix}にする</button>
       `;
+    }
+
+    /** 通信安定度アンテナ（0-5段階、クライアントUIと同じしきい値・色） */
+    function signalBars(level, rttMs) {
+      if (!Number.isFinite(level)) return '';
+      const clamped = Math.max(0, Math.min(5, Math.round(level)));
+      const color = SIGNAL_COLORS[clamped];
+      const bars = [1, 2, 3, 4, 5].map(step => `
+        <i style="height:${3 + step * 2.2}px; background:${step <= clamped ? color : 'rgba(255,255,255,0.2)'}"></i>
+      `).join('');
+      return `
+        <span class="sig" title="通信安定度 ${clamped}/5">
+          ${bars}
+          <i class="rtt">${rttMs != null ? fmtMs(rttMs) : ''}</i>
+        </span>
+      `;
+    }
+
+    function presenceChip(mode) {
+      if (!presenceText[mode]) return '';
+      return `<span class="chip ${presenceChipClass[mode] || ''}">${presenceText[mode]}</span>`;
+    }
+
+    /** RTP実流量の停滞警告（サーバー計測。上り=拠点→サーバー、下り=サーバー→拠点） */
+    function flowChips(client) {
+      const upStalled = (client.producerList || []).some(item => item.flowStalled && !item.paused);
+      const downStalled = (client.consumerList || []).some(item => item.flowStalled);
+      let html = '';
+      if (upStalled) html += '<span class="chip bad pulse">上りRTP停滞</span>';
+      if (downStalled) html += '<span class="chip bad pulse">下りRTP停滞</span>';
+      return html;
     }
 
     function monitorRows(client) {
@@ -1253,7 +1712,6 @@
       const micDisabled = isViewer || !(devices.audioInput || []).length;
       const speakerDisabled = !(devices.audioOutput || []).length;
       const recvOk = (remote.receivingVideoCount || 0) + (remote.receivingAudioCount || 0);
-      const open = expandedClientIds.has(client.id) || health === 'stale' || health === 'offline';
 
       // producer の実状態（即時反映）を優先し、無ければ telemetry の自己申告を使う
       const camOn = media.camera ? media.camera === 'on'
@@ -1262,26 +1720,30 @@
         : (!!local.micEnabled && local.audio?.readyState === 'live');
       const screenOn = media.screen === 'on';
       const qualityLevel = quality.level || 'unknown';
+      const sendOk = transports.sendState === 'connected';
+      const recvTransportOk = transports.recvState === 'connected';
 
       return `
-        <details class="client-card ${escapeHtml(health)}" data-socket="${escapeHtml(client.id)}" ${open ? 'open' : ''}>
-          <summary class="client-head">
-            <div>
+        <article class="client-card ${escapeHtml(health)}" data-socket="${escapeHtml(client.id)}">
+          <div class="client-head">
+            <span class="dot ${escapeHtml(health)}" title="${escapeHtml(healthText[health] || health)}"></span>
+            <div class="client-idbox">
               <div class="client-title">
-                <span class="dot ${escapeHtml(health)}"></span>
                 <span class="client-name">${escapeHtml(client.name || '不明')}</span>
+                ${presenceChip(client.presenceMode)}
                 <span class="chip blue">${escapeHtml(client.appType || 'client')}</span>
-                <span class="chip">${escapeHtml(client.appVersion || '-')}</span>
+                <span class="chip">v${escapeHtml(client.appVersion || '-')}</span>
               </div>
-              <div class="client-meta">${escapeHtml(shortId(client.id))} / ${escapeHtml(client.remoteAddress || '-')}</div>
+              <div class="client-meta">${escapeHtml(shortId(client.id))} / ${escapeHtml(client.remoteAddress || '-')} / CH: ${escapeHtml(channelName(channelId))}</div>
             </div>
+            ${signalBars(client.signalLevel, quality.rttMs ?? client.rttMs)}
             <div class="client-actions">
               <button class="mini-btn ok" data-action="call" data-socket="${escapeHtml(client.id)}">呼び出し</button>
               <button class="mini-btn blue" data-action="refresh" data-socket="${escapeHtml(client.id)}">デバイス更新</button>
               <button class="mini-btn danger" data-action="restart" data-socket="${escapeHtml(client.id)}">再構築</button>
               <button class="mini-btn" data-action="kick" data-socket="${escapeHtml(client.id)}">切断</button>
             </div>
-          </summary>
+          </div>
           <div class="client-body">
             <div class="kv-grid">
               <div class="kv"><span>状態</span><strong>${escapeHtml(healthText[health] || health)}</strong></div>
@@ -1290,23 +1752,27 @@
               <div class="kv"><span>安定度</span><strong class="q-${escapeHtml(qualityLevel)}">${escapeHtml(qualityText[qualityLevel] || qualityLevel)}</strong></div>
               <div class="kv"><span>最終受信</span><strong>${fmtMs(client.heartbeatAgeMs)}</strong></div>
               <div class="kv"><span>受信OK</span><strong>${recvOk}</strong></div>
-              <div class="kv"><span>チャンネル</span><strong>${escapeHtml(channelId)}</strong></div>
             </div>
 
             <div>
-              <div class="section-title">メディア状態（実機反映）</div>
+              <div class="section-title">メディア状態（実機の状態をリアルタイム反映）</div>
               <div class="chip-row">
                 ${mediaChip(camOn ? 'カメラ ON' : 'カメラ OFF', camOn, !camOn)}
+                ${recordingSocketSet.has(client.id) ? `<span class="chip ${camOn ? 'ok' : 'warn'}" title="サーバー側で映像を録画しています${camOn ? '' : '(カメラOFF中も録画は継続。他拠点への配信は停止中)'}">⏺ 録画中${camOn ? '' : '(配信OFF)'}</span>` : ''}
                 ${mediaChip(micOn ? 'マイク ON' : 'マイク OFF', micOn, !micOn)}
                 ${mediaChip(local.speakerMuted ? 'スピーカー OFF' : 'スピーカー ON', !local.speakerMuted, !!local.speakerMuted)}
                 ${screenOn ? mediaChip('画面共有中', true) : ''}
-                <span class="chip blue">送信 ${escapeHtml(transports.sendState || 'none')}</span>
-                <span class="chip blue">受信 ${escapeHtml(transports.recvState || 'none')}</span>
+                <span class="chip ${sendOk ? 'ok' : 'warn'}">送信 ${escapeHtml(transports.sendState || 'none')}</span>
+                <span class="chip ${recvTransportOk ? 'ok' : 'warn'}">受信 ${escapeHtml(transports.recvState || 'none')}</span>
+                ${client.tcpFallback ? '<span class="chip warn" title="UDPメディアが遮断されているため、この拠点はTCPで中継しています">TCP中継</span>' : ''}
+                ${client.connected === false ? '<span class="chip bad pulse" title="切断されましたが、再接続を待つ間セッションを仮で残しています">切断(再接続待ち)</span>' : ''}
+                ${client.recovering && client.connected !== false ? '<span class="chip warn pulse" title="メディアが確立するまでセッション再構築を繰り返しています">復旧中</span>' : ''}
+                ${flowChips(client)}
               </div>
             </div>
 
             <div>
-              <div class="section-title">ON/OFF制御</div>
+              <div class="section-title">遠隔操作（ON/OFF）</div>
               <div class="chip-row">
                 ${mediaToggleButton(client.id, 'camera', 'カメラ', camOn, isViewer)}
                 ${mediaToggleButton(client.id, 'mic', 'マイク', micOn, isViewer)}
@@ -1315,7 +1781,7 @@
             </div>
 
             <div>
-              <div class="section-title">デバイス選択</div>
+              <div class="section-title">チャンネル / デバイス選択</div>
               <div class="device-grid">
                 <div class="device-control">
                   <label>チャンネル</label>
@@ -1345,11 +1811,11 @@
             </div>
 
             <div>
-              <div class="section-title">クライアント受信モニター</div>
+              <div class="section-title">この拠点の受信モニター（他拠点からの映像・音声）</div>
               ${monitorRows(client)}
             </div>
           </div>
-        </details>
+        </article>
       `;
     }
 
@@ -1357,36 +1823,136 @@
       deviceSelectHoldUntil = Math.max(deviceSelectHoldUntil, Date.now() + ms);
     }
 
-    function isDeviceSelectActive() {
+    // プルダウン（チャンネル/カメラ/マイク/スピーカー）操作中は再描画を保留する。
+    // stats更新（500ms周期）で innerHTML を差し替えるとフォーカスが外れ、
+    // 開いているプルダウンが勝手に閉じて選択できなくなるため。
+    function isCardSelectActive() {
       const active = document.activeElement;
       return Date.now() < deviceSelectHoldUntil ||
-        !!active?.matches?.('select[data-action="device"]');
+        (!!active && active.tagName === 'SELECT' && clientCards.contains(active));
     }
 
     function renderClientCards(stats) {
       const clients = stats.clients || [];
       const html = clients.length
         ? clients.map(clientCard).join('')
-        : '<div class="empty">接続端末がありません</div>';
+        : `<div class="empty">${serverRunning ? '接続端末がありません' : 'サーバー起動後、接続端末の状態がここに表示されます'}</div>`;
       if (html === lastCardsHtml) return;
       lastCardsHtml = html;
       clientCards.innerHTML = html;
-      clientCardsFull.innerHTML = html;
     }
 
     function flushDeferredCardStats() {
-      if (!deferredCardStats || isDeviceSelectActive()) return;
+      if (!deferredCardStats || isCardSelectActive()) return;
       const stats = deferredCardStats;
       deferredCardStats = null;
       renderClientCards(stats);
     }
 
+    /** 拠点のtransport一覧から実際のメディア経路(UDP/TCP・確立状態)を集約する */
+    function transportRouteInfo(client) {
+      const list = client.transportList || [];
+      const open = list.filter(item => !item.closed);
+      const tuples = open.filter(item => item.iceSelectedTuple);
+      const protocols = Array.from(new Set(
+        tuples.map(item => String(item.iceSelectedTuple.protocol || '').toUpperCase()).filter(Boolean)
+      ));
+      return {
+        count: open.length,
+        protocols,
+        remote: tuples[0]?.iceSelectedTuple || null,
+        iceOk: open.some(item => item.iceState === 'connected' || item.iceState === 'completed'),
+        dtlsOk: open.some(item => item.dtlsState === 'connected'),
+      };
+    }
+
+    /** メディア経路タブ: サーバー待受・外部STUN/TURN死活・拠点別経路を描画する */
+    function renderMediaRoute(stats) {
+      if (!stats) return;
+
+      const listenChips = [];
+      if (!serverRunning) {
+        listenChips.push('<span class="chip">サーバー停止中</span>');
+      } else if (stats.rtcSinglePortActive) {
+        listenChips.push(`<span class="chip ok">STUN/ICE待受中: 固定ポート UDP/TCP ${escapeHtml(stats.rtcPort)}</span>`);
+        for (const port of stats.rtcExtraTcpPorts || []) {
+          listenChips.push(`<span class="chip ok">追加TCP ${escapeHtml(port)} 待受中</span>`);
+        }
+      } else if (stats.rtcPort) {
+        listenChips.push('<span class="chip bad">固定ポートをバインドできず、ポート範囲方式で稼働中</span>');
+      } else {
+        listenChips.push(`<span class="chip blue">STUN/ICE待受中: ポート範囲 UDP/TCP ${escapeHtml(stats.rtcPortRange?.min ?? '-')}-${escapeHtml(stats.rtcPortRange?.max ?? '-')}</span>`);
+      }
+      const announced = (stats.announcedIps || [stats.announcedIp]).filter(Boolean).join(', ');
+      listenChips.push(`<span class="chip">公開IP ${escapeHtml(announced || '-')}</span>`);
+      listenChips.push(stats.turnConfigured
+        ? '<span class="chip ok">TURN代替経路あり</span>'
+        : '<span class="chip warn">TURN代替経路なし（直結のみ）</span>');
+      routeListen.innerHTML = listenChips.join('');
+
+      const probes = stats.iceProbes || [];
+      if (!(stats.iceServers || []).length) {
+        routeIceServers.innerHTML = '<div class="empty">未設定（SFU直結のみ）。設定タブで TURN を追加すると、直結できない拠点向けの中継経路と到達監視が有効になります。</div>';
+      } else if (!probes.length) {
+        routeIceServers.innerHTML = '<div class="empty">死活確認中...</div>';
+      } else {
+        routeIceServers.innerHTML = `<div class="monitor-list">${probes.map(probe => `
+          <div class="monitor-row">
+            <div class="monitor-name">${escapeHtml(probe.url)}</div>
+            <span class="chip">${escapeHtml(String(probe.transport || '').toUpperCase())}</span>
+            <span class="chip ${probe.ok ? 'ok' : 'bad'}">${probe.ok ? `稼働中 (${fmtMs(probe.rttMs)})` : `応答なし: ${escapeHtml(probe.error || '不明')}`}</span>
+          </div>
+        `).join('')}</div>`;
+      }
+
+      const clients = (stats.clients || []).filter(client => client.appType !== 'server-gui');
+      if (!clients.length) {
+        routePeers.innerHTML = `<div class="empty">${serverRunning ? '接続端末がありません' : 'サーバー起動後に表示されます'}</div>`;
+        return;
+      }
+      routePeers.innerHTML = `
+        <table class="route-table">
+          <thead><tr>
+            <th>拠点</th><th>接続</th><th>経路</th><th>ICE</th><th>DTLS</th><th>接続方式</th><th>メディア状態</th>
+          </tr></thead>
+          <tbody>${clients.map(client => {
+            const route = transportRouteInfo(client);
+            const proto = route.protocols.join('+') || (route.count ? '確立待ち' : '-');
+            const remote = route.remote ? `${route.remote.remoteIp || route.remote.remoteAddress || ''}:${route.remote.remotePort || ''}` : '';
+            const stateChips = [];
+            if (client.connected === false) stateChips.push('<span class="chip bad pulse">切断(再接続待ち)</span>');
+            else if (client.recovering) stateChips.push('<span class="chip warn pulse">復旧中(貼り直し中)</span>');
+            else stateChips.push('<span class="chip ok">正常</span>');
+            const flows = flowChips(client);
+            return `<tr>
+              <td>${escapeHtml(client.name || '不明')}<div class="route-sub">${escapeHtml(client.appType || 'client')} / ${escapeHtml(client.remoteAddress || '-')}</div></td>
+              <td>${client.connected === false ? '<span class="chip bad">切断</span>' : '<span class="chip ok">接続中</span>'}</td>
+              <td>${escapeHtml(proto)}${remote ? `<div class="route-sub">${escapeHtml(remote)}</div>` : ''}</td>
+              <td><span class="chip ${route.iceOk ? 'ok' : (route.count ? 'warn' : '')}">${route.iceOk ? '確立' : (route.count ? '未確立' : '-')}</span></td>
+              <td><span class="chip ${route.dtlsOk ? 'ok' : (route.count ? 'warn' : '')}">${route.dtlsOk ? '確立' : (route.count ? '未確立' : '-')}</span></td>
+              <td>${client.tcpFallback ? '<span class="chip warn">TCP優先(自動)</span>' : (route.protocols.includes('TCP') ? '<span class="chip blue">TCP</span>' : '<span class="chip">UDP</span>')}</td>
+              <td>${stateChips.join('')}${flows}</td>
+            </tr>`;
+          }).join('')}</tbody>
+        </table>
+      `;
+    }
+
     function renderStats(stats) {
       latestStats = stats;
-      if (stats.systemState && !document.activeElement?.closest?.('#settings')) {
+      lastStatsAt = Date.now();
+      // 設定タブを表示中は入力欄を書き換えない(0.5秒周期のstats更新で
+      // 編集中のチェックボックスや入力値がリセットされる問題の対策)。
+      // 内部状態(systemSettings)へのマージだけ行い、タブを開き直したときに反映する。
+      const settingsTabActive = document.getElementById('settings')?.classList.contains('active');
+      if (stats.systemState && !settingsTabActive) {
         renderSystemSettings(stats.systemState);
       } else if (stats.systemState) {
-        systemSettings = { ...systemSettings, ...stats.systemState };
+        systemSettings = {
+          ...systemSettings,
+          ...stats.systemState,
+          recording: systemSettings.recording, // 録画設定はGUI保存値を保持
+        };
       }
       const clients = stats.clients || [];
       const health = stats.healthCounts || {};
@@ -1396,6 +1962,7 @@
       }, 0);
 
       document.getElementById('mPeers').innerText = stats.peerCount ?? 0;
+      navPeerCount.innerText = stats.peerCount ?? 0;
       document.getElementById('mHealth').innerText = `正常 ${health.healthy || 0} / 注意 ${(health.degraded || 0) + (health.warming || 0)} / 応答なし ${(health.stale || 0) + (health.offline || 0)}`;
       document.getElementById('mStreams').innerText = `${stats.totalProducers || 0} / ${stats.totalConsumers || 0}`;
       document.getElementById('mReceive').innerText = receiveOk;
@@ -1404,7 +1971,9 @@
       document.getElementById('mUptime').innerText = `起動時間 ${fmtUptime(stats.uptimeSec || 0)}`;
       document.getElementById('mCpu').innerText = `${stats.cpu || '0.0'}%`;
       document.getElementById('mAnnounced').innerText = `公開IP ${stats.announcedIp || '-'} / 実IP ${(stats.serverIps || []).join(', ') || '-'}`;
-      document.getElementById('mRtcPorts').innerText = `RTP ${stats.rtcPortRange?.min || '-'}-${stats.rtcPortRange?.max || '-'}`;
+      document.getElementById('mRtcPorts').innerText = stats.rtcSinglePortActive
+        ? `固定 ${stats.rtcPort}${(stats.rtcExtraTcpPorts || []).length ? ` +TCP ${stats.rtcExtraTcpPorts.join(',')}` : ''}`
+        : `${stats.rtcPortRange?.min || '-'}-${stats.rtcPortRange?.max || '-'}`;
 
       // 通信品質サマリー（全クライアントの平均RTTと安定度内訳）
       const qualitySamples = clients
@@ -1423,9 +1992,52 @@
         document.getElementById('mQuality').innerText = '-';
         document.getElementById('mQualityNote').innerText = '平均RTT / 安定度';
       }
+      // 録画状態サマリー
+      const rec = stats.recording || {};
+      recordingSocketSet = new Set(rec.recordingSocketIds || []);
+      const freeGbText = Number.isFinite(rec.freeBytes) ? `${(rec.freeBytes / 1024 / 1024 / 1024).toFixed(0)}GB` : '-';
+      const remainText = Number.isFinite(rec.estimatedRemainingDays) ? `残り約${rec.estimatedRemainingDays}日` : '';
+      if (!rec.enabled) {
+        mRecording.innerText = '停止中';
+        mRecordingNote.innerText = '設定タブで有効化';
+      } else if (!rec.ffmpegOk) {
+        mRecording.innerText = 'ffmpeg未検出';
+        mRecordingNote.innerText = '同梱ffmpegの再インストールが必要です';
+      } else if (!rec.storageOk) {
+        mRecording.innerText = '保存先エラー';
+        mRecordingNote.innerText = rec.storageError || '保存先に書き込めません(NAS切断?)';
+      } else if (rec.lowDisk) {
+        mRecording.innerText = `⚠ 空き不足(${freeGbText})`;
+        mRecordingNote.innerText = `最低${rec.minFreeGb}GB確保のため古い録画を自動削除中`;
+      } else {
+        mRecording.innerText = `● ${rec.activeCount || 0}拠点を録画中`;
+        mRecordingNote.innerText = `空き${freeGbText}${remainText ? ` / ${remainText}` : ''}${rec.compressionQueue ? ` / 圧縮${rec.compressionActiveCount || 0}並列+待ち${Math.max(0, rec.compressionQueue - (rec.compressionActiveCount || 0))}` : ''}`;
+      }
+
+      // 設定タブの容量表示(入力欄ではないため表示中でも常時更新する)
+      if (rec.enabled && Number.isFinite(rec.freeBytes)) {
+        const perDayText = Number.isFinite(rec.bytesPerDay) && rec.bytesPerDay > 0
+          ? `${(rec.bytesPerDay / 1024 / 1024 / 1024).toFixed(2)}GB/日`
+          : '計測中(録画蓄積後に表示)';
+        recDiskInfo.innerText =
+          `空き容量: ${freeGbText}(最低確保 ${rec.minFreeGb}GB)` +
+          ` / 使用ペース: ${perDayText}` +
+          `${Number.isFinite(rec.estimatedRemainingDays) ? ` / 予想残り保存期間: 約${rec.estimatedRemainingDays}日` : ''}` +
+          `${rec.lowDisk ? ' ⚠ 空き不足: 古い録画から自動削除しています' : ''}`;
+      } else if (!rec.enabled) {
+        recDiskInfo.innerText = '録画を有効にすると表示されます';
+      }
+
+      // 公開IP設定の「自動」時の実値をプレースホルダーで案内する
+      netAnnouncedIp.placeholder = `自動（${(stats.serverIps || [])[0] || 'サーバー自身のIP'}）`;
       refreshRegistryDefaults();
 
-      if (isDeviceSelectActive()) {
+      // メディア経路タブは表示中のみ描画する（500ms周期のDOM差し替えを抑える）
+      if (document.getElementById('mediaroute')?.classList.contains('active')) {
+        renderMediaRoute(stats);
+      }
+
+      if (isCardSelectActive()) {
         deferredCardStats = stats;
       } else {
         deferredCardStats = null;
@@ -1446,12 +2058,33 @@
       });
     }
 
+    // 監視データの更新鮮度を表示する（「リアルタイムに正確に伝わっているか」を可視化）
+    setInterval(() => {
+      if (!serverRunning) {
+        statsAgeEl.innerText = '-';
+        statsAgePill.style.color = 'var(--muted)';
+        return;
+      }
+      const age = Date.now() - lastStatsAt;
+      if (age < 2000) {
+        statsAgeEl.innerText = 'リアルタイム';
+        statsAgePill.style.color = 'var(--green)';
+      } else if (age < 6000) {
+        statsAgeEl.innerText = `${Math.round(age / 1000)}秒前`;
+        statsAgePill.style.color = 'var(--amber)';
+      } else {
+        statsAgeEl.innerText = `${Math.round(age / 1000)}秒前（停滞）`;
+        statsAgePill.style.color = 'var(--red)';
+      }
+    }, 500);
+
     function appendLog(log) {
       const p = document.createElement('div');
       p.innerText = String(log || '').trim();
       if (/ERROR|error|failed|失敗/.test(p.innerText)) p.style.color = 'var(--red)';
       if (/WARN|注意|timeout/.test(p.innerText)) p.style.color = 'var(--amber)';
       if (p.innerText.includes('[Admin]')) p.style.color = 'var(--blue)';
+      if (p.innerText.includes('[Recovery]')) p.style.color = 'var(--violet)';
       logOutput.appendChild(p);
       logOutput.scrollTop = logOutput.scrollHeight;
       if (logOutput.childNodes.length > 2000) logOutput.removeChild(logOutput.firstChild);
@@ -1499,34 +2132,28 @@
       });
 
       container.addEventListener('focusin', event => {
-        if (event.target.closest('select[data-action="device"]')) holdClientCardRender();
+        if (event.target.closest('select')) holdClientCardRender();
       });
 
       container.addEventListener('pointerdown', event => {
-        if (event.target.closest('select[data-action="device"]')) {
+        if (event.target.closest('select')) {
           holdClientCardRender();
           return;
         }
-        // 高頻度更新（毎秒4回）中でもクリック操作が再描画で途切れないように短時間ホールド
-        if (event.target.closest('button, select, summary')) holdClientCardRender(700);
+        // 高頻度更新中でもクリック操作が再描画で途切れないように短時間ホールド
+        if (event.target.closest('button')) holdClientCardRender(700);
       });
 
       container.addEventListener('focusout', event => {
-        if (!event.target.closest('select[data-action="device"]')) return;
-        deviceSelectHoldUntil = Math.max(deviceSelectHoldUntil, Date.now() + 250);
+        if (!event.target.closest('select')) return;
+        // 操作終了: focusin/pointerdown の長い保護ホールドを打ち切り、
+        // 保留していた最新statsをすぐ反映する
+        deviceSelectHoldUntil = Math.min(deviceSelectHoldUntil, Date.now() + 250);
         setTimeout(flushDeferredCardStats, 300);
       });
-
-      container.addEventListener('toggle', event => {
-        const card = event.target.closest?.('.client-card[data-socket]');
-        if (!card) return;
-        if (card.open) expandedClientIds.add(card.dataset.socket);
-        else expandedClientIds.delete(card.dataset.socket);
-      }, true);
     }
 
     wireClientActions(clientCards);
-    wireClientActions(clientCardsFull);
     loadRegisteredClients();
 
     regAddBtn.addEventListener('click', async () => {
@@ -1724,15 +2351,24 @@
       }, 6000);
     });
 
+    // 稼働状態と起動/停止ボタンを連動させる（稼働中の再起動・停止中の停止を防ぐ）
+    function applyServerRunningState(running) {
+      serverRunning = running;
+      statusText.innerText = running ? '稼働中' : '停止中';
+      statusDot.classList.toggle('running', running);
+      startBtn.disabled = running;
+      stopBtn.disabled = !running;
+    }
+
     window.api.onServerStatus((status) => {
-      statusText.innerText = status === 'Running' ? '稼働中' : '停止中';
-      statusDot.classList.toggle('running', status === 'Running');
-      if (status !== 'Running') resetStats();
+      applyServerRunningState(status === 'Running');
+      if (!serverRunning) resetStats();
     });
 
     window.api.onServerLog(appendLog);
     window.api.onServerStats(renderStats);
 
+    applyServerRunningState(false);
     resetStats();
   </script>
 </body>

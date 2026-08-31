@@ -1,0 +1,34 @@
+{
+  "name": "checkhouse-recording-viewer",
+  "version": "0.1.0",
+  "description": "CHECKHOUSE Meeting System 録画ビューア (サーバー接続 / NAS・フォルダ直読み対応)",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node scripts/test-media-file.cjs",
+    "package": "electron-builder build --mac --arm64 && electron-builder build --win --x64",
+    "package:mac": "electron-builder build --mac --arm64",
+    "package:win": "electron-builder build --win --x64"
+  },
+  "build": {
+    "appId": "com.checkhouse.meeting.recording-viewer",
+    "productName": "CHECKHOUSE Recording Viewer",
+    "mac": {
+      "icon": "build/icon.icns",
+      "target": ["dmg", "dir"],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": ["nsis", "portable", "zip"]
+    },
+    "directories": {
+      "output": "release"
+    }
+  },
+  "devDependencies": {
+    "electron": "^42.10.1",
+    "electron-builder": "^26.15.3"
+  }
+}
